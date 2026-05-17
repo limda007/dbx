@@ -81,6 +81,14 @@ import {
   usesSyntheticRowIdKey,
 } from "@/lib/tableEditing";
 import { formatGridSqlLiteral } from "@/lib/dataGridSql";
+import {
+  buildTransposeRows,
+  nextTransposeState,
+  transposeAnchorRowIndex,
+  transposeFieldWidth,
+  transposeScrollLeftForRecord,
+  visibleTransposeRecordWindow,
+} from "@/lib/dataGridTranspose";
 import { matchesRowStatusFilter, type RowStatus, type RowStatusFilter } from "@/lib/gridRowStatus";
 import { displayCellValue, type CellValue } from "@/lib/cellValue";
 import {
@@ -241,7 +249,9 @@ const detailCell = ref<{ rowIndex: number; col: number } | null>(null);
 const showCellDetail = ref(false);
 const transposeRowIndex = ref<number | null>(null);
 const showTranspose = ref(false);
-const transposePanelWidth = ref(320);
+const transposeScrollRef = ref<HTMLElement | { $el?: HTMLElement }>();
+const transposeScrollLeft = ref(0);
+const transposeViewportWidth = ref(0);
 const sortCol = ref<string | null>(null);
 const sortColIndex = ref<number | null>(null);
 const sortDir = ref<"asc" | "desc">("asc");
@@ -1880,26 +1890,97 @@ function copyDetailSqlCondition() {
   copyText(condition);
 }
 
-const transposeData = computed(() => {
-  if (transposeRowIndex.value === null) return null;
-  const item = displayItems.value[transposeRowIndex.value];
-  if (!item) return null;
-  return visibleColumnIndexes.value.map((columnIndex) => {
-    const col = props.result.columns[columnIndex];
-    return {
-      column: col,
-      type: columnTypeMap.value.get(col) || "",
-      value: item.data[columnIndex],
-      display: formatCell(item.data[columnIndex], columnIndex),
-      isNull: item.data[columnIndex] === null,
-    };
+const TRANSPOSE_RECORD_WIDTH = 168;
+const transposePinnedWidth = computed(() => transposeFieldWidth(visibleColumns.value));
+
+const transposeRows = computed(() => {
+  return buildTransposeRows({
+    columns: visibleColumns.value,
+    records: displayItems.value.map((item) => visibleColumnIndexes.value.map((columnIndex) => item.data[columnIndex])),
+    typeByColumn: columnTypeMap.value,
+    displayValue: (value, _column, index) => formatCell(value, visibleColumnIndexes.value[index]),
   });
 });
+const isTransposeMode = computed(() => showTranspose.value && transposeRows.value.length > 0);
+const transposeRecordWindow = computed(() =>
+  visibleTransposeRecordWindow({
+    totalRecords: displayItems.value.length,
+    scrollLeft: transposeScrollLeft.value,
+    viewportWidth: transposeViewportWidth.value,
+    pinnedWidth: transposePinnedWidth.value,
+    recordWidth: TRANSPOSE_RECORD_WIDTH,
+    overscan: 2,
+  }),
+);
+const visibleTransposeRecordIndexes = computed(() => {
+  const window = transposeRecordWindow.value;
+  return Array.from({ length: window.end - window.start }, (_, offset) => window.start + offset);
+});
+const transposeTotalWidth = computed(
+  () => transposePinnedWidth.value + displayItems.value.length * TRANSPOSE_RECORD_WIDTH,
+);
+
+function transposeScrollElement(): HTMLElement | undefined {
+  const raw = transposeScrollRef.value;
+  if (!raw) return undefined;
+  return raw instanceof HTMLElement ? raw : raw.$el;
+}
+
+function updateTransposeViewport() {
+  const el = transposeScrollElement();
+  if (!el) return;
+  transposeScrollLeft.value = el.scrollLeft;
+  transposeViewportWidth.value = el.clientWidth;
+}
+
+function onTransposeScroll() {
+  updateTransposeViewport();
+}
+
+function scrollTransposeRecordIntoView(rowIndex: number) {
+  nextTick(() => {
+    const el = transposeScrollElement();
+    if (!el) return;
+    el.scrollLeft = transposeScrollLeftForRecord({
+      recordIndex: rowIndex,
+      totalRecords: displayItems.value.length,
+      viewportWidth: el.clientWidth,
+      pinnedWidth: transposePinnedWidth.value,
+      recordWidth: TRANSPOSE_RECORD_WIDTH,
+    });
+    updateTransposeViewport();
+  });
+}
 
 function openTranspose(rowIndex: number) {
   transposeRowIndex.value = rowIndex;
   showTranspose.value = true;
   showCellDetail.value = false;
+  nextTick(updateTransposeViewport);
+  scrollTransposeRecordIntoView(rowIndex);
+}
+
+function openContextTranspose() {
+  if (!contextCell.value) return;
+  openTranspose(
+    transposeAnchorRowIndex({
+      requestedRowIndex: contextCell.value.rowIndex,
+      rowIds: displayItems.value.map((item) => item.id),
+      selectedRowIds: selectedRowIds.value,
+      selectedRange: selectedRange.value,
+    }),
+  );
+}
+
+function toggleTranspose(rowIndex: number) {
+  const next = nextTransposeState(showTranspose.value, transposeRowIndex.value, rowIndex);
+  transposeRowIndex.value = next.transposeRowIndex;
+  showTranspose.value = next.showTranspose;
+  if (next.showTranspose) {
+    showCellDetail.value = false;
+    nextTick(updateTransposeViewport);
+    if (next.transposeRowIndex !== null) scrollTransposeRecordIntoView(next.transposeRowIndex);
+  }
 }
 
 function transposeNav(delta: number) {
@@ -1907,23 +1988,13 @@ function transposeNav(delta: number) {
   const next = transposeRowIndex.value + delta;
   if (next >= 0 && next < displayItems.value.length) {
     transposeRowIndex.value = next;
+    scrollTransposeRecordIntoView(next);
   }
 }
 
-function onTransposeResizeStart(e: MouseEvent) {
-  e.preventDefault();
-  const startX = e.clientX;
-  const startWidth = transposePanelWidth.value;
-  const onMove = (ev: MouseEvent) => {
-    transposePanelWidth.value = Math.max(200, startWidth - (ev.clientX - startX));
-  };
-  const onUp = () => {
-    document.removeEventListener("mousemove", onMove);
-    document.removeEventListener("mouseup", onUp);
-  };
-  document.addEventListener("mousemove", onMove);
-  document.addEventListener("mouseup", onUp);
-}
+watch(isTransposeMode, (active) => {
+  if (active) nextTick(updateTransposeViewport);
+});
 
 watch(
   () => props.result,
@@ -2531,520 +2602,626 @@ defineExpose({
                   </button>
                 </div>
               </Transition>
-              <!-- Sticky header -->
-              <div
-                ref="headerRef"
-                class="shrink-0 bg-[rgb(239_239_239)] dark:bg-muted/60 z-10 border-y border-border overflow-hidden"
-              >
-                <div class="flex text-xs font-semibold text-foreground" :style="{ width: 'var(--header-total-w)' }">
-                  <div
-                    class="shrink-0 px-2 py-1.5 border-r border-border text-center text-muted-foreground select-none"
-                    :style="{ width: 'var(--row-num-w)' }"
+              <div v-if="isTransposeMode" class="flex-1 flex flex-col min-h-0 overflow-hidden">
+                <div class="h-8 flex items-center gap-2 px-3 border-y shrink-0 bg-muted/20">
+                  <Rows3 class="w-3.5 h-3.5 text-muted-foreground" />
+                  <span class="text-xs font-medium">{{ t("grid.transpose") }}</span>
+                  <span class="text-xs text-muted-foreground">
+                    {{ t("grid.rowNumber") }} {{ (transposeRowIndex ?? 0) + 1 }}
+                  </span>
+                  <span class="flex-1" />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    class="h-5 w-5"
+                    :disabled="transposeRowIndex === 0"
+                    @click="transposeNav(-1)"
                   >
-                    #
-                  </div>
-                  <Tooltip v-for="(col, colIdx) in visibleColumns" :key="`${col}-${actualColumnIndex(colIdx)}`">
-                    <TooltipTrigger as-child>
+                    <ChevronLeft class="w-3 h-3" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    class="h-5 w-5"
+                    :disabled="transposeRowIndex === displayItems.length - 1"
+                    @click="transposeNav(1)"
+                  >
+                    <ChevronRight class="w-3 h-3" />
+                  </Button>
+                  <Button variant="ghost" size="icon" class="h-5 w-5" @click="showTranspose = false">
+                    <X class="w-3 h-3" />
+                  </Button>
+                </div>
+                <RecycleScroller
+                  ref="transposeScrollRef"
+                  class="transpose-grid-scroller flex-1 min-h-0 overflow-auto overscroll-none bg-background"
+                  :style="{
+                    '--transpose-total-w': `${transposeTotalWidth}px`,
+                    '--transpose-field-w': `${transposePinnedWidth}px`,
+                    '--transpose-record-w': `${TRANSPOSE_RECORD_WIDTH}px`,
+                  }"
+                  :items="transposeRows"
+                  :item-size="30"
+                  :buffer="400"
+                  key-field="id"
+                  @scroll="onTransposeScroll"
+                >
+                  <template #before>
+                    <div
+                      class="sticky top-0 z-20 flex h-7 border-b border-border bg-[rgb(239_239_239)] text-xs font-semibold text-muted-foreground dark:bg-muted"
+                      :style="{ width: `${transposeTotalWidth}px` }"
+                    >
                       <div
-                        class="shrink-0 px-2 py-1.5 border-r border-border whitespace-nowrap hover:bg-accent/60 select-none relative overflow-hidden"
-                        :style="{ width: `var(--col-w-${colIdx})` }"
+                        class="sticky left-0 z-30 shrink-0 border-r border-border px-3 py-1.5 bg-[rgb(239_239_239)] truncate dark:bg-muted"
+                        :style="{ width: `${transposePinnedWidth}px` }"
                       >
-                        <span class="flex min-w-0 items-center gap-1 overflow-hidden">
-                          <span
-                            class="min-w-0 flex-1 truncate cursor-pointer"
-                            @click="toggleSort(col, actualColumnIndex(colIdx))"
-                          >
-                            {{ col }}
-                          </span>
-                          <button
-                            type="button"
-                            class="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-                            :class="
-                              sortCol === col && sortColIndex === actualColumnIndex(colIdx)
-                                ? 'text-primary opacity-100'
-                                : 'opacity-80'
-                            "
-                            :title="t('grid.sort')"
-                            @click.stop="toggleSort(col, actualColumnIndex(colIdx))"
-                          >
-                            <ArrowUp
-                              v-if="sortCol === col && sortColIndex === actualColumnIndex(colIdx) && sortDir === 'asc'"
-                              class="h-3 w-3 shrink-0"
-                            />
-                            <ArrowDown
-                              v-else-if="
-                                sortCol === col && sortColIndex === actualColumnIndex(colIdx) && sortDir === 'desc'
-                              "
-                              class="h-3 w-3 shrink-0"
-                            />
-                            <ArrowUpDown v-else class="h-3 w-3 shrink-0" />
-                          </button>
-                          <Popover
-                            :open="formatterOpenColumn === actualColumnIndex(colIdx)"
-                            @update:open="
-                              (value: boolean) =>
-                                value ? openColumnFormatter(actualColumnIndex(colIdx)) : closeColumnFormatter()
-                            "
-                          >
-                            <PopoverTrigger as-child>
-                              <button
-                                type="button"
-                                class="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-                                :class="
-                                  columnHasFormatter(actualColumnIndex(colIdx))
-                                    ? 'text-primary opacity-100'
-                                    : 'opacity-80'
-                                "
-                                :disabled="!formatterKeyForColumn(col)"
-                                :title="t('grid.columnFormatter')"
-                                @click.stop
-                              >
-                                <Code2 class="h-3.5 w-3.5" />
-                              </button>
-                            </PopoverTrigger>
-                            <PopoverContent
-                              align="start"
-                              side="bottom"
-                              class="w-[380px] max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl"
-                              @click.stop
-                              @keydown.stop
+                        {{ t("grid.columnName") }}
+                      </div>
+                      <div class="shrink-0" :style="{ width: `${transposeRecordWindow.beforeWidth}px` }" />
+                      <div
+                        v-for="recordIndex in visibleTransposeRecordIndexes"
+                        :key="`transpose-head-${recordIndex}`"
+                        class="shrink-0 border-r border-border px-2 py-1.5 text-center tabular-nums"
+                        :class="
+                          recordIndex === transposeRowIndex
+                            ? 'bg-primary/15 text-primary font-semibold'
+                            : 'bg-[rgb(239_239_239)] dark:bg-muted'
+                        "
+                        :style="{ width: `${TRANSPOSE_RECORD_WIDTH}px` }"
+                      >
+                        {{ recordIndex + 1 }}
+                      </div>
+                      <div class="shrink-0" :style="{ width: `${transposeRecordWindow.afterWidth}px` }" />
+                    </div>
+                  </template>
+                  <template #default="{ item }">
+                    <div
+                      class="flex border-b border-border/60 text-xs"
+                      :style="{ height: '30px', width: `${transposeTotalWidth}px` }"
+                    >
+                      <div
+                        class="sticky left-0 z-10 shrink-0 border-r border-border bg-background px-3 py-1.5 font-medium truncate"
+                        :style="{ width: `${transposePinnedWidth}px` }"
+                        :title="item.column"
+                      >
+                        {{ item.column }}
+                      </div>
+                      <div class="shrink-0" :style="{ width: `${transposeRecordWindow.beforeWidth}px` }" />
+                      <div
+                        v-for="recordIndex in visibleTransposeRecordIndexes"
+                        :key="`${item.id}:${recordIndex}`"
+                        class="shrink-0 border-r border-border/70 px-2 py-1.5 font-mono truncate"
+                        :class="{
+                          'text-muted-foreground italic': item.values[recordIndex]?.isNull,
+                          'bg-primary/10': recordIndex === transposeRowIndex,
+                        }"
+                        :style="{ width: `${TRANSPOSE_RECORD_WIDTH}px` }"
+                        :title="item.values[recordIndex]?.display"
+                      >
+                        {{ item.values[recordIndex]?.display }}
+                      </div>
+                      <div class="shrink-0" :style="{ width: `${transposeRecordWindow.afterWidth}px` }" />
+                    </div>
+                  </template>
+                </RecycleScroller>
+              </div>
+              <template v-else>
+                <!-- Sticky header -->
+                <div
+                  ref="headerRef"
+                  class="shrink-0 bg-[rgb(239_239_239)] dark:bg-muted/60 z-10 border-y border-border overflow-hidden"
+                >
+                  <div class="flex text-xs font-semibold text-foreground" :style="{ width: 'var(--header-total-w)' }">
+                    <div
+                      class="shrink-0 px-2 py-1.5 border-r border-border text-center text-muted-foreground select-none"
+                      :style="{ width: 'var(--row-num-w)' }"
+                    >
+                      #
+                    </div>
+                    <Tooltip v-for="(col, colIdx) in visibleColumns" :key="`${col}-${actualColumnIndex(colIdx)}`">
+                      <TooltipTrigger as-child>
+                        <div
+                          class="shrink-0 px-2 py-1.5 border-r border-border whitespace-nowrap hover:bg-accent/60 select-none relative overflow-hidden"
+                          :style="{ width: `var(--col-w-${colIdx})` }"
+                        >
+                          <span class="flex min-w-0 items-center gap-1 overflow-hidden">
+                            <span
+                              class="min-w-0 flex-1 truncate cursor-pointer"
+                              @click="toggleSort(col, actualColumnIndex(colIdx))"
                             >
-                              <div class="border-b bg-muted/40 px-3 py-2">
-                                <div class="text-sm font-semibold">
-                                  {{ t("grid.columnFormatterFor", { column: col }) }}
-                                </div>
-                                <div class="mt-0.5 text-[11px] text-muted-foreground">
-                                  {{ t("grid.columnFormatterHint") }}
-                                </div>
-                              </div>
-                              <div class="space-y-3 p-3">
-                                <div class="space-y-1.5">
-                                  <div class="text-xs font-medium text-muted-foreground">
-                                    {{ t("grid.formatterType") }}
+                              {{ col }}
+                            </span>
+                            <button
+                              type="button"
+                              class="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                              :class="
+                                sortCol === col && sortColIndex === actualColumnIndex(colIdx)
+                                  ? 'text-primary opacity-100'
+                                  : 'opacity-80'
+                              "
+                              :title="t('grid.sort')"
+                              @click.stop="toggleSort(col, actualColumnIndex(colIdx))"
+                            >
+                              <ArrowUp
+                                v-if="
+                                  sortCol === col && sortColIndex === actualColumnIndex(colIdx) && sortDir === 'asc'
+                                "
+                                class="h-3 w-3 shrink-0"
+                              />
+                              <ArrowDown
+                                v-else-if="
+                                  sortCol === col && sortColIndex === actualColumnIndex(colIdx) && sortDir === 'desc'
+                                "
+                                class="h-3 w-3 shrink-0"
+                              />
+                              <ArrowUpDown v-else class="h-3 w-3 shrink-0" />
+                            </button>
+                            <Popover
+                              :open="formatterOpenColumn === actualColumnIndex(colIdx)"
+                              @update:open="
+                                (value: boolean) =>
+                                  value ? openColumnFormatter(actualColumnIndex(colIdx)) : closeColumnFormatter()
+                              "
+                            >
+                              <PopoverTrigger as-child>
+                                <button
+                                  type="button"
+                                  class="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                                  :class="
+                                    columnHasFormatter(actualColumnIndex(colIdx))
+                                      ? 'text-primary opacity-100'
+                                      : 'opacity-80'
+                                  "
+                                  :disabled="!formatterKeyForColumn(col)"
+                                  :title="t('grid.columnFormatter')"
+                                  @click.stop
+                                >
+                                  <Code2 class="h-3.5 w-3.5" />
+                                </button>
+                              </PopoverTrigger>
+                              <PopoverContent
+                                align="start"
+                                side="bottom"
+                                class="w-[380px] max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl"
+                                @click.stop
+                                @keydown.stop
+                              >
+                                <div class="border-b bg-muted/40 px-3 py-2">
+                                  <div class="text-sm font-semibold">
+                                    {{ t("grid.columnFormatterFor", { column: col }) }}
                                   </div>
-                                  <Select
-                                    :model-value="formatterKind"
-                                    @update:model-value="(value: any) => (formatterKind = value)"
-                                  >
-                                    <SelectTrigger class="h-8 text-xs">
-                                      <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      <SelectItem value="datetime">{{ t("grid.formatterDatetime") }}</SelectItem>
-                                      <SelectItem value="json-path">{{ t("grid.formatterJsonPath") }}</SelectItem>
-                                      <SelectItem value="mask">{{ t("grid.formatterMask") }}</SelectItem>
-                                    </SelectContent>
-                                  </Select>
-                                </div>
-
-                                <div v-if="formatterKind === 'datetime'" class="space-y-1.5">
-                                  <div class="text-xs font-medium text-muted-foreground">
-                                    {{ t("grid.formatterTimestampUnit") }}
+                                  <div class="mt-0.5 text-[11px] text-muted-foreground">
+                                    {{ t("grid.columnFormatterHint") }}
                                   </div>
-                                  <Select
-                                    :model-value="formatterDateUnit"
-                                    @update:model-value="(value: any) => (formatterDateUnit = value)"
-                                  >
-                                    <SelectTrigger class="h-8 text-xs">
-                                      <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      <SelectItem value="auto">{{ t("grid.formatterUnitAuto") }}</SelectItem>
-                                      <SelectItem value="seconds">{{ t("grid.formatterUnitSeconds") }}</SelectItem>
-                                      <SelectItem value="milliseconds">{{
-                                        t("grid.formatterUnitMilliseconds")
-                                      }}</SelectItem>
-                                    </SelectContent>
-                                  </Select>
                                 </div>
-
-                                <div v-else-if="formatterKind === 'json-path'" class="space-y-1.5">
-                                  <div class="text-xs font-medium text-muted-foreground">
-                                    {{ t("grid.formatterJsonPathInput") }}
-                                  </div>
-                                  <input
-                                    v-model="formatterJsonPath"
-                                    autocapitalize="off"
-                                    autocorrect="off"
-                                    spellcheck="false"
-                                    class="h-8 w-full rounded border bg-background px-2 font-mono text-xs outline-none focus:border-primary"
-                                    placeholder="$.user.name"
-                                  />
-                                </div>
-
-                                <div v-else class="grid grid-cols-2 gap-2">
-                                  <label class="space-y-1.5">
-                                    <span class="text-xs font-medium text-muted-foreground">
-                                      {{ t("grid.formatterMaskPrefix") }}
-                                    </span>
-                                    <input
-                                      v-model.number="formatterMaskPrefix"
-                                      type="number"
-                                      min="0"
-                                      class="h-8 w-full rounded border bg-background px-2 text-xs outline-none focus:border-primary"
-                                    />
-                                  </label>
-                                  <label class="space-y-1.5">
-                                    <span class="text-xs font-medium text-muted-foreground">
-                                      {{ t("grid.formatterMaskSuffix") }}
-                                    </span>
-                                    <input
-                                      v-model.number="formatterMaskSuffix"
-                                      type="number"
-                                      min="0"
-                                      class="h-8 w-full rounded border bg-background px-2 text-xs outline-none focus:border-primary"
-                                    />
-                                  </label>
-                                </div>
-
-                                <div class="space-y-1.5">
-                                  <div class="text-xs font-medium text-muted-foreground">
-                                    {{ t("grid.formatterPreview") }}
-                                  </div>
-                                  <div class="max-h-40 overflow-auto rounded border bg-muted/20">
-                                    <div
-                                      v-for="row in formatterPreviewRows(actualColumnIndex(colIdx))"
-                                      :key="row.index"
-                                      class="grid grid-cols-[2rem_minmax(0,1fr)_minmax(0,1fr)] gap-2 border-b px-2 py-1.5 text-[11px] last:border-b-0"
+                                <div class="space-y-3 p-3">
+                                  <div class="space-y-1.5">
+                                    <div class="text-xs font-medium text-muted-foreground">
+                                      {{ t("grid.formatterType") }}
+                                    </div>
+                                    <Select
+                                      :model-value="formatterKind"
+                                      @update:model-value="(value: any) => (formatterKind = value)"
                                     >
-                                      <span class="text-muted-foreground">{{ row.index }}</span>
-                                      <span class="truncate font-mono text-muted-foreground">{{ row.raw }}</span>
-                                      <span class="truncate font-mono">{{ row.formatted }}</span>
+                                      <SelectTrigger class="h-8 text-xs">
+                                        <SelectValue />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="datetime">{{ t("grid.formatterDatetime") }}</SelectItem>
+                                        <SelectItem value="json-path">{{ t("grid.formatterJsonPath") }}</SelectItem>
+                                        <SelectItem value="mask">{{ t("grid.formatterMask") }}</SelectItem>
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+
+                                  <div v-if="formatterKind === 'datetime'" class="space-y-1.5">
+                                    <div class="text-xs font-medium text-muted-foreground">
+                                      {{ t("grid.formatterTimestampUnit") }}
+                                    </div>
+                                    <Select
+                                      :model-value="formatterDateUnit"
+                                      @update:model-value="(value: any) => (formatterDateUnit = value)"
+                                    >
+                                      <SelectTrigger class="h-8 text-xs">
+                                        <SelectValue />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="auto">{{ t("grid.formatterUnitAuto") }}</SelectItem>
+                                        <SelectItem value="seconds">{{ t("grid.formatterUnitSeconds") }}</SelectItem>
+                                        <SelectItem value="milliseconds">{{
+                                          t("grid.formatterUnitMilliseconds")
+                                        }}</SelectItem>
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+
+                                  <div v-else-if="formatterKind === 'json-path'" class="space-y-1.5">
+                                    <div class="text-xs font-medium text-muted-foreground">
+                                      {{ t("grid.formatterJsonPathInput") }}
+                                    </div>
+                                    <input
+                                      v-model="formatterJsonPath"
+                                      autocapitalize="off"
+                                      autocorrect="off"
+                                      spellcheck="false"
+                                      class="h-8 w-full rounded border bg-background px-2 font-mono text-xs outline-none focus:border-primary"
+                                      placeholder="$.user.name"
+                                    />
+                                  </div>
+
+                                  <div v-else class="grid grid-cols-2 gap-2">
+                                    <label class="space-y-1.5">
+                                      <span class="text-xs font-medium text-muted-foreground">
+                                        {{ t("grid.formatterMaskPrefix") }}
+                                      </span>
+                                      <input
+                                        v-model.number="formatterMaskPrefix"
+                                        type="number"
+                                        min="0"
+                                        class="h-8 w-full rounded border bg-background px-2 text-xs outline-none focus:border-primary"
+                                      />
+                                    </label>
+                                    <label class="space-y-1.5">
+                                      <span class="text-xs font-medium text-muted-foreground">
+                                        {{ t("grid.formatterMaskSuffix") }}
+                                      </span>
+                                      <input
+                                        v-model.number="formatterMaskSuffix"
+                                        type="number"
+                                        min="0"
+                                        class="h-8 w-full rounded border bg-background px-2 text-xs outline-none focus:border-primary"
+                                      />
+                                    </label>
+                                  </div>
+
+                                  <div class="space-y-1.5">
+                                    <div class="text-xs font-medium text-muted-foreground">
+                                      {{ t("grid.formatterPreview") }}
+                                    </div>
+                                    <div class="max-h-40 overflow-auto rounded border bg-muted/20">
+                                      <div
+                                        v-for="row in formatterPreviewRows(actualColumnIndex(colIdx))"
+                                        :key="row.index"
+                                        class="grid grid-cols-[2rem_minmax(0,1fr)_minmax(0,1fr)] gap-2 border-b px-2 py-1.5 text-[11px] last:border-b-0"
+                                      >
+                                        <span class="text-muted-foreground">{{ row.index }}</span>
+                                        <span class="truncate font-mono text-muted-foreground">{{ row.raw }}</span>
+                                        <span class="truncate font-mono">{{ row.formatted }}</span>
+                                      </div>
                                     </div>
                                   </div>
                                 </div>
-                              </div>
 
-                              <div class="flex items-center justify-between gap-2 border-t bg-muted/30 px-3 py-2">
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  class="h-7 px-2 text-xs"
-                                  :disabled="!columnHasFormatter(actualColumnIndex(colIdx))"
-                                  @click="clearColumnFormatter(actualColumnIndex(colIdx))"
-                                >
-                                  {{ t("grid.clearFormatter") }}
-                                </Button>
-                                <div class="flex items-center gap-2">
+                                <div class="flex items-center justify-between gap-2 border-t bg-muted/30 px-3 py-2">
                                   <Button
-                                    variant="outline"
+                                    variant="ghost"
                                     size="sm"
                                     class="h-7 px-2 text-xs"
-                                    @click="closeColumnFormatter"
+                                    :disabled="!columnHasFormatter(actualColumnIndex(colIdx))"
+                                    @click="clearColumnFormatter(actualColumnIndex(colIdx))"
                                   >
-                                    {{ t("dangerDialog.cancel") }}
+                                    {{ t("grid.clearFormatter") }}
                                   </Button>
-                                  <Button
-                                    size="sm"
-                                    class="h-7 px-2 text-xs"
-                                    :disabled="!formatterDraftIsSavable()"
-                                    @click="saveColumnFormatter(actualColumnIndex(colIdx))"
-                                  >
-                                    {{ t("grid.saveFormatter") }}
-                                  </Button>
+                                  <div class="flex items-center gap-2">
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      class="h-7 px-2 text-xs"
+                                      @click="closeColumnFormatter"
+                                    >
+                                      {{ t("dangerDialog.cancel") }}
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      class="h-7 px-2 text-xs"
+                                      :disabled="!formatterDraftIsSavable()"
+                                      @click="saveColumnFormatter(actualColumnIndex(colIdx))"
+                                    >
+                                      {{ t("grid.saveFormatter") }}
+                                    </Button>
+                                  </div>
                                 </div>
-                              </div>
-                            </PopoverContent>
-                          </Popover>
-                          <Popover
-                            :open="localFilterOpenColumn === actualColumnIndex(colIdx)"
-                            @update:open="
-                              (value: boolean) =>
-                                value ? openLocalFilter(actualColumnIndex(colIdx)) : closeLocalFilter()
-                            "
-                          >
-                            <PopoverTrigger as-child>
-                              <button
-                                type="button"
-                                class="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-                                :class="
-                                  localFilterActive(actualColumnIndex(colIdx))
-                                    ? 'text-primary opacity-100'
-                                    : 'opacity-80'
-                                "
-                                :title="t('grid.localFilter')"
-                                @click.stop
-                              >
-                                <Filter class="h-3.5 w-3.5" />
-                              </button>
-                            </PopoverTrigger>
-                            <PopoverContent
-                              align="start"
-                              side="bottom"
-                              class="w-[420px] max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border border-slate-200 bg-white p-0 text-slate-900 shadow-2xl ring-0 dark:border-slate-200 dark:bg-white dark:text-slate-900"
-                              @click.stop
-                              @keydown.stop
+                              </PopoverContent>
+                            </Popover>
+                            <Popover
+                              :open="localFilterOpenColumn === actualColumnIndex(colIdx)"
+                              @update:open="
+                                (value: boolean) =>
+                                  value ? openLocalFilter(actualColumnIndex(colIdx)) : closeLocalFilter()
+                              "
                             >
-                              <div
-                                class="border-b border-slate-200 bg-slate-50 px-3 py-2 text-center text-sm font-semibold text-slate-900"
-                              >
-                                {{ t("grid.localFilterFor", { column: col }) }}
-                              </div>
-                              <div class="flex items-center gap-2 border-b border-slate-200 px-3 py-2">
-                                <Search class="h-4 w-4 shrink-0 text-slate-400" />
-                                <input
-                                  v-model="localFilterSearch"
-                                  autocapitalize="off"
-                                  autocorrect="off"
-                                  spellcheck="false"
-                                  class="h-8 min-w-0 flex-1 bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400"
-                                  :placeholder="t('grid.searchValues')"
-                                />
-                              </div>
-                              <div
-                                class="grid grid-cols-[2rem_minmax(0,1fr)_4rem] border-b border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-500"
-                              >
+                              <PopoverTrigger as-child>
                                 <button
                                   type="button"
-                                  class="flex h-5 w-5 items-center justify-center rounded border"
+                                  class="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
                                   :class="
-                                    localFilterAllVisibleSelected
-                                      ? 'border-blue-600 bg-blue-600 text-white'
-                                      : 'border-slate-300 bg-white text-slate-700'
+                                    localFilterActive(actualColumnIndex(colIdx))
+                                      ? 'text-primary opacity-100'
+                                      : 'opacity-80'
                                   "
-                                  @click="toggleAllLocalFilterOptions"
+                                  :title="t('grid.localFilter')"
+                                  @click.stop
                                 >
-                                  <Check v-if="localFilterAllVisibleSelected" class="h-3.5 w-3.5 stroke-[3]" />
+                                  <Filter class="h-3.5 w-3.5" />
                                 </button>
-                                <span>{{ t("grid.value") }}</span>
-                                <span class="text-right">{{ t("grid.count") }}</span>
-                              </div>
-                              <div class="max-h-72 overflow-auto py-1">
-                                <button
-                                  v-for="option in localFilterOptions"
-                                  :key="option.key"
-                                  type="button"
-                                  class="grid w-full grid-cols-[2rem_minmax(0,1fr)_4rem] items-center px-3 py-1.5 text-left text-sm text-slate-900 hover:bg-sky-50"
-                                  @click="toggleLocalFilterValue(option.key)"
+                              </PopoverTrigger>
+                              <PopoverContent
+                                align="start"
+                                side="bottom"
+                                class="w-[420px] max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border border-slate-200 bg-white p-0 text-slate-900 shadow-2xl ring-0 dark:border-slate-200 dark:bg-white dark:text-slate-900"
+                                @click.stop
+                                @keydown.stop
+                              >
+                                <div
+                                  class="border-b border-slate-200 bg-slate-50 px-3 py-2 text-center text-sm font-semibold text-slate-900"
                                 >
-                                  <span
+                                  {{ t("grid.localFilterFor", { column: col }) }}
+                                </div>
+                                <div class="flex items-center gap-2 border-b border-slate-200 px-3 py-2">
+                                  <Search class="h-4 w-4 shrink-0 text-slate-400" />
+                                  <input
+                                    v-model="localFilterSearch"
+                                    autocapitalize="off"
+                                    autocorrect="off"
+                                    spellcheck="false"
+                                    class="h-8 min-w-0 flex-1 bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400"
+                                    :placeholder="t('grid.searchValues')"
+                                  />
+                                </div>
+                                <div
+                                  class="grid grid-cols-[2rem_minmax(0,1fr)_4rem] border-b border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-500"
+                                >
+                                  <button
+                                    type="button"
                                     class="flex h-5 w-5 items-center justify-center rounded border"
                                     :class="
-                                      localFilterDraft?.values.has(option.key)
+                                      localFilterAllVisibleSelected
                                         ? 'border-blue-600 bg-blue-600 text-white'
                                         : 'border-slate-300 bg-white text-slate-700'
                                     "
+                                    @click="toggleAllLocalFilterOptions"
                                   >
-                                    <Check
-                                      v-if="localFilterDraft?.values.has(option.key)"
-                                      class="h-3.5 w-3.5 stroke-[3]"
-                                    />
-                                  </span>
-                                  <span
-                                    class="truncate font-mono"
-                                    :class="{ 'italic text-slate-500': option.value === null }"
+                                    <Check v-if="localFilterAllVisibleSelected" class="h-3.5 w-3.5 stroke-[3]" />
+                                  </button>
+                                  <span>{{ t("grid.value") }}</span>
+                                  <span class="text-right">{{ t("grid.count") }}</span>
+                                </div>
+                                <div class="max-h-72 overflow-auto py-1">
+                                  <button
+                                    v-for="option in localFilterOptions"
+                                    :key="option.key"
+                                    type="button"
+                                    class="grid w-full grid-cols-[2rem_minmax(0,1fr)_4rem] items-center px-3 py-1.5 text-left text-sm text-slate-900 hover:bg-sky-50"
+                                    @click="toggleLocalFilterValue(option.key)"
                                   >
-                                    {{ option.label }}
-                                  </span>
-                                  <span class="text-right tabular-nums text-slate-500">{{ option.count }}</span>
-                                </button>
-                                <div
-                                  v-if="localFilterAllOptions.length > localFilterOptions.length"
-                                  class="px-3 py-1 text-center text-[11px] text-slate-500"
-                                >
-                                  {{
-                                    t("grid.moreValues", {
-                                      count: localFilterAllOptions.length - localFilterOptions.length,
-                                    })
-                                  }}
+                                    <span
+                                      class="flex h-5 w-5 items-center justify-center rounded border"
+                                      :class="
+                                        localFilterDraft?.values.has(option.key)
+                                          ? 'border-blue-600 bg-blue-600 text-white'
+                                          : 'border-slate-300 bg-white text-slate-700'
+                                      "
+                                    >
+                                      <Check
+                                        v-if="localFilterDraft?.values.has(option.key)"
+                                        class="h-3.5 w-3.5 stroke-[3]"
+                                      />
+                                    </span>
+                                    <span
+                                      class="truncate font-mono"
+                                      :class="{ 'italic text-slate-500': option.value === null }"
+                                    >
+                                      {{ option.label }}
+                                    </span>
+                                    <span class="text-right tabular-nums text-slate-500">{{ option.count }}</span>
+                                  </button>
+                                  <div
+                                    v-if="localFilterAllOptions.length > localFilterOptions.length"
+                                    class="px-3 py-1 text-center text-[11px] text-slate-500"
+                                  >
+                                    {{
+                                      t("grid.moreValues", {
+                                        count: localFilterAllOptions.length - localFilterOptions.length,
+                                      })
+                                    }}
+                                  </div>
+                                  <div
+                                    v-if="localFilterOptions.length === 0"
+                                    class="px-3 py-8 text-center text-sm text-slate-500"
+                                  >
+                                    {{ t("grid.noSearchResults") }}
+                                  </div>
                                 </div>
                                 <div
-                                  v-if="localFilterOptions.length === 0"
-                                  class="px-3 py-8 text-center text-sm text-slate-500"
+                                  class="flex items-center justify-between gap-2 border-t border-slate-200 bg-slate-50 px-3 py-2"
                                 >
-                                  {{ t("grid.noSearchResults") }}
-                                </div>
-                              </div>
-                              <div
-                                class="flex items-center justify-between gap-2 border-t border-slate-200 bg-slate-50 px-3 py-2"
-                              >
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  class="h-7 px-2 text-xs text-slate-700 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-700 dark:hover:bg-slate-100 dark:hover:text-slate-900"
-                                  @click="clearLocalFilter(actualColumnIndex(colIdx))"
-                                >
-                                  {{ t("grid.clearFilter") }}
-                                </Button>
-                                <div class="flex items-center gap-2">
                                   <Button
-                                    variant="outline"
+                                    variant="ghost"
                                     size="sm"
-                                    class="h-7 border-slate-300 bg-white px-2 text-xs text-slate-700 hover:bg-slate-100 hover:text-slate-900 dark:border-slate-300 dark:bg-white dark:text-slate-700 dark:hover:bg-slate-100 dark:hover:text-slate-900"
-                                    @click="closeLocalFilter"
+                                    class="h-7 px-2 text-xs text-slate-700 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-700 dark:hover:bg-slate-100 dark:hover:text-slate-900"
+                                    @click="clearLocalFilter(actualColumnIndex(colIdx))"
                                   >
-                                    {{ t("dangerDialog.cancel") }}
+                                    {{ t("grid.clearFilter") }}
                                   </Button>
-                                  <Button
-                                    size="sm"
-                                    class="h-7 bg-slate-950 px-2 text-xs text-white hover:bg-slate-800 dark:bg-slate-950 dark:text-white dark:hover:bg-slate-800"
-                                    @click="applyLocalFilter"
-                                  >
-                                    {{ t("grid.applyFilter") }}
-                                  </Button>
+                                  <div class="flex items-center gap-2">
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      class="h-7 border-slate-300 bg-white px-2 text-xs text-slate-700 hover:bg-slate-100 hover:text-slate-900 dark:border-slate-300 dark:bg-white dark:text-slate-700 dark:hover:bg-slate-100 dark:hover:text-slate-900"
+                                      @click="closeLocalFilter"
+                                    >
+                                      {{ t("dangerDialog.cancel") }}
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      class="h-7 bg-slate-950 px-2 text-xs text-white hover:bg-slate-800 dark:bg-slate-950 dark:text-white dark:hover:bg-slate-800"
+                                      @click="applyLocalFilter"
+                                    >
+                                      {{ t("grid.applyFilter") }}
+                                    </Button>
+                                  </div>
                                 </div>
-                              </div>
-                            </PopoverContent>
-                          </Popover>
-                        </span>
-                        <div
-                          class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30"
-                          @mousedown.stop="onResizeStart(colIdx, $event)"
-                          @dblclick.stop="autoFitColumn(colIdx)"
-                        />
-                      </div>
-                    </TooltipTrigger>
-                    <TooltipContent
-                      v-if="columnTypeMap.get(col) || columnCommentMap.get(col)"
-                      side="bottom"
-                      class="text-xs grid grid-cols-[auto_1fr] gap-x-2"
-                    >
-                      <template v-if="columnTypeMap.get(col)">
-                        <span class="text-muted-foreground">{{ t("grid.columnType") }}</span>
-                        <span :class="typeColorClass(columnTypeMap.get(col)!)">{{ columnTypeMap.get(col) }}</span>
-                      </template>
-                      <template v-if="columnCommentMap.get(col)">
-                        <span class="text-muted-foreground">{{ t("grid.columnComment") }}</span>
-                        <span>{{ columnCommentMap.get(col) }}</span>
-                      </template>
-                    </TooltipContent>
-                  </Tooltip>
-                  <div
-                    v-if="gridScrollbarGutter > 0"
-                    class="shrink-0 border-l border-border"
-                    :style="{ width: 'var(--grid-scrollbar-gutter)' }"
-                  />
-                </div>
-              </div>
-
-              <div
-                v-if="isErrorResult"
-                class="flex-1 flex flex-col items-center justify-center gap-2 px-6 text-center text-destructive"
-              >
-                <TriangleAlert class="h-8 w-8 text-destructive/50" aria-hidden="true" />
-                <div class="space-y-1">
-                  <div class="text-sm font-medium">{{ t("grid.queryError") }}</div>
-                  <div class="text-xs max-w-lg break-all text-destructive/80">{{ errorMessage }}</div>
-                </div>
-              </div>
-
-              <div
-                v-else-if="!hasVisibleRows"
-                class="flex-1 flex flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground"
-              >
-                <component
-                  :is="hasActiveFilter ? SearchX : Inbox"
-                  class="h-8 w-8 text-muted-foreground/50"
-                  aria-hidden="true"
-                />
-                <div class="space-y-1">
-                  <div class="text-sm font-medium text-foreground">{{ emptyTitle }}</div>
-                  <div class="text-xs">{{ emptyDescription }}</div>
-                </div>
-              </div>
-
-              <!-- Virtual scrolled rows -->
-              <RecycleScroller
-                v-else
-                ref="scrollerRef"
-                class="data-grid-scroller flex-1 overflow-x-auto overscroll-none"
-                :class="{ 'is-scrolling': isScrolling }"
-                :items="displayItems"
-                :item-size="26"
-                :buffer="600"
-                :skip-hover="true"
-                key-field="id"
-                @scroll="onScrollerScroll"
-              >
-                <template #default="{ item, index }">
-                  <div
-                    class="flex text-xs border-b border-border"
-                    :class="{
-                      'bg-destructive/5 opacity-70': item.isDeleted,
-                      'bg-primary/5': item.isNew && !isRowActive(index),
-                      'bg-muted/30': !item.isNew && !item.isDeleted && !isRowActive(index) && index % 2 === 1,
-                      'active-row': isRowActive(index) && !item.isDeleted,
-                    }"
-                    :style="{ height: '26px', width: 'var(--total-w)' }"
-                    :data-row-index="index"
-                  >
+                              </PopoverContent>
+                            </Popover>
+                          </span>
+                          <div
+                            class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30"
+                            @mousedown.stop="onResizeStart(colIdx, $event)"
+                            @dblclick.stop="autoFitColumn(colIdx)"
+                          />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent
+                        v-if="columnTypeMap.get(col) || columnCommentMap.get(col)"
+                        side="bottom"
+                        class="text-xs grid grid-cols-[auto_1fr] gap-x-2"
+                      >
+                        <template v-if="columnTypeMap.get(col)">
+                          <span class="text-muted-foreground">{{ t("grid.columnType") }}</span>
+                          <span :class="typeColorClass(columnTypeMap.get(col)!)">{{ columnTypeMap.get(col) }}</span>
+                        </template>
+                        <template v-if="columnCommentMap.get(col)">
+                          <span class="text-muted-foreground">{{ t("grid.columnComment") }}</span>
+                          <span>{{ columnCommentMap.get(col) }}</span>
+                        </template>
+                      </TooltipContent>
+                    </Tooltip>
                     <div
-                      class="shrink-0 px-2 py-1 border-r border-border text-center select-none cursor-default hover:bg-accent/50"
-                      :class="[
-                        rowNumberStatusClass(item),
-                        {
-                          'text-primary font-semibold !bg-primary/25':
-                            isRowSelected(item.id) &&
-                            item.status !== 'new' &&
-                            item.status !== 'edited' &&
-                            item.status !== 'deleted',
-                        },
-                      ]"
-                      :style="{ width: 'var(--row-num-w)' }"
-                      @click="handleRowClick(index, item.id, $event)"
-                      @contextmenu="onRowContext(item.id, index)"
-                    >
-                      {{ index + 1 }}
-                    </div>
-                    <div
-                      v-for="(actualColIdx, visibleColIdx) in visibleColumnIndexes"
-                      :key="actualColIdx"
-                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none"
-                      :style="{ width: `var(--col-w-${visibleColIdx})` }"
-                      :class="{
-                        'text-muted-foreground italic': isNull(item.data[actualColIdx]),
-                        'bg-yellow-500/10 cell-dirty': item.isDirtyCol[actualColIdx],
-                        'cell-selected': cellIsSelected(index, visibleColIdx) && !item.isDirtyCol[actualColIdx],
-                        'cell-selected-dirty': cellIsSelected(index, visibleColIdx) && item.isDirtyCol[actualColIdx],
-                        'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(index, actualColIdx),
-                        'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(
-                          index,
-                          actualColIdx,
-                        ),
-                        'tabular-nums': typeof item.data[actualColIdx] === 'number',
-                        'cursor-text hover:bg-accent/50': canEditCellItem(item, actualColIdx),
-                        'line-through': item.isDeleted,
-                      }"
-                      @mousedown="handleDataCellMousedown(index, visibleColIdx, item.id, $event)"
-                      @mouseenter="extendCellSelection(index, visibleColIdx)"
-                      @dblclick="canEditCellItem(item, actualColIdx) && startEdit(item.id, actualColIdx)"
-                      @contextmenu="onCellContext(item.id, index, actualColIdx, visibleColIdx)"
-                    >
-                      <template v-if="editingCell?.rowId === item.id && editingCell?.col === actualColIdx">
-                        <input
-                          v-model="editValue"
-                          autocapitalize="off"
-                          autocorrect="off"
-                          spellcheck="false"
-                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2 py-0.5 text-xs outline-none z-10"
-                          @blur="commitEdit"
-                          @click.stop
-                          @keydown.stop="onEditKeydown"
-                        />
-                      </template>
-                      <template v-else>
-                        {{ formatCell(item.data[actualColIdx], actualColIdx) }}
-                        <button
-                          class="absolute right-0.5 top-0.5 hidden h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground group-hover/cell:flex"
-                          :title="t('grid.cellDetails')"
-                          @mousedown.stop
-                          @click.stop="showCellDetails(index, actualColIdx)"
-                        >
-                          <Info class="h-3 w-3" />
-                        </button>
-                      </template>
-                    </div>
+                      v-if="gridScrollbarGutter > 0"
+                      class="shrink-0 border-l border-border"
+                      :style="{ width: 'var(--grid-scrollbar-gutter)' }"
+                    />
                   </div>
-                </template>
-              </RecycleScroller>
-              <div v-if="loading" class="absolute inset-0 z-20 bg-background/50 flex items-center justify-center">
-                <div
-                  class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-background border shadow-sm text-xs text-muted-foreground"
-                >
-                  <Loader2 class="w-3.5 h-3.5 animate-spin" />
-                  <span>{{ (loadingElapsed / 1000).toFixed(1) }}s</span>
                 </div>
-              </div>
+
+                <div
+                  v-if="isErrorResult"
+                  class="flex-1 flex flex-col items-center justify-center gap-2 px-6 text-center text-destructive"
+                >
+                  <TriangleAlert class="h-8 w-8 text-destructive/50" aria-hidden="true" />
+                  <div class="space-y-1">
+                    <div class="text-sm font-medium">{{ t("grid.queryError") }}</div>
+                    <div class="text-xs max-w-lg break-all text-destructive/80">{{ errorMessage }}</div>
+                  </div>
+                </div>
+
+                <div
+                  v-else-if="!hasVisibleRows"
+                  class="flex-1 flex flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground"
+                >
+                  <component
+                    :is="hasActiveFilter ? SearchX : Inbox"
+                    class="h-8 w-8 text-muted-foreground/50"
+                    aria-hidden="true"
+                  />
+                  <div class="space-y-1">
+                    <div class="text-sm font-medium text-foreground">{{ emptyTitle }}</div>
+                    <div class="text-xs">{{ emptyDescription }}</div>
+                  </div>
+                </div>
+
+                <!-- Virtual scrolled rows -->
+                <RecycleScroller
+                  v-else
+                  ref="scrollerRef"
+                  class="data-grid-scroller flex-1 overflow-x-auto overscroll-none"
+                  :class="{ 'is-scrolling': isScrolling }"
+                  :items="displayItems"
+                  :item-size="26"
+                  :buffer="600"
+                  :skip-hover="true"
+                  key-field="id"
+                  @scroll="onScrollerScroll"
+                >
+                  <template #default="{ item, index }">
+                    <div
+                      class="flex text-xs border-b border-border"
+                      :class="{
+                        'bg-destructive/5 opacity-70': item.isDeleted,
+                        'bg-primary/5': item.isNew && !isRowActive(index),
+                        'bg-muted/30': !item.isNew && !item.isDeleted && !isRowActive(index) && index % 2 === 1,
+                        'active-row': isRowActive(index) && !item.isDeleted,
+                      }"
+                      :style="{ height: '26px', width: 'var(--total-w)' }"
+                      :data-row-index="index"
+                    >
+                      <div
+                        class="shrink-0 px-2 py-1 border-r border-border text-center select-none cursor-default hover:bg-accent/50"
+                        :class="[
+                          rowNumberStatusClass(item),
+                          {
+                            'text-primary font-semibold !bg-primary/25':
+                              isRowSelected(item.id) &&
+                              item.status !== 'new' &&
+                              item.status !== 'edited' &&
+                              item.status !== 'deleted',
+                          },
+                        ]"
+                        :style="{ width: 'var(--row-num-w)' }"
+                        @click="handleRowClick(index, item.id, $event)"
+                        @dblclick.stop="toggleTranspose(index)"
+                        @contextmenu="onRowContext(item.id, index)"
+                      >
+                        {{ index + 1 }}
+                      </div>
+                      <div
+                        v-for="(actualColIdx, visibleColIdx) in visibleColumnIndexes"
+                        :key="actualColIdx"
+                        class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none"
+                        :style="{ width: `var(--col-w-${visibleColIdx})` }"
+                        :class="{
+                          'text-muted-foreground italic': isNull(item.data[actualColIdx]),
+                          'bg-yellow-500/10 cell-dirty': item.isDirtyCol[actualColIdx],
+                          'cell-selected': cellIsSelected(index, visibleColIdx) && !item.isDirtyCol[actualColIdx],
+                          'cell-selected-dirty': cellIsSelected(index, visibleColIdx) && item.isDirtyCol[actualColIdx],
+                          'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(index, actualColIdx),
+                          'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40':
+                            cellIsCurrentMatch(index, actualColIdx),
+                          'tabular-nums': typeof item.data[actualColIdx] === 'number',
+                          'cursor-text hover:bg-accent/50': canEditCellItem(item, actualColIdx),
+                          'line-through': item.isDeleted,
+                        }"
+                        @mousedown="handleDataCellMousedown(index, visibleColIdx, item.id, $event)"
+                        @mouseenter="extendCellSelection(index, visibleColIdx)"
+                        @dblclick="canEditCellItem(item, actualColIdx) && startEdit(item.id, actualColIdx)"
+                        @contextmenu="onCellContext(item.id, index, actualColIdx, visibleColIdx)"
+                      >
+                        <template v-if="editingCell?.rowId === item.id && editingCell?.col === actualColIdx">
+                          <input
+                            v-model="editValue"
+                            autocapitalize="off"
+                            autocorrect="off"
+                            spellcheck="false"
+                            class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2 py-0.5 text-xs outline-none z-10"
+                            @blur="commitEdit"
+                            @click.stop
+                            @keydown.stop="onEditKeydown"
+                          />
+                        </template>
+                        <template v-else>
+                          {{ formatCell(item.data[actualColIdx], actualColIdx) }}
+                          <button
+                            class="absolute right-0.5 top-0.5 hidden h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground group-hover/cell:flex"
+                            :title="t('grid.cellDetails')"
+                            @mousedown.stop
+                            @click.stop="showCellDetails(index, actualColIdx)"
+                          >
+                            <Info class="h-3 w-3" />
+                          </button>
+                        </template>
+                      </div>
+                    </div>
+                  </template>
+                </RecycleScroller>
+                <div v-if="loading" class="absolute inset-0 z-20 bg-background/50 flex items-center justify-center">
+                  <div
+                    class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-background border shadow-sm text-xs text-muted-foreground"
+                  >
+                    <Loader2 class="w-3.5 h-3.5 animate-spin" />
+                    <span>{{ (loadingElapsed / 1000).toFixed(1) }}s</span>
+                  </div>
+                </div>
+              </template>
             </div>
             <!-- Table Info Drawer -->
             <div
@@ -3315,67 +3492,6 @@ defineExpose({
                 </Button>
               </div>
             </div>
-            <!-- Transpose Panel -->
-            <div
-              v-if="showTranspose && transposeData"
-              class="relative shrink-0 border-l flex flex-col bg-background min-w-0"
-              :style="{ width: transposePanelWidth + 'px' }"
-            >
-              <div
-                class="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize z-20 hover:bg-primary/30 active:bg-primary/50"
-                @mousedown="onTransposeResizeStart"
-              />
-              <div class="h-9 flex items-center gap-2 px-3 border-b shrink-0 bg-muted/20">
-                <Rows3 class="w-3.5 h-3.5 text-muted-foreground" />
-                <span class="text-xs font-medium">{{ t("grid.transpose") }}</span>
-                <span class="text-xs text-muted-foreground"
-                  >{{ t("grid.rowNumber") }} {{ (transposeRowIndex ?? 0) + 1 }}</span
-                >
-                <span class="flex-1" />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  class="h-5 w-5"
-                  :disabled="transposeRowIndex === 0"
-                  @click="transposeNav(-1)"
-                >
-                  <ChevronLeft class="w-3 h-3" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  class="h-5 w-5"
-                  :disabled="transposeRowIndex === displayItems.length - 1"
-                  @click="transposeNav(1)"
-                >
-                  <ChevronRight class="w-3 h-3" />
-                </Button>
-                <Button variant="ghost" size="icon" class="h-5 w-5" @click="showTranspose = false">
-                  <X class="w-3 h-3" />
-                </Button>
-              </div>
-              <div class="flex-1 min-h-0 overflow-auto">
-                <table class="w-full text-xs">
-                  <tbody>
-                    <tr
-                      v-for="(field, fi) in transposeData"
-                      :key="fi"
-                      class="border-b border-border/50 hover:bg-accent/50"
-                    >
-                      <td class="px-3 py-1.5 font-medium text-muted-foreground whitespace-nowrap w-1/3 align-top">
-                        <div>{{ field.column }}</div>
-                        <div v-if="field.type" :class="typeColorClass(field.type)" class="text-[10px]">
-                          {{ field.type }}
-                        </div>
-                      </td>
-                      <td class="px-3 py-1.5 break-all" :class="{ 'text-muted-foreground italic': field.isNull }">
-                        {{ field.display }}
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
           </div>
         </div>
       </ContextMenuTrigger>
@@ -3428,7 +3544,7 @@ defineExpose({
             <ContextMenuItem @click="copyAll">{{ t("grid.copyAll") }}</ContextMenuItem>
           </ContextMenuSubContent>
         </ContextMenuSub>
-        <ContextMenuItem v-if="contextCell" @click="openTranspose(contextCell.rowIndex)">
+        <ContextMenuItem v-if="contextCell" @click="openContextTranspose">
           <Rows3 class="w-3.5 h-3.5 mr-2" /> {{ t("grid.transpose") }}
         </ContextMenuItem>
         <ContextMenuSub v-if="hasCellSelection">
@@ -3621,6 +3737,20 @@ defineExpose({
 
 .data-grid-scroller.is-scrolling :deep(.vue-recycle-scroller__item-view) {
   pointer-events: none;
+}
+
+.transpose-grid-scroller {
+  overflow-anchor: none;
+  will-change: scroll-position;
+}
+
+.transpose-grid-scroller :deep(.vue-recycle-scroller__item-wrapper) {
+  min-width: var(--transpose-total-w);
+  overflow: visible;
+}
+
+.transpose-grid-scroller :deep(.vue-recycle-scroller__item-view) {
+  contain: layout style paint;
 }
 
 .ddl-drawer-resizing {
