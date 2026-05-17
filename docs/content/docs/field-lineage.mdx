@@ -5,6 +5,10 @@ description: Trace where columns come from, how they are referenced, and which r
 
 Field Lineage helps answer a common question: where does a column's data come from, and what might depend on it? Use it to understand complex schemas, inspect impact, and read legacy structures.
 
+<Callout type="info">
+Field Lineage is enabled for MySQL, PostgreSQL, SQLite, SQL Server, Oracle, Redshift, DM, and GaussDB. Other engines may not expose enough relationship metadata for DBX to build useful lineage.
+</Callout>
+
 ## What It Helps With
 
 - Before changing a column, see which tables, views, or queries may depend on it

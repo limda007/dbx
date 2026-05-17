@@ -19,6 +19,16 @@ Connection
 
 Expand or collapse nodes to drill down. Click a table to open its data. Column entries show type, constraints, defaults, and related attributes when available.
 
+## Database-Specific Trees
+
+| Connection Type | Browser Model |
+|---|---|
+| Relational databases | Connection, database, schema, tables/views, columns, indexes, foreign keys, triggers, and routines where metadata is available |
+| Redis | Redis databases and keys, with value editors for String, Hash, List, Set, Sorted Set, and Stream |
+| MongoDB | Databases, collections, and paginated document browsing |
+| Object browser | Views, procedures, and functions when the database exposes source metadata |
+| Saved SQL | Folders and reusable SQL files in the sidebar library |
+
 ## Search
 
 Sidebar search helps locate objects when a connection contains many tables:
@@ -84,3 +94,13 @@ Redis connections use a browser designed for key-value data:
 - String, Hash, List, Set, Sorted Set, and Stream are supported
 
 For large Redis keyspaces, use search and pagination together instead of expanding too much data at once.
+
+## Feature Boundaries
+
+| Feature | Supported Types |
+|---|---|
+| Schema-aware tree | PostgreSQL, SQL Server, Oracle, Redshift, DM, GaussDB, KingBase, HighGo, Vastbase, JDBC, H2, Snowflake, Trino, DB2, TDengine |
+| ER diagram | MySQL, PostgreSQL, SQLite, SQL Server, Oracle, Redshift, DM, GaussDB, KingBase, HighGo, Vastbase, GoldenDB, Access, H2, DB2 |
+| Database search | MySQL, PostgreSQL, SQLite, SQL Server, Oracle, Redshift, DuckDB, ClickHouse, DM, GaussDB, KingBase, HighGo, Vastbase, GoldenDB, Access, H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, TDengine |
+
+If an action is missing from a node menu, the active database type may not expose the required metadata or safe SQL generation path.

@@ -12,7 +12,9 @@ Table Import writes a local file into a selected database table. Use it for one-
 | CSV | Comma-separated text for general data exchange |
 | TSV | Tab-separated text, useful when values contain commas |
 | JSON | JSON arrays exported from APIs or scripts |
-| Excel | `.xlsx` or `.xls` files |
+| Excel | `.xlsx`, `.xlsm`, or `.xls` files; DBX reads the first sheet |
+
+DBX previews the first 50 rows before import. Empty CSV/TSV cells are treated as `NULL`. JSON imports can be a single object, an array of objects, or an array of arrays; mixed object and array rows are rejected.
 
 ## Import Workflow
 
@@ -54,6 +56,20 @@ Table Import writes a local file into a selected database table. Use it for one-
 <Callout type="warn">
 Truncate-then-import deletes existing rows from the target table. Confirm backups and impact before using it on production data.
 </Callout>
+
+Imports run in batches. The default batch size is 500 rows, and the progress view reports imported rows, total rows, errors, and cancellation state.
+
+## Column Mapping Rules
+
+- Exact column names are matched first
+- Normalized names also match when spacing, underscores, hyphens, or case differ
+- A source column can be skipped
+- A target column cannot be mapped more than once
+- At least one column must be mapped before import can start
+
+## Database Coverage
+
+Table import is available for MySQL, PostgreSQL, SQLite, DuckDB, ClickHouse, SQL Server, Oracle, Doris, StarRocks, Redshift, DM, GaussDB, KingBase, HighGo, Vastbase, GoldenDB, and Access.
 
 ## Before Importing
 

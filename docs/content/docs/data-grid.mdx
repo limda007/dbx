@@ -40,6 +40,17 @@ You can edit data directly in the grid:
 
 All changes are staged locally first. Before saving, DBX shows the SQL it is about to execute.
 
+## When Editing Is Available
+
+Editing is available when DBX can identify the target table and enough key information to generate reviewable `UPDATE`, `INSERT`, or `DELETE` statements. Simple table browsing is usually editable. Ad-hoc joins, aggregates, expressions, or result sets without usable keys are treated as read-only.
+
+| Result Type | Typical Behavior |
+|---|---|
+| Opened table data | Editable when the database and table support edits |
+| Simple `SELECT * FROM table` | Often editable if primary key or row identity is available |
+| Joins, aggregates, computed columns | Read-only result set |
+| Redis or MongoDB views | Use their dedicated editors instead of relational row SQL |
+
 ## SQL Preview
 
 <Callout type="warn">
@@ -52,6 +63,8 @@ The preview shows `UPDATE`, `INSERT`, or `DELETE` statements. Use it to confirm:
 - Inserted rows contain the expected fields
 - Delete operations match the expected records
 - `NULL`, empty strings, and default values are handled correctly
+
+If the preview looks too broad, cancel the save and narrow the filter or selection first.
 
 ## Cell Details
 
@@ -73,3 +86,7 @@ Click a cell to open the detail panel. It is useful for values that are awkward 
 | INSERT | Copy selected rows as executable `INSERT` statements |
 
 Before exporting, check the active filters and sort order so the exported data matches what you expect.
+
+## Pagination And Large Results
+
+DBX can page result sets and keep large grids responsive with virtual scrolling. For large tables, prefer database-side `WHERE` and `ORDER BY` clauses instead of relying only on client search, because the database can use indexes and return a smaller result set.

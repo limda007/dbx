@@ -63,8 +63,13 @@ If a table fails, the current transfer stops and shows the error. Fix the struct
 |---|---|
 | Create target table | Try to create the target table from the source structure when it does not exist |
 | Append | Insert data after existing target rows |
-| Truncate then import | Clear the target table before writing source rows |
+| Overwrite | Clear the target table before writing source rows |
+| Upsert | Use key-aware write behavior where the target database path supports it |
 | Batch size | Control how many rows are written per batch |
+
+## Database Coverage
+
+SQL-based transfer is available for MySQL, PostgreSQL, SQLite, SQL Server, Oracle, ClickHouse, DuckDB, DM, and GaussDB. Cross-engine transfers use DBX's type mapping layer, so always verify row counts and important column values after transfer.
 
 ## Before You Transfer
 

@@ -292,4 +292,10 @@ The plugin directory must include `manifest.json`:
 }
 ```
 
+The current DBX app supports plugin protocol version `1`. DBX rejects a plugin whose manifest declares a different protocol version, and each plugin request has a 30 second timeout so a hung driver process does not block the app indefinitely.
+
 The initial protocol supports `testConnection`, `connect`, `executeQuery`, `listDatabases`, `listSchemas`, `listTables`, and `getColumns`.
+
+<Callout type="info">
+JDBC connection configs store `jdbc_driver_class` and `jdbc_driver_paths`. If a driver needs several JARs, keep all paths attached to the connection so metadata and query calls use the same classpath.
+</Callout>

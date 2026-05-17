@@ -1,6 +1,6 @@
 # DBX Docs MDX Code Sync Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Update the DBX static docs MDX pages in English and Simplified Chinese so they match the actual product behavior implemented in this repository.
 
@@ -61,7 +61,7 @@
 - Read: `mcp/src/sql-safety.ts`
 - Modify: `docs/superpowers/plans/2026-05-17-docs-mdx-code-sync-plan.md`
 
-- [ ] **Step 1: Extract database type and profile facts**
+- [x] **Step 1: Extract database type and profile facts**
 
 Run:
 
@@ -77,7 +77,7 @@ Expected:
 - Connection profile labels, default ports, and profile-to-driver mappings.
 - A picker list that shows user-visible database choices.
 
-- [ ] **Step 2: Extract feature support boundaries**
+- [x] **Step 2: Extract feature support boundaries**
 
 Run:
 
@@ -89,7 +89,7 @@ Expected:
 
 - Sets for schema-aware databases, SQL file unsupported types, diagrams, database search, table import, table structure, create database, field lineage, and transfer support.
 
-- [ ] **Step 3: Extract workflow and safety facts**
+- [x] **Step 3: Extract workflow and safety facts**
 
 Run:
 
@@ -109,7 +109,7 @@ Expected:
 
 - Concrete facts for AI modes, SQL safety, SQL file splitting, import formats, transfer modes, export contents, MCP tools, and MCP safety defaults.
 
-- [ ] **Step 4: Mark this task complete in this plan**
+- [x] **Step 4: Mark this task complete in this plan**
 
 Edit this file and change Task 1 checkboxes to checked after facts are collected.
 
@@ -130,7 +130,7 @@ Edit this file and change Task 1 checkboxes to checked after facts are collected
 - Modify: `docs/content/docs/config-export.cn.mdx`
 - Modify: `docs/superpowers/plans/2026-05-17-docs-mdx-code-sync-plan.md`
 
-- [ ] **Step 1: Update Getting Started in both locales**
+- [x] **Step 1: Update Getting Started in both locales**
 
 Use these facts:
 
@@ -147,7 +147,7 @@ Content requirements:
 - Expand connection creation steps with URL import, SSH/proxy, file-based databases, and test/save flow.
 - Add safety notes for secrets and production connection colors.
 
-- [ ] **Step 2: Update Database Support in both locales**
+- [x] **Step 2: Update Database Support in both locales**
 
 Use these facts:
 
@@ -167,7 +167,7 @@ Content requirements:
 - Keep DM/ODBC notes where still relevant.
 - Add a note that feature support is intentionally database-specific.
 
-- [ ] **Step 3: Update JDBC Plugin docs in both locales**
+- [x] **Step 3: Update JDBC Plugin docs in both locales**
 
 Use these facts:
 
@@ -182,7 +182,7 @@ Content requirements:
 - Document driver JAR import, driver class, connection test, and troubleshooting boundaries.
 - Add security and compatibility notes.
 
-- [ ] **Step 4: Lightly update SSH Tunnel and Config Export in both locales**
+- [x] **Step 4: Lightly update SSH Tunnel and Config Export in both locales**
 
 Use these facts:
 
@@ -195,7 +195,7 @@ Content requirements:
 - Add concise boundary notes without turning these pages into internals docs.
 - Ensure links to Getting Started and Database Support are present.
 
-- [ ] **Step 5: Mark this task complete in this plan**
+- [x] **Step 5: Mark this task complete in this plan**
 
 Edit this file and check all Task 2 boxes after both English and Chinese files are updated.
 
@@ -218,7 +218,7 @@ Edit this file and check all Task 2 boxes after both English and Chinese files a
 - Modify: `docs/content/docs/field-lineage.cn.mdx`
 - Modify: `docs/superpowers/plans/2026-05-17-docs-mdx-code-sync-plan.md`
 
-- [ ] **Step 1: Update Query Editor in both locales**
+- [x] **Step 1: Update Query Editor in both locales**
 
 Use these facts:
 
@@ -234,7 +234,7 @@ Content requirements:
 - Link to AI Assistant and Data Grid.
 - Keep shortcut table.
 
-- [ ] **Step 2: Update Data Grid in both locales**
+- [x] **Step 2: Update Data Grid in both locales**
 
 Use these facts:
 
@@ -247,7 +247,7 @@ Content requirements:
 - Add review-before-save behavior.
 - Add export and copy formats.
 
-- [ ] **Step 3: Update Schema Browser and related schema pages in both locales**
+- [x] **Step 3: Update Schema Browser and related schema pages in both locales**
 
 Use these facts:
 
@@ -261,7 +261,7 @@ Content requirements:
 - Add capability boundary tables.
 - Cross-link schema diff, table structure, field lineage, database search if documented.
 
-- [ ] **Step 4: Mark this task complete in this plan**
+- [x] **Step 4: Mark this task complete in this plan**
 
 Edit this file and check all Task 3 boxes after updates are complete.
 
@@ -284,7 +284,7 @@ Edit this file and check all Task 3 boxes after updates are complete.
 - Modify: `docs/content/docs/mcp.cn.mdx`
 - Modify: `docs/superpowers/plans/2026-05-17-docs-mdx-code-sync-plan.md`
 
-- [ ] **Step 1: Update Data Transfer in both locales**
+- [x] **Step 1: Update Data Transfer in both locales**
 
 Use these facts:
 
@@ -298,7 +298,7 @@ Content requirements:
 - Add source/target database support boundaries.
 - Add review and cancellation notes.
 
-- [ ] **Step 2: Update Table Import in both locales**
+- [x] **Step 2: Update Table Import in both locales**
 
 Use these facts:
 
@@ -315,7 +315,7 @@ Content requirements:
 - Add mapping rules and duplicate target column warning.
 - Add append/truncate mode safety callout.
 
-- [ ] **Step 3: Update SQL File and Database Export in both locales**
+- [x] **Step 3: Update SQL File and Database Export in both locales**
 
 Use these facts:
 
@@ -329,7 +329,7 @@ Content requirements:
 - Add supported/unsupported database notes.
 - Add backup and import/export round-trip guidance.
 
-- [ ] **Step 4: Update AI Assistant in both locales**
+- [x] **Step 4: Update AI Assistant in both locales**
 
 Use these facts:
 
@@ -344,7 +344,7 @@ Content requirements:
 - Add SQL safety table.
 - Add schema context and `@table` mention guidance.
 
-- [ ] **Step 5: Update MCP in both locales**
+- [x] **Step 5: Update MCP in both locales**
 
 Use these facts:
 
@@ -360,7 +360,7 @@ Content requirements:
 - Add desktop vs web mode table.
 - Add safety environment variable section.
 
-- [ ] **Step 6: Mark this task complete in this plan**
+- [x] **Step 6: Mark this task complete in this plan**
 
 Edit this file and check all Task 4 boxes after updates are complete.
 
@@ -376,7 +376,7 @@ Edit this file and check all Task 4 boxes after updates are complete.
 - Modify: any previously touched MDX page with broken cross-links or mismatched headings
 - Modify: `docs/superpowers/plans/2026-05-17-docs-mdx-code-sync-plan.md`
 
-- [ ] **Step 1: Update What Is DBX in both locales**
+- [x] **Step 1: Update What Is DBX in both locales**
 
 Use these facts:
 
@@ -389,7 +389,7 @@ Content requirements:
 - Ensure feature list matches the revised core pages.
 - Keep screenshot reference intact unless broken.
 
-- [ ] **Step 2: Review changelog pages without inventing releases**
+- [x] **Step 2: Review changelog pages without inventing releases**
 
 Run:
 
@@ -403,7 +403,7 @@ Expected:
 - If only intro wording or links need consistency fixes, edit them.
 - Do not add unreleased entries.
 
-- [ ] **Step 3: Scan all MDX links for obvious locale mistakes**
+- [x] **Step 3: Scan all MDX links for obvious locale mistakes**
 
 Run:
 
@@ -417,7 +417,7 @@ Expected:
 - Chinese docs use `/cn/docs/...`.
 - No accidentally mixed locale links in newly edited sections.
 
-- [ ] **Step 4: Mark this task complete in this plan**
+- [x] **Step 4: Mark this task complete in this plan**
 
 Edit this file and check all Task 5 boxes after updates are complete.
 
@@ -430,7 +430,7 @@ Edit this file and check all Task 5 boxes after updates are complete.
 - Verify: `docs/package.json`
 - Modify: `docs/superpowers/plans/2026-05-17-docs-mdx-code-sync-plan.md`
 
-- [ ] **Step 1: Check bilingual page pairs exist**
+- [x] **Step 1: Check bilingual page pairs exist**
 
 Run:
 
@@ -462,7 +462,7 @@ NODE
 
 Expected: exit code 0 and no missing page output.
 
-- [ ] **Step 2: Check English/Chinese heading parity for edited page pairs**
+- [x] **Step 2: Check English/Chinese heading parity for edited page pairs**
 
 Run:
 
@@ -487,7 +487,7 @@ NODE
 
 Expected: no output. If output appears, inspect whether the mismatch is intentional. Fix unintentional mismatches.
 
-- [ ] **Step 3: Build the docs site**
+- [x] **Step 3: Build the docs site**
 
 Run:
 
@@ -497,7 +497,7 @@ pnpm --dir docs build
 
 Expected: Next/Fumadocs build completes successfully.
 
-- [ ] **Step 4: Review git diff**
+- [x] **Step 4: Review git diff**
 
 Run:
 
@@ -511,7 +511,7 @@ Expected:
 - Only documentation content and plan progress changed.
 - No generated cache, build output, or unrelated source changes are included.
 
-- [ ] **Step 5: Commit docs content changes**
+- [x] **Step 5: Commit docs content changes**
 
 Run:
 
@@ -524,6 +524,6 @@ Expected:
 
 - Commit succeeds with a Conventional Commit message.
 
-- [ ] **Step 6: Mark this task complete in this plan**
+- [x] **Step 6: Mark this task complete in this plan**
 
 If the plan file is already committed before this checkbox is marked, leave the completion status in the final response instead of making a follow-up commit only for this checkbox.

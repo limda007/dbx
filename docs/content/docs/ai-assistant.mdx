@@ -38,6 +38,30 @@ AI-generated SQL is not executed automatically. Review table names, columns, fil
 When no API key is configured, AI features should prompt the user to complete setup instead of failing silently.
 </Callout>
 
+## Ask Mode And Agent Mode
+
+| Mode | Behavior | Execution |
+|---|---|---|
+| Ask | Generates SQL, explanations, fixes, optimizations, dialect conversions, or sample data | Does not imply anything has run |
+| Agent | Prioritizes one executable SQL statement when the user clearly asks DBX to query data | DBX evaluates the generated SQL before attempting execution |
+
+## Schema Context
+
+AI prompts can include the current database type, connection name, database, current SQL, recent error, result preview, and schema context. Schema context contains tables, columns, indexes, and foreign keys.
+
+When a schema is large, DBX truncates context. Use `@table` or `@schema.table` mentions in your prompt to prioritize the tables you want AI to reason about.
+
+## SQL Safety Policy
+
+| SQL Category | DBX Behavior |
+|---|---|
+| Read-only statements such as `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, `EXPLAIN` | Can be auto-executed in Agent mode when the user clearly asks to query |
+| Scoped low-risk writes such as `INSERT` or keyed `UPDATE` | Auto-execute only in clearly non-production environments; otherwise confirm |
+| Multiple statements, `DELETE`, `MERGE`, `REPLACE`, `CREATE`, or unknown SQL | Confirm before execution |
+| Dangerous statements such as `DROP`, `TRUNCATE`, `ALTER`, `RENAME`, or broad `UPDATE` | Blocked by the AI execution policy |
+
+Production-like connection names, hosts, or database names make DBX more conservative. Generated SQL is still text from an AI model; review it like code before trusting it.
+
 ## Common Uses
 
 ### Generate SQL

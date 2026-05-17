@@ -12,6 +12,7 @@ Database Export writes table structure and table data into a SQL file. Use it be
 | Structure | `CREATE TABLE`, columns, primary keys, indexes, constraints, and other DDL |
 | Data | Rows exported as `INSERT` statements |
 | Batched inserts | Multiple rows grouped into one `INSERT` to reduce file size and import overhead |
+| Objects | Views, procedures, and functions where the database exposes source definitions |
 
 Example:
 
@@ -33,7 +34,7 @@ INSERT INTO users (id, name, email) VALUES
   <Step>
     ### Configure Export Options
 
-    DBX currently exports up to `10,000` rows per table. Tables that hit the limit are marked as truncated in the generated file.
+    Choose whether to include structure, data, and database objects. You can export all tables or a selected table subset.
   </Step>
   <Step>
     ### Choose Output Location
@@ -43,18 +44,23 @@ INSERT INTO users (id, name, email) VALUES
   <Step>
     ### Start Export
 
-    DBX generates a SQL file containing structure and data.
+    DBX generates a SQL file and reports the current object, progress, row counts, errors, and cancellation state.
   </Step>
 </Steps>
 
-## Row Limits
+## Batching And Selection
 
-Database export currently uses a fixed `10,000` rows per table limit. This is useful when:
+DBX reads table data in batches and writes generated `INSERT` statements into the output file. If batch size is not set, the export uses a default batch size of 1000 rows.
 
-- You only need schema plus sample data
-- Full table data is too large to export
-- You are creating a smaller dev or test dataset
-- You need a minimal reproduction file for debugging
+Selected-table export filters the table list before generating DDL and data. Routine objects such as procedures and functions are included only when object export is enabled and the export is not limited to a table subset.
+
+<Callout type="info">
+For MySQL exports, DBX temporarily writes `SET FOREIGN_KEY_CHECKS = 0` before table content and re-enables it at the end of the file.
+</Callout>
+
+## Cancellation And Errors
+
+You can cancel an export between objects or row batches. If a specific table or object cannot be exported, DBX writes a SQL comment with the error and continues with the remaining export where possible.
 
 ## Importing the Export
 

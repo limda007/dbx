@@ -18,6 +18,7 @@ When creating or editing a connection, enable the SSH tunnel option:
 | SSH Host | Hostname or IP of the SSH server |
 | SSH Port | Port for SSH (default: 22) |
 | SSH User | Username for SSH authentication |
+| Connect Timeout | Maximum time DBX waits while opening the SSH connection; default is 5 seconds |
 
 ## Authentication Methods
 
@@ -50,3 +51,18 @@ By default, the SSH tunnel listens on `localhost` only. Enable LAN exposure to b
 3. Connects to the database through the forwarded local port
 
 The tunnel remains active for the duration of the connection and closes automatically when you disconnect.
+
+## SSH, Proxy, And File Databases
+
+SSH tunnels are available for network databases. SQLite and Access connections are file-based and do not use SSH. DuckDB usually uses a local file as well, so only configure SSH when the selected driver profile actually needs a network endpoint.
+
+If your network requires a proxy instead of SSH, use the connection dialog's proxy tab. DBX supports SOCKS5 and HTTP proxy settings with optional username and password.
+
+<Cards>
+  <Card title="Create a Connection" href="/en/docs/getting-started">
+    Configure the database profile, SSH, proxy, SSL, and connection color together.
+  </Card>
+  <Card title="Database Support" href="/en/docs/databases">
+    Check which database profiles are file-based, native, compatibility-based, or plugin-backed.
+  </Card>
+</Cards>

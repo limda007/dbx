@@ -12,7 +12,9 @@ description: 将 CSV、TSV、JSON 或 Excel 文件导入数据库表，并检查
 | CSV | 逗号分隔文本，适合通用数据交换 |
 | TSV | 制表符分隔文本，适合字段中包含逗号的场景 |
 | JSON | JSON 数组，适合从接口或脚本导出的数据 |
-| Excel | `.xlsx` 或 `.xls` 文件 |
+| Excel | `.xlsx`、`.xlsm` 或 `.xls` 文件；DBX 读取第一个工作表 |
+
+DBX 会在导入前预览前 50 行。CSV/TSV 中的空单元格会按 `NULL` 处理。JSON 可以是单个对象、对象数组或数组行；对象行和数组行混用会被拒绝。
 
 ## 导入流程
 
@@ -54,6 +56,20 @@ description: 将 CSV、TSV、JSON 或 Excel 文件导入数据库表，并检查
 <Callout type="warn">
 清空后导入会删除目标表中的现有数据。生产环境使用前请确认备份和影响范围。
 </Callout>
+
+导入会分批执行。默认批大小为 500 行，进度视图会显示已导入行数、总行数、错误和取消状态。
+
+## 字段映射规则
+
+- 先按字段名精确匹配
+- 也会按规范化名称匹配，忽略大小写、空格、下划线和连字符差异
+- 源字段可以跳过
+- 同一个目标字段不能被重复映射
+- 至少需要映射一个字段才能开始导入
+
+## 数据库覆盖范围
+
+表数据导入支持 MySQL、PostgreSQL、SQLite、DuckDB、ClickHouse、SQL Server、Oracle、Doris、StarRocks、Redshift、DM、GaussDB、KingBase、HighGo、Vastbase、GoldenDB 和 Access。
 
 ## 导入前检查
 

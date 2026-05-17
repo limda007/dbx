@@ -124,6 +124,17 @@ Execute a SQL query and return results (max 100 rows).
 | `connection_name` | Yes | DBX connection name |
 | `sql` | Yes | SQL query |
 
+### `dbx_get_schema_context`
+
+Return compact table and column context for SQL generation.
+
+| Parameter | Required | Description |
+|---|---|---|
+| `connection_name` | Yes | DBX connection name |
+| `schema` | No | Schema name |
+| `tables` | No | Specific table names to include |
+| `max_tables` | No | Maximum number of tables to include; capped between 1 and 20 |
+
 ### `dbx_add_connection`
 
 Add a new database connection to DBX.
@@ -198,7 +209,28 @@ AI Agent → MCP Server → HTTP localhost → DBX backend → Tauri event → F
 
 ### Supported Databases
 
-MCP query support: PostgreSQL, MySQL, and compatible databases (Doris, StarRocks, etc.). UI integration (open table) supports all database types in DBX.
+MCP query support in desktop local mode is implemented for PostgreSQL, MySQL, and compatible databases. Web mode delegates to the DBX web backend configured by `DBX_WEB_URL`. UI integration such as opening a table supports all database types that the running DBX desktop app can open.
+
+### SQL Safety
+
+MCP query execution is intentionally conservative:
+
+| Rule | Default |
+|---|---|
+| Empty or unrecognized SQL | Blocked |
+| More than one SQL statement | Blocked |
+| Non-read SQL | Blocked unless writes are explicitly allowed |
+| `DROP`, `TRUNCATE`, or `ALTER` | Blocked unless dangerous SQL is explicitly allowed |
+| `UPDATE` or `DELETE` without `WHERE` when writes are allowed | Blocked |
+
+Set `DBX_MCP_ALLOW_WRITES=1` to allow write statements. Set `DBX_MCP_ALLOW_DANGEROUS_SQL=1` only in controlled environments where destructive SQL is expected.
+
+### Desktop And Web Mode
+
+| Mode | How It Is Selected | Notes |
+|---|---|---|
+| Desktop local mode | Default | Reads DBX desktop connection storage and can call desktop-only UI bridge tools |
+| Web mode | Set `DBX_WEB_URL` | Sends requests to the DBX web backend instead of reading local desktop storage |
 
 ## FAQ
 

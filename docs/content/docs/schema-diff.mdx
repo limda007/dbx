@@ -59,6 +59,10 @@ Schema sync may include destructive operations such as dropping tables, dropping
 Schema Diff currently does not fully compare foreign keys, triggers, view definitions, column comments, or changed columns/uniqueness inside an index with the same name. Important migrations still need manual SQL review.
 </Callout>
 
+## Database Coverage
+
+Schema Diff depends on table, column, and index metadata. It works best on relational engines where DBX can list structures consistently, such as MySQL, PostgreSQL, SQLite, SQL Server, Oracle, Redshift, DM, and GaussDB-family engines. Redis, MongoDB, and Elasticsearch use different data models and are not good targets for relational schema sync.
+
 ## Before Running Sync SQL
 
 Before applying generated SQL, confirm:
@@ -77,5 +81,8 @@ Before applying generated SQL, confirm:
   </Card>
   <Card title="Database Export" href="/en/docs/database-export">
     Export structure and data before high-risk sync operations.
+  </Card>
+  <Card title="Database Support" href="/en/docs/databases">
+    Check which engines support schema and structure workflows.
   </Card>
 </Cards>

@@ -1,76 +1,100 @@
 ---
 title: Database Support
-description: 25+ database engines through native Rust drivers by default, with optional JDBC plugin support for more databases.
+description: Understand which databases DBX can connect to and which advanced features are available per engine.
 ---
 
 <Callout type="info">
-DBX uses native Rust drivers by default, with no JDBC required. For additional databases, install the optional [JDBC plugin](/docs/plugins).
+DBX uses native Rust drivers for the main app whenever possible. Some engines are compatibility profiles over MySQL or PostgreSQL protocols, and some are handled through Agent drivers or the optional [JDBC Plugin](/en/docs/plugins).
 </Callout>
 
-## Fully Supported
+## Connection Profiles
 
-| Database | Driver | Protocol |
+The connection dialog exposes ready-to-use profiles with default ports and driver labels.
+
+| Group | Profiles | Notes |
 |---|---|---|
-| MySQL | sqlx | MySQL |
-| PostgreSQL | sqlx | PostgreSQL |
-| SQLite | sqlx | Embedded |
-| Redis | redis-rs | RESP |
-| MongoDB | mongodb | MongoDB Wire |
-| DuckDB | duckdb-rs | Embedded |
-| ClickHouse | HTTP client | HTTP |
-| SQL Server | tiberius | TDS |
-| Oracle | oracle-rs | OCI |
-| Elasticsearch | HTTP client | REST |
-| DM (Dameng) | odbc-api | ODBC |
-| GaussDB | rust-gaussdb | GaussDB |
+| Core SQL engines | MySQL, PostgreSQL, SQLite, DuckDB, ClickHouse, SQL Server, Oracle, Redshift, DM, GaussDB | Available directly in the DBX connection picker |
+| Document and key-value engines | Redis, MongoDB, Elasticsearch | Use dedicated browsers or query flows instead of the generic relational grid where appropriate |
+| MySQL-compatible profiles | MariaDB, TiDB, OceanBase, Doris, SelectDB, StarRocks, GoldenDB, custom MySQL | Reuse MySQL-style connection handling where the engine speaks a compatible protocol |
+| PostgreSQL-compatible profiles | openGauss, KingBase, HighGo, Vastbase, CockroachDB, custom PostgreSQL | Reuse PostgreSQL-style connection handling where the engine speaks a compatible protocol |
+| File-based engines | SQLite, DuckDB, Microsoft Access | Choose a local database file instead of host and port |
+| Agent/JDBC-oriented engines | H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, TDengine, JDBC | Feature coverage depends on the driver path used by that engine |
 
-## MySQL Compatible
+## Default Ports
 
-These databases use MySQL protocol and work with the MySQL driver out of the box:
-
-| Database | Default Port |
-|---|---|
-| MariaDB | 3306 |
+| Profile | Default Port |
+|---|---:|
+| MySQL / MariaDB / GoldenDB | 3306 |
+| PostgreSQL / openGauss / GaussDB / Vastbase | 5432 |
+| Redis | 6379 |
+| MongoDB | 27017 |
+| ClickHouse | 8123 |
+| SQL Server | 1433 |
+| Oracle | 1521 |
+| Elasticsearch | 9200 |
 | TiDB | 4000 |
 | OceanBase | 2881 |
-| GoldenDB | 3306 |
-| Doris | 9030 |
-| SelectDB | 9030 |
-| StarRocks | 9030 |
+| Doris / SelectDB / StarRocks | 9030 |
+| Redshift | 5439 |
+| CockroachDB | 26257 |
+| DM | 5236 |
+| KingBase | 54321 |
+| HighGo | 5866 |
+| H2 | 9092 |
+| Snowflake | 443 |
+| Trino | 8080 |
+| Hive | 10000 |
+| DB2 | 50000 |
+| Informix | 9088 |
+| Neo4j | 7687 |
+| Cassandra | 9042 |
+| BigQuery | 443 |
+| Kylin | 7070 |
+| SunDB | 22000 |
 | TDengine | 6041 |
 
 <Callout type="info">
-OceanBase supports automatic Oracle mode detection — when connected to an OceanBase instance running in Oracle mode, DBX automatically switches to Oracle-style schema queries.
+SQLite, DuckDB, Access, and JDBC profiles use port `0` in the saved connection model when a network port is not part of the connection.
 </Callout>
 
-These databases use PostgreSQL protocol and work with the PostgreSQL driver:
+## Feature Matrix
 
-| Database | Default Port |
+DBX intentionally enables advanced workflows only where the app has enough metadata and SQL-generation support.
+
+| Feature | Supported Types |
 |---|---|
-| openGauss | 5432 |
-| KingBase | 54321 |
-| Vastbase | 5432 |
-| Redshift | 5439 |
-| CockroachDB | 26257 |
+| Schema-aware tree | PostgreSQL, SQL Server, Oracle, Redshift, DM, GaussDB, KingBase, HighGo, Vastbase, JDBC, H2, Snowflake, Trino, DB2, TDengine |
+| ER diagram | MySQL, PostgreSQL, SQLite, SQL Server, Oracle, Redshift, DM, GaussDB, KingBase, HighGo, Vastbase, GoldenDB, Access, H2, DB2 |
+| Database search | MySQL, PostgreSQL, SQLite, SQL Server, Oracle, Redshift, DuckDB, ClickHouse, DM, GaussDB, KingBase, HighGo, Vastbase, GoldenDB, Access, H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, TDengine |
+| Table import | MySQL, PostgreSQL, SQLite, DuckDB, ClickHouse, SQL Server, Oracle, Doris, StarRocks, Redshift, DM, GaussDB, KingBase, HighGo, Vastbase, GoldenDB, Access |
+| Table structure editor | MySQL, PostgreSQL, SQLite, SQL Server |
+| Create database | MySQL, PostgreSQL, SQL Server, ClickHouse, Oracle, DM, GaussDB, Doris, StarRocks, Redshift |
+| Field lineage | MySQL, PostgreSQL, SQLite, SQL Server, Oracle, Redshift, DM, GaussDB |
+| Data transfer | MySQL, PostgreSQL, SQLite, SQL Server, Oracle, ClickHouse, DuckDB, DM, GaussDB |
+| SQL file execution unavailable | Redis, MongoDB, Elasticsearch |
 
-## ODBC Databases
+<Callout type="warn">
+If a database can connect but does not appear in a feature row, that feature may be hidden or limited for that engine. This prevents DBX from generating SQL it cannot review reliably.
+</Callout>
 
-DM (Dameng) connects through ODBC, which requires an ODBC driver installed on your system.
+## Connection Options
 
-### DM (Dameng)
+Most network databases support host, port, username, password, default database, optional URL parameters, SSL, connection color, SSH tunnel, and proxy settings. File-based engines replace host and port with a file picker.
 
-DM8 connects via the DM ODBC driver. Default port: **5236**, default user: **SYSDBA**.
+DBX can also parse common connection URLs for engines such as MySQL, PostgreSQL, Redis, MongoDB, ClickHouse, SQL Server, Oracle, Elasticsearch, DM, GaussDB, openGauss, TDengine, and Access.
+
+## DM And ODBC
+
+DM uses an ODBC-based path and requires the DM ODBC driver installed on the machine running DBX.
 
 <Tabs groupId="dm-platform" items={['Linux', 'Windows', 'macOS']}>
   <Tab value="Linux">
     ```bash
-    # Install unixODBC
     sudo apt install unixodbc
 
-    # Install DM8 (includes ODBC driver)
+    # Install DM8, which includes the ODBC driver.
     # Download from https://eco.dameng.com/download/
 
-    # Register the driver in /etc/odbcinst.ini
     sudo tee -a /etc/odbcinst.ini << 'EOF'
     [DM8 ODBC DRIVER]
     Description = DM8 ODBC Driver
@@ -79,13 +103,25 @@ DM8 connects via the DM ODBC driver. Default port: **5236**, default user: **SYS
     ```
   </Tab>
   <Tab value="Windows">
-    The DM8 installer automatically registers the ODBC driver. No manual configuration needed.
+    The DM installer normally registers the ODBC driver automatically.
   </Tab>
   <Tab value="macOS">
-    DM does not provide a native macOS ODBC driver. For development/testing, DM is best accessed from Linux.
+    DM does not provide a native macOS ODBC driver. Use a Linux host for DM development or testing when possible.
   </Tab>
 </Tabs>
 
-## Optional JDBC Plugin
+## Extending Support
 
-If your target database is not built in, or if you must use a vendor JDBC driver, create a JDBC connection with the [JDBC plugin](/docs/plugins). The JDBC plugin does not increase the main DBX installer size and does not automatically download vendor drivers.
+Use the [JDBC Plugin](/en/docs/plugins) when a database is not covered by the built-in profiles or when your team must use a vendor JDBC driver. JDBC keeps vendor driver JARs outside the main DBX app, so you control which driver files are installed.
+
+<Cards>
+  <Card title="Create a Connection" href="/en/docs/getting-started">
+    Install DBX, choose a database profile, and test the first connection.
+  </Card>
+  <Card title="JDBC Plugin" href="/en/docs/plugins">
+    Install the optional JDBC plugin and import vendor driver JARs.
+  </Card>
+  <Card title="SSH Tunnel" href="/en/docs/ssh-tunnel">
+    Reach databases behind private networks or bastion hosts.
+  </Card>
+</Cards>
