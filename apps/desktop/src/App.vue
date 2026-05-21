@@ -29,6 +29,7 @@ import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/api";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
+import { findTreeNodeById, resolveNewQueryTarget } from "@/lib/newQueryContext";
 import { buildExecutableObjectSourceStatements, objectSourceSaveExecutionMode } from "@/lib/objectSourceEditor";
 import { resolveExecutableSql } from "@/lib/sqlExecutionTarget";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
@@ -114,6 +115,7 @@ const selectedSql = ref("");
 const cursorPos = ref(0);
 const formatSqlRequestId = ref(0);
 const activeOutputView = ref<"result" | "explain" | "chart">("result");
+const newQueryContextSource = ref<"tab" | "sidebar">("tab");
 const showSaveSqlDialog = ref(false);
 const saveSqlName = ref("");
 const saveSqlFolderId = ref("");
@@ -206,10 +208,18 @@ const saveSqlFolders = computed(() => {
 watch(
   () => queryStore.activeTabId,
   (id) => {
+    if (id) newQueryContextSource.value = "tab";
     selectedSql.value = "";
     activeOutputView.value = "result";
     showDriverStore.value = false;
     if (id) queryStore.reloadEvictedTab(id);
+  },
+);
+
+watch(
+  () => connectionStore.selectedTreeNodeId,
+  (id) => {
+    if (id) newQueryContextSource.value = "sidebar";
   },
 );
 
@@ -435,16 +445,24 @@ function setConnectionDialogOpen(value: boolean) {
 }
 
 async function newQuery() {
-  const connId = connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
-  if (!connId) return;
-  const conn = connectionStore.getConfig(connId);
+  const target = resolveNewQueryTarget({
+    activeTab: activeTab.value,
+    selectedTreeNode: findTreeNodeById(connectionStore.treeNodes, connectionStore.selectedTreeNodeId),
+    activeConnectionId: connectionStore.activeConnectionId,
+    connections: connectionStore.connections,
+    preferredSource: newQueryContextSource.value,
+  });
+  if (!target) return;
+  const conn = connectionStore.getConfig(target.connectionId);
   if (!conn) return;
-  connectionStore.activeConnectionId = connId;
-  const tabId = queryStore.createTab(conn.id, resolveDefaultDatabase(conn, []));
+  connectionStore.activeConnectionId = target.connectionId;
+  const tabId = queryStore.createTab(conn.id, target.database);
   try {
-    await connectionStore.ensureConnected(connId);
-    const options = await getDatabaseOptions(connId);
-    queryStore.updateDatabase(tabId, resolveDefaultDatabase(conn, options));
+    await connectionStore.ensureConnected(target.connectionId);
+    if (target.shouldRefreshDefaultDatabase) {
+      const options = await getDatabaseOptions(target.connectionId);
+      queryStore.updateDatabase(tabId, resolveDefaultDatabase(conn, options));
+    }
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
