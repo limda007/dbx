@@ -577,6 +577,52 @@ fn mysql_url_verifies_identity(url: &str) -> bool {
     })
 }
 
+fn is_jdbc_param(key: &str) -> bool {
+    match key.to_ascii_lowercase().as_str() {
+        "useunicode"
+        | "characterencoding"
+        | "zerodatetimebehavior"
+        | "usessl"
+        | "servertimezone"
+        | "allowpublickeyretrieval"
+        | "autoreconnect"
+        | "maxreconnects"
+        | "uselegacydatetimecode"
+        | "usecompression"
+        | "cacheprepstmts"
+        | "useserverprepstmts"
+        | "useconfigs"
+        | "usecursorfetch"
+        | "defaultfetchsize"
+        | "usejdbccomplianttimezoneshift"
+        | "usesspscompatibletimezoneshift"
+        | "failoverreadonly"
+        | "maxallowedpacket"
+        | "tinyint1isbit"
+        | "transformedbitisboolean"
+        | "yearisdatetype"
+        | "createdatabaseifnotexist"
+        | "noaccesstoprocedurebodies"
+        | "nullcatalogmeanscurrent"
+        | "nullnamepatternmatchesall"
+        | "dumponqueriesexception"
+        | "enablequerytimeouts"
+        | "useinformationschema"
+        | "gatherperfmetrics"
+        | "reportmetricsintervalmillis"
+        | "maxquerysizetolog"
+        | "packetdebugbuffersize"
+        | "usenanosforelapsedtime"
+        | "slowquerythresholdmillis"
+        | "autoslowlog"
+        | "explainslowqueries"
+        | "resultsetsizethreshold"
+        | "nettimeoutforstreamingresults"
+        | "useusageadvisor" => true,
+        _ => false,
+    }
+}
+
 fn mysql_async_url(url: &str) -> Cow<'_, str> {
     let Some((base, query)) = url.split_once('?') else {
         return Cow::Borrowed(url);
@@ -615,6 +661,9 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
                 "verify_identity" => filtered.push("require_ssl=true".to_string()),
                 _ => {}
             }
+            continue;
+        }
+        if is_jdbc_param(key) {
             continue;
         }
         filtered.push(segment.to_string());
@@ -1346,6 +1395,18 @@ mod tests {
             mysql_async_url(url).as_ref(),
             "mysql://host:3306/db?require_ssl=true&verify_ca=false&verify_identity=false"
         );
+    }
+
+    #[test]
+    fn mysql_async_url_strips_jdbc_params() {
+        let url = "mysql://host:3306/db?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8&allowPublicKeyRetrieval=true";
+        assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db");
+    }
+
+    #[test]
+    fn mysql_async_url_keeps_valid_params_while_stripping_jdbc() {
+        let url = "mysql://host:3306/db?useUnicode=true&characterEncoding=utf8&require_ssl=true&charset=utf8mb4&autoReconnect=true";
+        assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db?require_ssl=true");
     }
 
     #[test]

@@ -546,7 +546,8 @@ impl AppState {
         // before performing I/O-heavy health checks to avoid blocking writers.
         let checks: Vec<(String, PoolKind)> = {
             let conns = self.connections.read().await;
-            conns.iter()
+            conns
+                .iter()
                 .filter(|(_, pool)| matches!(pool, PoolKind::Mysql(..) | PoolKind::Postgres(..)))
                 .map(|(key, pool)| (key.clone(), clone_pool_kind(pool)))
                 .collect()
