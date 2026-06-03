@@ -29,9 +29,9 @@ import {
   Pin,
   ArrowRightLeft,
   Download,
+  Upload,
   FileCode,
   Network,
-  FileUp,
   PencilRuler,
   Search,
   FolderInput,
@@ -2785,7 +2785,7 @@ const shortcutDelete = "Delete";
 function exportDataSubmenu(): ContextMenuItem {
   return {
     label: t("contextMenu.exportData"),
-    icon: Download,
+    icon: Upload,
     children: [
       { label: "CSV", action: () => exportData("csv") },
       { label: "JSON", action: () => exportData("json") },
@@ -2944,7 +2944,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: t("transfer.dataTransfer"), action: openTransfer, icon: ArrowRightLeft });
     items.push({ label: t("diff.title"), action: openSchemaDiff, icon: ArrowRightLeft });
     items.push({ label: t("dataCompare.title"), action: openDataCompare, icon: ArrowRightLeft });
-    items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Download });
+    items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Upload });
     if (canCloseDatabaseConnection.value) {
       items.push({ label: "", separator: true });
       items.push({ label: t("contextMenu.closeDatabaseConnection"), action: closeDatabaseConnection, icon: Unplug });
@@ -3023,14 +3023,14 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: t("diagram.open"), action: openDiagram, icon: Network });
     }
     if (canOpenTableImport.value) {
-      items.push({ label: t("contextMenu.importData"), action: openTableImport, icon: FileUp });
+      items.push({ label: t("contextMenu.importData"), action: openTableImport, icon: Download });
     }
     if (isTableNotView.value) {
       items.push({ label: t("dataCompare.title"), action: openDataCompare, icon: ArrowRightLeft });
     }
     items.push({ label: "", separator: true });
     items.push(exportDataSubmenu());
-    items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Download });
+    items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Upload });
     items.push({ label: t("contextMenu.exportStructure"), action: exportStructure, icon: FileCode });
     items.push(copyStructureAsSubmenu());
     if (isTableNotView.value) {

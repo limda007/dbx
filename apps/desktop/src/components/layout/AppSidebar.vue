@@ -66,26 +66,32 @@ defineExpose({ focusSearch });
           t("sidebar.connections")
         }}</span>
         <span class="flex-1 self-stretch" data-tauri-drag-region />
-        <LightDropdown
-          model-value=""
-          :items="importSourceItems"
-          :aria-label="t('sidebar.import')"
-          :trigger-title="t('sidebar.import')"
-          :trigger-icon="Upload"
-          trigger-class="inline-flex h-6 w-5 items-center justify-center rounded-md outline-none hover:bg-muted hover:text-foreground focus-visible:ring-0"
-          trigger-icon-class="h-4 w-4"
-          content-class="w-44"
-          :show-trigger-label="false"
-          :show-chevron="false"
-          :highlight-selected="false"
-          check-position="none"
-          align="end"
-          @update:model-value="(source) => emit('import', source as 'dbx' | 'navicat' | 'dbeaver')"
-        />
+        <Tooltip>
+          <TooltipTrigger as-child>
+            <span class="inline-flex">
+              <LightDropdown
+                model-value=""
+                :items="importSourceItems"
+                :aria-label="t('sidebar.import')"
+                :trigger-icon="Download"
+                trigger-class="inline-flex h-6 w-5 items-center justify-center rounded-md outline-none hover:bg-muted hover:text-foreground focus-visible:ring-0"
+                trigger-icon-class="h-4 w-4"
+                content-class="w-44"
+                :show-trigger-label="false"
+                :show-chevron="false"
+                :highlight-selected="false"
+                check-position="none"
+                align="end"
+                @update:model-value="(source) => emit('import', source as 'dbx' | 'navicat' | 'dbeaver')"
+              />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{{ t("sidebar.import") }}</TooltipContent>
+        </Tooltip>
         <Tooltip>
           <TooltipTrigger as-child>
             <Button variant="ghost" size="icon" class="h-5 w-5" @click="emit('export')">
-              <Download class="h-3 w-3" />
+              <Upload class="h-3 w-3" />
             </Button>
           </TooltipTrigger>
           <TooltipContent>{{ t("sidebar.export") }}</TooltipContent>

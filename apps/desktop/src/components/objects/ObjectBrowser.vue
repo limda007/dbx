@@ -17,7 +17,7 @@ import {
   Eraser,
   Eye,
   FileCode,
-  FileUp,
+  Upload,
   Loader2,
   Network,
   Pencil,
@@ -1197,7 +1197,7 @@ watch(
 function exportDataSubmenu(item: ObjectBrowserRow): ContextMenuItem {
   return {
     label: t("contextMenu.exportData"),
-    icon: Download,
+    icon: Upload,
     children: [
       { label: "CSV", action: () => exportData(item, "csv") },
       { label: "JSON", action: () => exportData(item, "json") },
@@ -1219,12 +1219,12 @@ function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     { label: t("contextMenu.newQuery"), action: () => openNewQuery(item), icon: TerminalSquare },
     ...(canOpenDiagram.value ? [{ label: t("diagram.open"), action: () => openDiagram(item), icon: Network }] : []),
     ...(canOpenTableImport.value
-      ? [{ label: t("contextMenu.importData"), action: () => openTableImport(item), icon: FileUp }]
+      ? [{ label: t("contextMenu.importData"), action: () => openTableImport(item), icon: Download }]
       : []),
     { label: t("dataCompare.title"), action: () => openDataCompare(item), icon: ArrowRightLeft },
     { label: "", separator: true },
     exportDataSubmenu(item),
-    { label: t("contextMenu.exportDatabase"), action: () => openDatabaseExport(item), icon: Download },
+    { label: t("contextMenu.exportDatabase"), action: () => openDatabaseExport(item), icon: Upload },
     { label: t("contextMenu.exportStructure"), action: () => exportStructure(item), icon: FileCode },
     { label: "", separator: true },
     { label: t("contextMenu.duplicateStructure"), action: () => requestDuplicateStructure(item), icon: CopyPlus },
@@ -1269,7 +1269,7 @@ function getViewMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     ...(canOpenDiagram.value ? [{ label: t("diagram.open"), action: () => openDiagram(item), icon: Network }] : []),
     { label: "", separator: true },
     exportDataSubmenu(item),
-    { label: t("contextMenu.exportDatabase"), action: () => openDatabaseExport(item), icon: Download },
+    { label: t("contextMenu.exportDatabase"), action: () => openDatabaseExport(item), icon: Upload },
     { label: t("contextMenu.exportStructure"), action: () => exportStructure(item), icon: FileCode },
     { label: "", separator: true },
     {
