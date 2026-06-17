@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
-import { Play, Copy, TextSelect } from "@lucide/vue";
+import { Play, Copy, Table2, TextSelect } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { CompletionContext } from "@codemirror/autocomplete";
 import type { EditorView as EditorViewType } from "@codemirror/view";
@@ -35,6 +35,7 @@ import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/shortc
 import { trimmedSelectionLayer } from "@/lib/codemirrorTrimmedSelectionLayer";
 import { selectionMatchOccurrences } from "@/lib/codemirrorSelectionMatches";
 import { isSchemaAware, isSingleDatabase } from "@/lib/databaseFeatureSupport";
+import { qualifiedTableNameAtSqlPosition } from "@/lib/queryCursorTableTarget";
 import * as api from "@/lib/api";
 import { areSqlSemanticDiagnosticsEqual, buildSqlParserErrorDiagnostic, buildSqlSemanticDiagnostics, shouldRunSqlSemanticDiagnostics, type SqlSemanticDiagnostic } from "@/lib/sqlSemanticDiagnostics";
 import { buildRedisSyntaxDiagnostics, shouldRunRedisDiagnostics } from "@/lib/redisSyntaxDiagnostics";
@@ -66,6 +67,7 @@ const emit = defineEmits<{
   execute: [sql: string];
   save: [];
   clickTable: [tableName: string];
+  viewTableData: [tableName: string];
   clickColumn: [columns: Array<{ name: string; table: string; schema?: string }>, error?: string | undefined];
   closeColumnPanel: [];
   viewportChange: [viewport: { scrollTop: number; scrollLeft: number }];
@@ -141,6 +143,7 @@ const isGestureZooming = ref(false);
 const searchPanelRef = ref<InstanceType<typeof EditorSearchPanel>>();
 const selectedSql = ref("");
 const executableSql = ref("");
+const contextTableName = ref<string | null>(null);
 
 const hasSelectedSql = computed(() => selectedSql.value.trim().length > 0);
 const canCopySelectedSql = computed(() => selectedSql.value.length > 0);
@@ -294,6 +297,12 @@ function syncContextMenuState(currentView: EditorViewType) {
   executableSql.value = executableSqlFromView(currentView);
 }
 
+function syncContextMenuStateAtEvent(currentView: EditorViewType, event: MouseEvent) {
+  syncContextMenuState(currentView);
+  const pos = currentView.posAtCoords({ x: event.clientX, y: event.clientY });
+  contextTableName.value = pos == null ? null : qualifiedTableNameAtSqlPosition(currentView.state.doc.toString(), pos);
+}
+
 function focusEditor() {
   view.value?.focus();
 }
@@ -352,6 +361,12 @@ function selectAllSqlFromContextMenu() {
   focusEditor();
 }
 
+function openTableFromContextMenu() {
+  if (!contextTableName.value) return;
+  emit("viewTableData", contextTableName.value);
+  focusEditor();
+}
+
 function selectSqlLineFromGutter(currentView: EditorViewType, line: { from: number; to: number }, event: Event): boolean {
   if (!(event instanceof MouseEvent) || event.button !== 0) return false;
   event.preventDefault();
@@ -370,6 +385,12 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
     action: executeFromContextMenu,
     disabled: !canExecuteContextSql.value,
     icon: Play,
+  },
+  {
+    label: t("contextMenu.viewData"),
+    action: openTableFromContextMenu,
+    disabled: !contextTableName.value,
+    icon: Table2,
   },
   { label: "", separator: true },
   {
@@ -2205,7 +2226,7 @@ defineExpose({ openSearch, openReplace, scrollCursorIntoView });
         class="h-full w-full overflow-hidden"
         @contextmenu="
           (e: MouseEvent) => {
-            if (view) syncContextMenuState(view);
+            if (view) syncContextMenuStateAtEvent(view, e);
             onContextMenu(e);
           }
         "

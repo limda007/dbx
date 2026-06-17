@@ -762,9 +762,9 @@ function openSavedSqlFromWelcome(fileId: string) {
   toast(t("welcome.fileOpened", { name: file.name }), 2000);
 }
 
-async function onClickTable(tableName: string) {
+function tableTargetFromActiveTab(tableName: string) {
   const tab = activeTab.value;
-  if (!tab) return;
+  if (!tab) return null;
   const connectionId = tab.connectionId;
   let database = tab.database;
   let schema = tab.schema;
@@ -784,8 +784,24 @@ async function onClickTable(tableName: string) {
     }
   }
 
+  return { connectionId, database, schema, tableName: rawTableName };
+}
+
+async function onClickTable(tableName: string) {
+  const target = tableTargetFromActiveTab(tableName);
+  if (!target) return;
   try {
-    await openTableTarget({ connectionId, database, schema, tableName: rawTableName }, { tableInfoTab: "ddl" });
+    await openTableTarget(target, { tableInfoTab: "ddl" });
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
+async function onViewTableData(tableName: string) {
+  const target = tableTargetFromActiveTab(tableName);
+  if (!target) return;
+  try {
+    await openTableTarget(target);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
@@ -1255,6 +1271,7 @@ onUnmounted(() => {
                     @sort="onSort"
                     @execute-sql="onExecuteSql"
                     @click-table="onClickTable"
+                    @view-table-data="onViewTableData"
                     @open-object-table="
                       (target) =>
                         activeTab &&

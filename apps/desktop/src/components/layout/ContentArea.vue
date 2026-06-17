@@ -116,6 +116,7 @@ const emit = defineEmits<{
   sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string];
   executeSql: [sql: string];
   clickTable: [tableName: string];
+  viewTableData: [tableName: string];
   openObjectTable: [target: { tableName: string; schema?: string }];
   objectSchemaChange: [schema: string | undefined];
   structureEditorSaved: [commentChanged: boolean];
@@ -428,6 +429,10 @@ function onHandleClickTable(tableName: string) {
   emit("clickTable", tableName);
 }
 
+function onHandleViewTableData(tableName: string) {
+  emit("viewTableData", tableName);
+}
+
 function onHandleCloseColumnPanel() {
   showColumnInfo.value = false;
   columnInfoColumns.value = [];
@@ -520,6 +525,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
               @execute="emit('execute')"
               @save="emit('saveSql')"
               @click-table="onHandleClickTable"
+              @view-table-data="onHandleViewTableData"
               @click-column="onHandleClickColumn"
               @close-column-panel="onHandleCloseColumnPanel"
             />
