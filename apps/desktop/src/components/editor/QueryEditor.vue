@@ -10,12 +10,14 @@ import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomC
 import { copyToClipboard } from "@/lib/clipboard";
 import { resolveExecutableSql, type SqlExecutionSnapshot } from "@/lib/sqlExecutionTarget";
 import { formatSqlText, type SqlFormatDialect } from "@/lib/sqlFormatter";
+import { formatMongoShellText } from "@/lib/mongoFormatter";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useTheme } from "@/composables/useTheme";
 import { useToast } from "@/composables/useToast";
 import { buildSqlCompletionItemsFromContext, getSqlFunctionSignatureHelp, getSqlCompletionContext, getSqlCompletionResultValidFor, isSqlLikeCompletionStatement, recordCompletionSelection, shouldAutoOpenSqlCompletion, extractCteDefinitions } from "@/lib/sqlCompletion";
 import { buildElasticsearchCompletionItemsFromContext, getElasticsearchCompletionContext, getElasticsearchCompletionResultValidFor, shouldAutoOpenElasticsearchCompletion, type ElasticsearchCompletionItem } from "@/lib/elasticsearchCompletion";
+import { buildMongoCompletionItemsFromContext, getMongoCompletionContext, getMongoCompletionResultValidFor, shouldAutoOpenMongoCompletion, type MongoCompletionItem } from "@/lib/mongoCompletion";
 import { extractIdentifierAt, isSqlKeyword, matchTable } from "@/lib/sqlNavigation";
 import { lineColumnToOffset, parseSqlErrorLocation } from "@/lib/sqlDiagnostics";
 import {
@@ -829,7 +831,7 @@ async function formatCurrentSql() {
   if (!source.trim()) return;
 
   try {
-    const formatted = await formatSqlText(source, props.formatDialect ?? props.dialect ?? "generic", settingsStore.editorSettings.sqlFormatter);
+    const formatted = props.databaseType === "mongodb" ? formatMongoShellText(source, settingsStore.editorSettings.sqlFormatter) : await formatSqlText(source, props.formatDialect ?? props.dialect ?? "generic", settingsStore.editorSettings.sqlFormatter);
     if (view.value !== currentView || currentView.state !== originalState || currentView.state.sliceDoc(from, to) !== source) {
       return;
     }
@@ -904,7 +906,7 @@ function unregisterTableReferenceDropListener() {
 let completionEpoch = 0;
 let completionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-type QueryCompletionItem = SqlCompletionItem | ElasticsearchCompletionItem | RedisCompletionItem;
+type QueryCompletionItem = SqlCompletionItem | ElasticsearchCompletionItem | RedisCompletionItem | MongoCompletionItem;
 
 function buildCompletionResult(items: QueryCompletionItem[], from: number, validFor?: RegExp) {
   if (items.length === 0) return null;
@@ -1031,10 +1033,50 @@ async function provideRedisCompletions(currentState: import("@codemirror/state")
   };
 }
 
+async function provideMongoCompletions(currentState: import("@codemirror/state").EditorState, position: number, explicit: boolean) {
+  if (!props.connectionId) return null;
+  const epoch = ++completionEpoch;
+  const fullDoc = currentState.doc.toString();
+  if (!explicit && !shouldAutoOpenMongoCompletion(fullDoc, position)) return null;
+
+  const completionContext = getMongoCompletionContext(fullDoc, position);
+  let collections: string[] = [];
+  let fields: Awaited<ReturnType<typeof connectionStore.listMongoCompletionFields>> = [];
+
+  if (props.database && completionContext.mode === "collection") {
+    try {
+      collections = await connectionStore.listMongoCompletionCollections(props.connectionId, props.database);
+    } catch {
+      collections = [];
+    }
+  }
+
+  if (props.database && completionContext.mode === "field" && completionContext.collection) {
+    try {
+      fields = await connectionStore.listMongoCompletionFields(props.connectionId, props.database, completionContext.collection);
+    } catch {
+      fields = [];
+    }
+  }
+
+  if (epoch !== completionEpoch) return null;
+
+  const items = buildMongoCompletionItemsFromContext(completionContext, { collections, fields });
+  if (items.length === 0) return null;
+  return {
+    from: completionContext.from,
+    options: items.map((item) => completionOptionForItem(item)),
+    validFor: getMongoCompletionResultValidFor(),
+  };
+}
+
 async function provideSqlCompletions(currentState: import("@codemirror/state").EditorState, position: number, explicit: boolean) {
   if (imeCompositionActive || view.value?.compositionStarted || view.value?.composing) return null;
   if (!props.connectionId) return null;
   const fullDoc = currentState.doc.toString();
+  if (props.databaseType === "mongodb") {
+    return provideMongoCompletions(currentState, position, explicit);
+  }
   if (props.databaseType === "elasticsearch") {
     if (!isSqlLikeCompletionStatement(fullDoc, position)) {
       return provideElasticsearchCompletions(currentState, position, explicit);

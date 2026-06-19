@@ -1,4 +1,5 @@
 import type { DatabaseType, SqlSnippet } from "@/types/database";
+import { buildMongoCompletionItemsFromContext, type MongoCompletionItem } from "@/lib/mongoCompletion";
 
 const SQL_KEYWORDS = [
   "SELECT",
@@ -1164,7 +1165,7 @@ class SqlCompletionProvider {
     const { context } = this;
 
     if (this.databaseType === "mongodb") {
-      return dedupeAndSort(buildMongoCompletionItems(context.prefix));
+      return dedupeAndSort(buildMongoCompletionItemsFromContext({ mode: "root", prefix: context.prefix, from: 0 }).map(mongoCompletionItemToSqlCompletionItem));
     }
 
     if (!context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions && !context.exclusiveRoutineSuggestions) {
@@ -3131,37 +3132,15 @@ function buildFunctionSnippetItems(prefix: string, functionDescriptions: Map<str
   return items;
 }
 
-const MONGO_COMPLETIONS: Array<Pick<SqlCompletionItem, "label" | "type" | "detail" | "apply">> = [
-  { label: "find", type: "function", detail: "MongoDB query documents", apply: "find({})" },
-  { label: "findOne", type: "function", detail: "MongoDB query one document", apply: "findOne({})" },
-  { label: "aggregate", type: "function", detail: "MongoDB aggregation pipeline", apply: "aggregate([])" },
-  {
-    label: "countDocuments",
-    type: "function",
-    detail: "MongoDB count matching documents",
-    apply: "countDocuments({})",
-  },
-  { label: "distinct", type: "function", detail: "MongoDB distinct field values", apply: 'distinct("field", {})' },
-  { label: "insertOne", type: "function", detail: "MongoDB insert one document", apply: "insertOne({})" },
-  { label: "updateOne", type: "function", detail: "MongoDB update one document", apply: "updateOne({}, { $set: {} })" },
-  { label: "deleteOne", type: "function", detail: "MongoDB delete one document", apply: "deleteOne({})" },
-  { label: "sort", type: "function", detail: "MongoDB sort cursor", apply: "sort({ field: 1 })" },
-  { label: "limit", type: "function", detail: "MongoDB limit cursor", apply: "limit(100)" },
-  { label: "skip", type: "function", detail: "MongoDB skip cursor", apply: "skip(0)" },
-  { label: "db.collection.find", type: "snippet", detail: "MongoDB find command", apply: "db.collection.find({})" },
-  {
-    label: "db.collection.aggregate",
-    type: "snippet",
-    detail: "MongoDB aggregate command",
-    apply: "db.collection.aggregate([])",
-  },
-];
-
-function buildMongoCompletionItems(prefix: string): SqlCompletionItem[] {
-  return MONGO_COMPLETIONS.filter((item) => matchesPrefix(item.label, prefix)).map((item) => ({
-    ...item,
-    boost: computeBoost(item.label, prefix) + (item.type === "snippet" ? 400 : 600),
-  }));
+function mongoCompletionItemToSqlCompletionItem(item: MongoCompletionItem): SqlCompletionItem {
+  return {
+    label: item.label,
+    type: item.type,
+    detail: item.detail,
+    info: item.info,
+    apply: item.apply,
+    boost: item.boost,
+  };
 }
 
 function buildSelectAliasItems(context: SqlCompletionContext): SqlCompletionItem[] {

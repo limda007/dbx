@@ -50,6 +50,7 @@ import { supportsDatabaseUserAdmin } from "@/lib/databaseUserAdmin";
 import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { encodeSqlServerLinkedSchema, parseSqlServerLinkedSchema } from "@/lib/sqlServerLinkedServers";
+import { inferMongoCompletionFields, type MongoCompletionField } from "@/lib/mongoCompletion";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
 const ACTIVE_CONNECTION_STORAGE_KEY = "dbx-active-connection";
@@ -155,6 +156,8 @@ export const useConnectionStore = defineStore("connection", () => {
   const completionDatabasesCache = ref<Record<string, string[]>>({});
   const elasticsearchCompletionIndicesCache = ref<Record<string, string[]>>({});
   const redisCompletionKeysCache = ref<Record<string, string[]>>({});
+  const mongoCompletionCollectionsCache = ref<Record<string, string[]>>({});
+  const mongoCompletionFieldsCache = ref<Record<string, MongoCompletionField[]>>({});
   const schemaListCache = ref<Record<string, string[]>>({});
   const sidebarSearchQuery = ref("");
   const completionTableIndex = new Map<string, { touched: number; tables: SqlCompletionTable[] }>();
@@ -657,6 +660,12 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     for (const key of Object.keys(redisCompletionKeysCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete redisCompletionKeysCache.value[key];
+    }
+    for (const key of Object.keys(mongoCompletionCollectionsCache.value)) {
+      if (key === exactCacheKey || key.startsWith(cachePrefix)) delete mongoCompletionCollectionsCache.value[key];
+    }
+    for (const key of Object.keys(mongoCompletionFieldsCache.value)) {
+      if (key === exactCacheKey || key.startsWith(cachePrefix)) delete mongoCompletionFieldsCache.value[key];
     }
     for (const key of completionTableIndex.keys()) {
       if (key.startsWith(cachePrefix)) completionTableIndex.delete(key);
@@ -2239,6 +2248,35 @@ export const useConnectionStore = defineStore("connection", () => {
     });
   }
 
+  async function listMongoCompletionCollections(connectionId: string, database: string): Promise<string[]> {
+    if (!database) return [];
+    const cacheKey = `${connectionId}:${database}`;
+    const cached = mongoCompletionCollectionsCache.value[cacheKey];
+    if (cached) return cached;
+    return withCompletionInFlight(`${cacheKey}:mongo-collections`, async () => {
+      await ensureConnected(connectionId);
+      const collections = sortSidebarNames(await api.mongoListCollections(connectionId, database));
+      mongoCompletionCollectionsCache.value[cacheKey] = collections;
+      evictOldestCacheEntries(mongoCompletionCollectionsCache.value, COMPLETION_CACHE_MAX);
+      return collections;
+    });
+  }
+
+  async function listMongoCompletionFields(connectionId: string, database: string, collection: string): Promise<MongoCompletionField[]> {
+    if (!database || !collection) return [];
+    const cacheKey = `${connectionId}:${database}:${collection}`;
+    const cached = mongoCompletionFieldsCache.value[cacheKey];
+    if (cached) return cached;
+    return withCompletionInFlight(`${cacheKey}:mongo-fields`, async () => {
+      await ensureConnected(connectionId);
+      const result = await api.mongoFindDocuments(connectionId, database, collection, 0, 20, "{}");
+      const fields = inferMongoCompletionFields(result.documents ?? []);
+      mongoCompletionFieldsCache.value[cacheKey] = fields;
+      evictOldestCacheEntries(mongoCompletionFieldsCache.value, COMPLETION_CACHE_MAX);
+      return fields;
+    });
+  }
+
   async function listCompletionTables(connectionId: string, database: string, filter = "", limit?: number, schema?: string): Promise<SqlCompletionTable[]> {
     const normalizedFilter = filter.trim().toLowerCase();
     const relaxedFilter = relaxedCompletionTableFilter(normalizedFilter);
@@ -2534,7 +2572,7 @@ export const useConnectionStore = defineStore("connection", () => {
   function persistSidebarLayoutDebounced() {
     if (layoutPersistTimer) clearTimeout(layoutPersistTimer);
     layoutPersistTimer = setTimeout(() => {
-      api.saveSidebarLayout(sidebarLayout.value).catch(() => {});
+      api.saveSidebarLayout(sidebarLayout.value).catch(() => { });
       layoutPersistTimer = null;
     }, 300);
   }
@@ -3040,6 +3078,8 @@ export const useConnectionStore = defineStore("connection", () => {
     refreshCompletionDatabases,
     listElasticsearchCompletionIndices,
     listRedisCompletionKeys,
+    listMongoCompletionCollections,
+    listMongoCompletionFields,
     invalidateCompletionCache,
     exportConnectionsToFile,
     readImportFile,
