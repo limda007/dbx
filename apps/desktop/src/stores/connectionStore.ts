@@ -27,7 +27,7 @@ import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, sortSidebarName
 import { buildSqlServerDatabaseTreeNodes, SQLSERVER_DEFAULT_SCHEMA } from "@/lib/sqlServerTree";
 import { findDatabaseTreeNode } from "@/lib/treeRefreshTarget";
 import { shouldMarkDisconnected } from "@/lib/connectionHealth";
-import { connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
+import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
 import { filterDatabaseNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
 import {
   buildObjectGroupPlaceholderNodes,
@@ -282,12 +282,23 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function withConnectionAttemptTimeout<T>(promise: Promise<T>, config: ConnectionConfig): Promise<T> {
     const timeoutMs = connectionAttemptTimeoutMs(config);
+    const timeoutMessage = connectionAttemptTimeoutMessage(timeoutMs);
+    let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    void promise.catch((error) => {
+      if (!timedOut) return;
+      const current = connectionErrors.value[config.id];
+      if (current !== timeoutMessage) return;
+      setConnectionError(config.id, connectionAttemptOriginalErrorMessage(timeoutMessage, connectionErrorMessage(error)));
+    });
     try {
       return await Promise.race([
         promise,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(connectionAttemptTimeoutMessage(timeoutMs))), timeoutMs);
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(timeoutMessage));
+          }, timeoutMs);
         }),
       ]);
     } finally {
@@ -366,7 +377,7 @@ export const useConnectionStore = defineStore("connection", () => {
       url_params: config.url_params || "",
       attached_databases: Array.isArray(config.attached_databases) ? config.attached_databases.filter((database) => database.name?.trim() && database.path?.trim()) : [],
       transport_layers: Array.isArray(config.transport_layers) ? config.transport_layers : [],
-      connect_timeout_secs: config.connect_timeout_secs || 5,
+      connect_timeout_secs: config.connect_timeout_secs || 10,
       query_timeout_secs: config.query_timeout_secs ?? 30,
       idle_timeout_secs: config.idle_timeout_secs ?? 60,
       keepalive_interval_secs: config.keepalive_interval_secs ?? 0,

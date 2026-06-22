@@ -112,7 +112,7 @@ const defaultForm = (): ConnectionForm => ({
   database: undefined,
   color: "",
   transport_layers: [],
-  connect_timeout_secs: 5,
+  connect_timeout_secs: 10,
   query_timeout_secs: 30,
   idle_timeout_secs: 60,
   keepalive_interval_secs: 0,
@@ -720,7 +720,7 @@ watch(
         database: config.database,
         color: config.color || "",
         transport_layers: transportLayersForConfig(legacyConfig),
-        connect_timeout_secs: config.connect_timeout_secs || 5,
+        connect_timeout_secs: config.connect_timeout_secs || 10,
         query_timeout_secs: config.query_timeout_secs ?? 30,
         idle_timeout_secs: config.idle_timeout_secs ?? 60,
         keepalive_interval_secs: config.keepalive_interval_secs ?? 0,
@@ -1256,7 +1256,7 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   });
   validateTransportLayers(config);
   const connectTimeout = Number(config.connect_timeout_secs);
-  config.connect_timeout_secs = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 5;
+  config.connect_timeout_secs = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 10;
   const queryTimeout = Number(config.query_timeout_secs);
   config.query_timeout_secs = Number.isFinite(queryTimeout) && queryTimeout >= 0 ? queryTimeout : 30;
   const idleTimeout = Number(config.idle_timeout_secs);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createPinia, setActivePinia } from "pinia";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
 import type { ConnectionConfig } from "../../apps/desktop/src/types/database.ts";
 
@@ -150,6 +150,42 @@ test("explicit lost-connection marker clears state without relying on error text
     assert.equal(store.connectionErrors["conn-1"], "连接可能已断开，请刷新数据重试");
     await new Promise((resolve) => setTimeout(resolve, 0));
   } finally {
+    restoreStorage();
+  }
+});
+
+test("late original connect errors replace the generic timeout detail", async () => {
+  vi.useFakeTimers();
+  const restoreStorage = installMemoryStorage();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input) => {
+    if (String(input) === "/api/connection/connect") {
+      return new Promise<Response>((_, reject) => {
+        setTimeout(() => reject(new Error("MySQL connection failed: raw socket timeout")), 3500);
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    setActivePinia(createPinia());
+    const store = useConnectionStore();
+    const config = { ...conn("conn-1"), connect_timeout_secs: 1 };
+    const connectPromise = store.connect(config);
+    const timeoutRejection = assert.rejects(() => connectPromise, /Connection attempt timed out after 3s/);
+
+    await vi.advanceTimersByTimeAsync(3000);
+    await timeoutRejection;
+    assert.equal(store.connectionErrors["conn-1"], "Connection attempt timed out after 3s. Please check the network or VPN and try again.");
+
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.resolve();
+
+    assert.match(store.connectionErrors["conn-1"], /Original database error returned after the UI timeout/);
+    assert.match(store.connectionErrors["conn-1"], /MySQL connection failed: raw socket timeout/);
+  } finally {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
     restoreStorage();
   }
 });

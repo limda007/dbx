@@ -4,7 +4,7 @@ export const CONNECTION_ATTEMPT_TIMEOUT_BUFFER_MS = 2_000;
 export const MONGO_LEGACY_FALLBACK_TIMEOUT_BUFFER_MS = 30_000;
 export const AGENT_DRIVER_MIN_CONNECT_TIMEOUT_SECS = 30;
 export const ACCESS_AGENT_MIN_CONNECT_TIMEOUT_SECS = 30;
-const DEFAULT_CONNECT_TIMEOUT_SECS = 5;
+const DEFAULT_CONNECT_TIMEOUT_SECS = 10;
 
 const AGENT_DRIVER_TYPES = new Set<DatabaseType>([
   "dameng",
@@ -60,4 +60,10 @@ export function connectionAttemptTimeoutMs(config: Pick<ConnectionConfig, "conne
 
 export function connectionAttemptTimeoutMessage(timeoutMs: number): string {
   return `Connection attempt timed out after ${Math.ceil(timeoutMs / 1000)}s. Please check the network or VPN and try again.`;
+}
+
+export function connectionAttemptOriginalErrorMessage(timeoutMessage: string, originalMessage: string): string {
+  const message = originalMessage.trim();
+  if (!message || message === timeoutMessage) return timeoutMessage;
+  return `${timeoutMessage}\n\nOriginal database error returned after the UI timeout:\n${message}`;
 }
