@@ -18,6 +18,15 @@ describe("executableStatementRangeCacheForDoc", () => {
     expect(executableStatementRangeStartingAt(second, 10)?.sql).toBe("SELECT 2");
   });
 
+  it("resolves the exact multi-line statement for a gutter run button", () => {
+    const doc = Text.of(["SELECT *", "FROM apis AS ap", "LIMIT 100;", "", "SELECT *", "FROM menus AS mn", "LIMIT 100;"]);
+
+    const cache = executableStatementRangeCacheForDoc(null, doc, "mysql");
+    const secondStatementLine = doc.line(5);
+
+    expect(executableStatementRangeStartingAt(cache, secondStatementLine.from)?.sql).toBe("SELECT *\nFROM menus AS mn\nLIMIT 100");
+  });
+
   it("rebuilds the cache when the document instance changes", () => {
     const firstDoc = Text.of(["SELECT 1;"]);
     const secondDoc = Text.of(["SELECT 1;"]);

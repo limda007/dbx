@@ -598,7 +598,7 @@ function executeSqlStatementFromGutter(currentView: EditorViewType, line: { from
   if (!statementRange) return false;
   event.preventDefault();
   event.stopPropagation();
-  requestExecuteFromView(currentView, line.from, { ignoreSelection: true });
+  emit("execute", statementRange.sql);
   currentView.focus();
   return true;
 }
