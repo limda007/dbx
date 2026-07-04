@@ -691,11 +691,25 @@ fn normalized_passphrase(passphrase: Option<&str>) -> Option<&str> {
 }
 
 fn normalized_remote_path(value: Option<&str>) -> String {
-    let value = value.unwrap_or(DEFAULT_REMOTE_PATH).trim().trim_start_matches('/');
-    if value.is_empty() {
+    let value = value.unwrap_or(DEFAULT_REMOTE_PATH).trim().replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in value.split('/') {
+        let part = part.trim();
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            // Keep the WebDAV target inside the configured endpoint when users paste OS paths.
+            parts.pop();
+            continue;
+        }
+        parts.push(part);
+    }
+
+    if parts.is_empty() {
         DEFAULT_REMOTE_PATH.to_string()
     } else {
-        value.to_string()
+        parts.join("/")
     }
 }
 
@@ -844,12 +858,24 @@ mod tests {
     fn normalizes_empty_remote_path_to_default() {
         assert_eq!(normalized_remote_path(None), "DBX/sync/snapshot.json");
         assert_eq!(normalized_remote_path(Some("")), "DBX/sync/snapshot.json");
+        assert_eq!(normalized_remote_path(Some("///\\\\//")), "DBX/sync/snapshot.json");
+    }
+
+    #[test]
+    fn normalizes_remote_path_separators() {
         assert_eq!(normalized_remote_path(Some("/custom/snapshot.json")), "custom/snapshot.json");
+        assert_eq!(normalized_remote_path(Some(r"\DBX\sync\snapshot.json")), "DBX/sync/snapshot.json");
+        assert_eq!(normalized_remote_path(Some("///DBX//sync/./snapshot.json")), "DBX/sync/snapshot.json");
+        assert_eq!(normalized_remote_path(Some("DBX/sync/../snapshot.json")), "DBX/snapshot.json");
     }
 
     #[test]
     fn returns_parent_collection_paths_from_leaf() {
         assert_eq!(parent_collection_paths("dbx/sync/snapshot.json"), vec!["dbx".to_string(), "dbx/sync".to_string()]);
+        assert_eq!(
+            parent_collection_paths(&normalized_remote_path(Some(r"\DBX\sync\snapshot.json"))),
+            vec!["DBX".to_string(), "DBX/sync".to_string()]
+        );
     }
 
     #[test]
