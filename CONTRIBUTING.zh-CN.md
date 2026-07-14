@@ -85,11 +85,17 @@ cd agents
 
 ### 提交说明
 
-提交信息用自然语言写清楚即可：
+请严格遵循 **[`docs/commit-guide.md`](docs/commit-guide.md)**（emoji + Conventional Commits）。格式：
 
-- `docs: add web API reference for Docker deployments`
-- `fix(redis): handle empty scan cursor`
-- `feat(schema): show catalog info for Doris`
+```
+<emoji> <type>(<scope>): <subject>
+```
+
+示例：
+
+- `📝 docs: add web API reference for Docker deployments`
+- `🐛 fix(redis): handle empty scan cursor`
+- `✨ feat(schema): show catalog info for Doris`
 
 ### 测试
 

@@ -85,11 +85,17 @@ Keep PRs focused. A docs-only PR should not include unrelated code changes. A bu
 
 ### Commits
 
-Write commit messages in plain language:
+Follow **[`docs/commit-guide.md`](docs/commit-guide.md)** (emoji + Conventional Commits). Required shape:
 
-- `docs: add web API reference for Docker deployments`
-- `fix(redis): handle empty scan cursor`
-- `feat(schema): show catalog info for Doris`
+```
+<emoji> <type>(<scope>): <subject>
+```
+
+Examples:
+
+- `📝 docs: add web API reference for Docker deployments`
+- `🐛 fix(redis): handle empty scan cursor`
+- `✨ feat(schema): show catalog info for Doris`
 
 ### Tests
 
