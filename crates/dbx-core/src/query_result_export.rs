@@ -730,8 +730,21 @@ async fn try_export_postgres_query_result_stream(
     let mut xlsx = None;
     let budget = operation_budget_for_pool_key(state, &pool_key, query_export_timeout(request.timeout_secs)).await;
     let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
+    let db_type = {
+        let configs = state.configs.read().await;
+        crate::connection::config_for_pool_key(&pool_key, &configs).map(|config| config.db_type)
+    };
+    let db_type_label = crate::connection_lifecycle::optional_database_type_log_label(db_type);
+    let mut log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+        Some(pool_key.as_str()),
+        request.execution_id.as_deref(),
+        db_type_label.as_deref(),
+    );
+    if let Some(ref client_session_id) = request.client_session_id {
+        log_context.client_session_id = Some(client_session_id.as_str());
+    }
 
-    crate::db::postgres::stream_select_query_with_cancel(
+    crate::db::postgres::stream_select_query_with_cancel_logged(
         &pool,
         request.schema.as_deref(),
         &request.sql,
@@ -739,6 +752,7 @@ async fn try_export_postgres_query_result_stream(
         cancel_token,
         budget,
         cancel_context,
+        log_context,
         |item| {
             match item {
                 crate::db::postgres::PostgresQueryStreamItem::Columns { columns: stream_columns, column_types } => {

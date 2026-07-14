@@ -21,7 +21,7 @@ use tokio_postgres::{NoTls, Row, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
 use super::file_validator::validate_file_path;
-use crate::query::DbOperationBudget;
+use crate::connection_lifecycle::{self, DbOperationBudget, LifecycleStage, StageLog, StageLogContext, StageOutcome};
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
@@ -2369,7 +2369,29 @@ pub async fn execute_query_with_max_rows_and_cancel(
     budget: DbOperationBudget,
     cancel_context: Option<PostgresCancelContext>,
 ) -> Result<QueryResult, String> {
-    let client = checkout_postgres_client(pool, cancel_token.as_ref(), budget.checkout_timeout).await?;
+    execute_query_with_max_rows_and_cancel_logged(
+        pool,
+        sql,
+        max_rows,
+        cancel_token,
+        budget,
+        cancel_context,
+        StageLogContext::empty(),
+    )
+    .await
+}
+
+pub async fn execute_query_with_max_rows_and_cancel_logged(
+    pool: &Pool,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancel_token: Option<CancellationToken>,
+    budget: DbOperationBudget,
+    cancel_context: Option<PostgresCancelContext>,
+    log_context: StageLogContext<'_>,
+) -> Result<QueryResult, String> {
+    let client =
+        checkout_postgres_client_logged(pool, cancel_token.as_ref(), budget.checkout_timeout, log_context).await?;
     let pg_cancel_token = client.cancel_token();
     wait_postgres_query(
         pg_cancel_token,
@@ -2392,8 +2414,34 @@ pub async fn stream_select_query_with_cancel(
     cancel_context: Option<PostgresCancelContext>,
     on_item: impl FnMut(PostgresQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
+    stream_select_query_with_cancel_logged(
+        pool,
+        schema,
+        sql,
+        max_rows,
+        cancel_token,
+        budget,
+        cancel_context,
+        StageLogContext::empty(),
+        on_item,
+    )
+    .await
+}
+
+pub async fn stream_select_query_with_cancel_logged(
+    pool: &Pool,
+    schema: Option<&str>,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancel_token: Option<CancellationToken>,
+    budget: DbOperationBudget,
+    cancel_context: Option<PostgresCancelContext>,
+    log_context: StageLogContext<'_>,
+    on_item: impl FnMut(PostgresQueryStreamItem) -> Result<(), String>,
+) -> Result<u64, String> {
     let start = Instant::now();
-    let client = checkout_postgres_client(pool, cancel_token.as_ref(), budget.checkout_timeout).await?;
+    let client =
+        checkout_postgres_client_logged(pool, cancel_token.as_ref(), budget.checkout_timeout, log_context).await?;
     let mut on_item = on_item;
     let row_limit = max_rows.map(|limit| limit.max(1));
     let schema = schema.map(str::trim).filter(|schema| !schema.is_empty());
@@ -2402,13 +2450,33 @@ pub async fn stream_select_query_with_cancel(
     if let Some(schema) = schema.filter(|_| schema_was_set) {
         // Match normal query execution: export may reference unqualified names
         // in the active schema, so the streaming path must use the same search_path.
-        execute_postgres_infra_statement(
+        let schema_started = Instant::now();
+        connection_lifecycle::log_stage(
+            StageLog::new(LifecycleStage::SchemaSet, StageOutcome::Start, 0)
+                .with_timeout(budget.recycle_timeout)
+                .with_context(log_context),
+        );
+        if let Err(e) = execute_postgres_infra_statement(
             &client,
             &format!("SET search_path TO {}, public", pg_quote_ident(schema)),
             budget.recycle_timeout,
             "schema.set",
         )
-        .await?;
+        .await
+        {
+            connection_lifecycle::log_stage(
+                StageLog::new(LifecycleStage::SchemaSet, StageOutcome::Error, schema_started.elapsed().as_millis())
+                    .with_timeout(budget.recycle_timeout)
+                    .with_context(log_context)
+                    .with_error(&e),
+            );
+            return Err(e);
+        }
+        connection_lifecycle::log_stage(
+            StageLog::new(LifecycleStage::SchemaSet, StageOutcome::Done, schema_started.elapsed().as_millis())
+                .with_timeout(budget.recycle_timeout)
+                .with_context(log_context),
+        );
     }
 
     let pg_cancel_token = client.cancel_token();
@@ -2501,9 +2569,33 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     budget: DbOperationBudget,
     cancel_context: Option<PostgresCancelContext>,
 ) -> Result<QueryResult, String> {
+    execute_query_with_schema_and_max_rows_and_cancel_logged(
+        pool,
+        schema,
+        sql,
+        max_rows,
+        cancel_token,
+        budget,
+        cancel_context,
+        StageLogContext::empty(),
+    )
+    .await
+}
+
+pub async fn execute_query_with_schema_and_max_rows_and_cancel_logged(
+    pool: &Pool,
+    schema: &str,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancel_token: Option<CancellationToken>,
+    budget: DbOperationBudget,
+    cancel_context: Option<PostgresCancelContext>,
+    log_context: StageLogContext<'_>,
+) -> Result<QueryResult, String> {
     let start = Instant::now();
     let checkout_start = Instant::now();
-    let client = checkout_postgres_client(pool, cancel_token.as_ref(), budget.checkout_timeout).await?;
+    let client =
+        checkout_postgres_client_logged(pool, cancel_token.as_ref(), budget.checkout_timeout, log_context).await?;
     log::info!(
         "[postgres][execute_with_schema:pool:done] elapsed_ms={} total_ms={} schema={}",
         checkout_start.elapsed().as_millis(),
@@ -2528,13 +2620,32 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     }
 
     let set_schema_start = Instant::now();
-    execute_postgres_infra_statement(
+    connection_lifecycle::log_stage(
+        StageLog::new(LifecycleStage::SchemaSet, StageOutcome::Start, 0)
+            .with_timeout(budget.recycle_timeout)
+            .with_context(log_context),
+    );
+    if let Err(e) = execute_postgres_infra_statement(
         &client,
         &format!("SET search_path TO {}, public", pg_quote_ident(schema)),
         budget.recycle_timeout,
         "schema.set",
     )
-    .await?;
+    .await
+    {
+        connection_lifecycle::log_stage(
+            StageLog::new(LifecycleStage::SchemaSet, StageOutcome::Error, set_schema_start.elapsed().as_millis())
+                .with_timeout(budget.recycle_timeout)
+                .with_context(log_context)
+                .with_error(&e),
+        );
+        return Err(e);
+    }
+    connection_lifecycle::log_stage(
+        StageLog::new(LifecycleStage::SchemaSet, StageOutcome::Done, set_schema_start.elapsed().as_millis())
+            .with_timeout(budget.recycle_timeout)
+            .with_context(log_context),
+    );
     log::info!(
         "[postgres][execute_with_schema:set-search-path:done] elapsed_ms={} total_ms={}",
         set_schema_start.elapsed().as_millis(),
@@ -2686,10 +2797,23 @@ where
 /// PostgreSQL pool checkout with timeout and cancel token support.
 /// When the checkout phase is stuck, the cancel token can terminate the wait early.
 /// The timeout error message includes "checkout timed out" to ensure is_connection_error can classify it correctly.
+///
+/// Stable 3-arg entry point (PR-A1 compatibility). Stage logs omit correlation IDs.
+/// Prefer [`checkout_postgres_client_logged`] when `trace_id` / `connection_id` are available.
 pub async fn checkout_postgres_client(
     pool: &Pool,
     cancel_token: Option<&CancellationToken>,
     checkout_timeout: Duration,
+) -> Result<deadpool_postgres::Object, String> {
+    checkout_postgres_client_logged(pool, cancel_token, checkout_timeout, StageLogContext::empty()).await
+}
+
+/// Same as [`checkout_postgres_client`], but attaches lifecycle correlation fields to stage logs.
+pub async fn checkout_postgres_client_logged(
+    pool: &Pool,
+    cancel_token: Option<&CancellationToken>,
+    checkout_timeout: Duration,
+    log_context: StageLogContext<'_>,
 ) -> Result<deadpool_postgres::Object, String> {
     let start = Instant::now();
     let get_future = async {
@@ -2697,21 +2821,23 @@ pub async fn checkout_postgres_client(
             .await
             .map_err(|_| {
                 let elapsed = start.elapsed().as_millis();
-                log::warn!(
-                    "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} error=checkout timed out",
-                    elapsed,
-                    checkout_timeout.as_millis()
+                let error = format!("PostgreSQL connection pool checkout timed out ({}s)", checkout_timeout.as_secs());
+                connection_lifecycle::log_stage(
+                    StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Error, elapsed)
+                        .with_timeout(checkout_timeout)
+                        .with_context(log_context)
+                        .with_error("checkout timed out"),
                 );
-                format!("PostgreSQL connection pool checkout timed out ({}s)", checkout_timeout.as_secs())
+                error
             })?
             .map_err(|e| {
                 let elapsed = start.elapsed().as_millis();
                 let err = pg_pool_error_to_string(e);
-                log::warn!(
-                    "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} error={}",
-                    elapsed,
-                    checkout_timeout.as_millis(),
-                    err
+                connection_lifecycle::log_stage(
+                    StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Error, elapsed)
+                        .with_timeout(checkout_timeout)
+                        .with_context(log_context)
+                        .with_error(&err),
                 );
                 format!("PostgreSQL connection pool checkout failed: {err}")
             })
@@ -2721,10 +2847,14 @@ pub async fn checkout_postgres_client(
         Some(token) => tokio::select! {
             biased;
             _ = token.cancelled() => {
-                log::info!(
-                    "[db:pool.checkout:cancelled] elapsed_ms={} timeout_ms={}",
-                    start.elapsed().as_millis(),
-                    checkout_timeout.as_millis()
+                connection_lifecycle::log_stage(
+                    StageLog::new(
+                        LifecycleStage::PoolCheckout,
+                        StageOutcome::Cancelled,
+                        start.elapsed().as_millis(),
+                    )
+                    .with_timeout(checkout_timeout)
+                    .with_context(log_context),
                 );
                 return Err(crate::query::canceled_error());
             }
@@ -2733,10 +2863,10 @@ pub async fn checkout_postgres_client(
         None => get_future.await,
     };
     if result.is_ok() {
-        log::debug!(
-            "[db:pool.checkout:done] elapsed_ms={} timeout_ms={}",
-            start.elapsed().as_millis(),
-            checkout_timeout.as_millis()
+        connection_lifecycle::log_stage(
+            StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Done, start.elapsed().as_millis())
+                .with_timeout(checkout_timeout)
+                .with_context(log_context),
         );
     }
     result

@@ -23,7 +23,10 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{AppState, PoolKind, TransactionSession, TxnConnection};
+use crate::connection_lifecycle::{self, resolve_query_timeout};
 use crate::database_capabilities;
+// Public re-export: callers may keep using `crate::query::DbOperationBudget`.
+pub use crate::connection_lifecycle::DbOperationBudget;
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query_execution_sql::is_write_sql;
@@ -89,53 +92,8 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Unified database operation execution budget.
-/// query_timeout = None only means SQL execution has no upper limit;
-/// checkout/connect/recycle/cancel/cleanup always have hard upper limits and cannot be disabled.
-#[derive(Debug, Clone)]
-pub struct DbOperationBudget {
-    pub checkout_timeout: Duration,
-    pub connect_timeout: Duration,
-    pub recycle_timeout: Duration,
-    pub query_timeout: Option<Duration>,
-    pub cancel_timeout: Duration,
-    pub cleanup_timeout: Duration,
-}
-
-impl DbOperationBudget {
-    /// Build an execution budget from connection config.
-    /// checkout/connect/recycle use connect_timeout_secs (clamped to 1s minimum, 300s maximum).
-    /// query_timeout follows resolve_query_timeout semantics (Some(0) -> None).
-    /// cancel/cleanup are fixed values and cannot be disabled.
-    pub fn from_config(connect_timeout_secs: u64, query_timeout_secs: Option<u64>) -> Self {
-        let infra_timeout = Duration::from_secs(connect_timeout_secs.clamp(1, 300));
-        Self {
-            checkout_timeout: infra_timeout,
-            connect_timeout: infra_timeout,
-            recycle_timeout: infra_timeout,
-            query_timeout: resolve_query_timeout(query_timeout_secs),
-            cancel_timeout: Duration::from_secs(5),
-            cleanup_timeout: Duration::from_secs(3),
-        }
-    }
-
-    pub fn from_connection_config(config: &ConnectionConfig) -> Self {
-        Self::from_config(config.effective_connect_timeout_secs(), Some(config.query_timeout_secs))
-    }
-
-    /// Use global default values (when no connection config is available).
-    pub fn with_defaults() -> Self {
-        let default_infra = db::connection_timeout();
-        Self {
-            checkout_timeout: default_infra,
-            connect_timeout: default_infra,
-            recycle_timeout: default_infra,
-            query_timeout: Some(QUERY_TIMEOUT),
-            cancel_timeout: Duration::from_secs(5),
-            cleanup_timeout: Duration::from_secs(3),
-        }
-    }
-}
+// DbOperationBudget lives in `connection_lifecycle` (Phase A facade).
+// Re-exported above so existing `crate::query::DbOperationBudget` imports keep working.
 
 /// Check read-only protection for a connection, blocking write SQL statements.
 /// Only clones the connection name when read-only mode is active, avoiding
@@ -1123,14 +1081,6 @@ async fn sqlserver_pool_is_current(
     matches!(connections.get(pool_key), Some(PoolKind::SqlServer(current)) if Arc::ptr_eq(current, client))
 }
 
-fn resolve_query_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
-    match timeout_secs {
-        Some(0) => None,
-        Some(n) => Some(Duration::from_secs(n)),
-        None => Some(QUERY_TIMEOUT),
-    }
-}
-
 pub async fn operation_budget_for_pool_key(
     state: &AppState,
     pool_key: &str,
@@ -1321,9 +1271,19 @@ pub async fn do_execute(
             let schema = schema.map(|s| s.to_string());
             let max_rows = options.max_rows;
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
+            // Owned label so openGauss/Redshift/etc. are not all logged as "postgres".
+            let db_type_label = connection_lifecycle::optional_database_type_log_label(pool_db_type);
+            let mut log_context = connection_lifecycle::StageLogContext::for_pool(
+                Some(pool_key),
+                options.execution_id.as_deref(),
+                db_type_label.as_deref(),
+            );
+            if let Some(ref client_session_id) = options.client_session_id {
+                log_context.client_session_id = Some(client_session_id.as_str());
+            }
             drop(connections);
             if let Some(schema) = schema {
-                db::postgres::execute_query_with_schema_and_max_rows_and_cancel(
+                db::postgres::execute_query_with_schema_and_max_rows_and_cancel_logged(
                     &p,
                     &schema,
                     sql,
@@ -1331,16 +1291,18 @@ pub async fn do_execute(
                     cancel_token,
                     operation_budget.clone(),
                     cancel_context,
+                    log_context,
                 )
                 .await
             } else {
-                db::postgres::execute_query_with_max_rows_and_cancel(
+                db::postgres::execute_query_with_max_rows_and_cancel_logged(
                     &p,
                     sql,
                     max_rows,
                     cancel_token,
                     operation_budget.clone(),
                     cancel_context,
+                    log_context,
                 )
                 .await
             }
@@ -2460,7 +2422,17 @@ pub async fn execute_statements_in_transaction(
     let result = match path {
         Some(TxPath::Pg(pool)) => {
             let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
-            exec_tx_pg_inner(pool, statements, schema, start, operation_budget.clone(), cancel_context).await
+            exec_tx_pg_inner(
+                pool,
+                statements,
+                schema,
+                start,
+                operation_budget.clone(),
+                cancel_context,
+                &pool_key,
+                db_type,
+            )
+            .await
         }
         Some(TxPath::Mysql(pool, _bare)) => {
             exec_tx_mysql_inner(state, &pool_key, pool, statements, start, operation_budget.clone()).await
@@ -2515,20 +2487,57 @@ async fn exec_tx_pg_inner(
     start: std::time::Instant,
     budget: DbOperationBudget,
     cancel_context: Option<db::postgres::PostgresCancelContext>,
+    pool_key: &str,
+    db_type: Option<DatabaseType>,
 ) -> Result<db::QueryResult, String> {
-    let mut client = db::postgres::checkout_postgres_client(&pool, None, budget.checkout_timeout)
+    // Checkout stage logs are emitted inside `checkout_postgres_client_logged` (lifecycle facade).
+    let db_type_label = connection_lifecycle::optional_database_type_log_label(db_type);
+    let log_context = connection_lifecycle::StageLogContext::for_pool(Some(pool_key), None, db_type_label.as_deref());
+    let mut client = db::postgres::checkout_postgres_client_logged(&pool, None, budget.checkout_timeout, log_context)
         .await
-        .map_err(|e| format!("Failed to acquire connection: {}", e))?;
+        .map_err(|e| format!("Failed to acquire connection: {e}"))?;
     let had_schema = schema.is_some();
     if let Some(s) = schema {
-        db::postgres::execute_postgres_infra_statement(
+        // Time only the SET statement — do not include checkout latency.
+        let schema_started = std::time::Instant::now();
+        connection_lifecycle::log_stage(
+            connection_lifecycle::StageLog::new(
+                connection_lifecycle::LifecycleStage::SchemaSet,
+                connection_lifecycle::StageOutcome::Start,
+                0,
+            )
+            .with_timeout(budget.recycle_timeout)
+            .with_context(log_context),
+        );
+        if let Err(e) = db::postgres::execute_postgres_infra_statement(
             &client,
             &format!("SET search_path TO {}", db::postgres::pg_quote_ident(s)),
             budget.recycle_timeout,
             "schema.set",
         )
         .await
-        .map_err(|e| format!("SET search_path failed: {}", e))?;
+        {
+            connection_lifecycle::log_stage(
+                connection_lifecycle::StageLog::new(
+                    connection_lifecycle::LifecycleStage::SchemaSet,
+                    connection_lifecycle::StageOutcome::Error,
+                    schema_started.elapsed().as_millis(),
+                )
+                .with_timeout(budget.recycle_timeout)
+                .with_context(log_context)
+                .with_error(&e),
+            );
+            return Err(format!("SET search_path failed: {e}"));
+        }
+        connection_lifecycle::log_stage(
+            connection_lifecycle::StageLog::new(
+                connection_lifecycle::LifecycleStage::SchemaSet,
+                connection_lifecycle::StageOutcome::Done,
+                schema_started.elapsed().as_millis(),
+            )
+            .with_timeout(budget.recycle_timeout)
+            .with_context(log_context),
+        );
     }
     let tx_result = exec_tx_pg_statements(&mut client, statements, &budget, cancel_context).await;
 
@@ -3940,68 +3949,12 @@ mod tests {
     }
 
     #[test]
-    fn db_operation_budget_from_config() {
-        let budget = DbOperationBudget::from_config(10, Some(30));
-        assert_eq!(budget.checkout_timeout, Duration::from_secs(10));
-        assert_eq!(budget.connect_timeout, Duration::from_secs(10));
-        assert_eq!(budget.recycle_timeout, Duration::from_secs(10));
-        assert_eq!(budget.query_timeout, Some(Duration::from_secs(30)));
-        assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
-        assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
-    }
-
-    #[test]
-    fn db_operation_budget_from_connection_config_uses_connection_settings() {
-        let mut config = test_connection_config(DatabaseType::Postgres);
-        config.connect_timeout_secs = 12;
-        config.query_timeout_secs = 0;
-
-        let budget = DbOperationBudget::from_connection_config(&config);
-
-        assert_eq!(budget.checkout_timeout, Duration::from_secs(12));
-        assert_eq!(budget.connect_timeout, Duration::from_secs(12));
-        assert_eq!(budget.recycle_timeout, Duration::from_secs(12));
-        assert_eq!(budget.query_timeout, None);
-        assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
-        assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
-    }
-
-    #[test]
-    fn db_operation_budget_query_timeout_zero_means_no_limit() {
+    fn db_operation_budget_reexport_preserves_query_module_path() {
+        // Callers may still import budget types from `crate::query`.
         let budget = DbOperationBudget::from_config(10, Some(0));
         assert_eq!(budget.query_timeout, None);
-        // Infrastructure timeouts still have hard limits
-        assert_eq!(budget.checkout_timeout, Duration::from_secs(10));
         assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
-    }
-
-    #[test]
-    fn db_operation_budget_query_timeout_zero_keeps_transaction_infra_limits() {
-        let mut config = test_connection_config(DatabaseType::Mysql);
-        config.connect_timeout_secs = 7;
-        config.query_timeout_secs = 0;
-
-        let budget = DbOperationBudget::from_connection_config(&config);
-
-        assert_eq!(budget.query_timeout, None);
-        assert_eq!(budget.checkout_timeout, Duration::from_secs(7));
-        assert_eq!(budget.recycle_timeout, Duration::from_secs(7));
-        assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
-    }
-
-    #[test]
-    fn db_operation_budget_clamps_infra_timeout() {
-        let budget = DbOperationBudget::from_config(0, Some(30));
-        assert_eq!(budget.checkout_timeout, Duration::from_secs(1)); // clamped to min 1s
-        let budget = DbOperationBudget::from_config(600, Some(30));
-        assert_eq!(budget.checkout_timeout, Duration::from_secs(300)); // clamped to max 300s
-    }
-
-    #[test]
-    fn db_operation_budget_with_defaults() {
-        let budget = DbOperationBudget::with_defaults();
-        assert_eq!(budget.checkout_timeout, db::connection_timeout());
-        assert_eq!(budget.query_timeout, Some(QUERY_TIMEOUT));
+        assert_eq!(QUERY_TIMEOUT, connection_lifecycle::DEFAULT_QUERY_TIMEOUT);
     }
 
     #[test]
