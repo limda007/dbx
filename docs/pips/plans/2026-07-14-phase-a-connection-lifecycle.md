@@ -130,6 +130,9 @@ Frontend adapter (later PR in this phase):
 
 ### PR-A2 — Budgeted health + cleanup as lifecycle APIs
 
+**Status (2026-07-14):** Implemented on branch with A1.  
+`connection_lifecycle/{health,cleanup}.rs` own PG/MySQL probes + budgeted close; `AppState::remove_stale_connection_pool`, `refresh_connections` (PG/MySQL arms), and `close_pool_kind_with_timeout` call into the facade. Tauri/web remain one-liners via existing `AppState` methods.
+
 **Intent:** One health and one cleanup path with `DbOperationBudget`, used by Tauri/web.
 
 **Files:**

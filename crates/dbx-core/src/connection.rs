@@ -39,8 +39,7 @@ const SQLSERVER_LEGACY_DRIVER_INSTALL_HINT: &str =
     "Install the SQL Server legacy compatibility component from Driver Manager, or open the connection settings and enable SQL Server legacy compatibility mode again.";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
-const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
-const HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
+// Pool close / health acquire budgets live in `connection_lifecycle` (PR-A2).
 
 #[cfg(feature = "duckdb-bundled")]
 mod duckdb_types {
@@ -1868,58 +1867,48 @@ impl AppState {
                 PoolKind::Mysql(pool, _) => {
                     let pool = pool.clone();
                     drop(connections);
-                    match tokio::time::timeout(HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT, pool.get_conn()).await {
-                        // Pool saturation means active work, not a dead connection. Removing this pool would
-                        // start a competing reconnect while foreground queries and metadata are still running.
-                        Err(_) => {
+                    // Pool saturation means active work, not a dead connection.
+                    let budget = self.lifecycle_budget_for_pool_key(pool_key).await;
+                    let db_type_label = self.lifecycle_db_type_label_for_pool_key(pool_key).await;
+                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+                        Some(pool_key),
+                        None,
+                        db_type_label.as_deref(),
+                    );
+                    let probe = crate::connection_lifecycle::probe_mysql_pool_health(&pool, &budget, log_context).await;
+                    match &probe {
+                        crate::connection_lifecycle::PoolHealthProbeResult::Busy => {
                             log::debug!("MySQL connection pool '{pool_key}' is busy; skipping health probe");
-                            false
                         }
-                        Ok(Err(err)) => {
-                            log::warn!("MySQL connection pool '{pool_key}' is stale: {err}");
-                            true
+                        crate::connection_lifecycle::PoolHealthProbeResult::Unhealthy { reason } => {
+                            log::warn!("MySQL connection pool '{pool_key}' is stale: {reason}");
                         }
-                        Ok(Ok(mut conn)) => {
-                            let timeout = crate::db::connection_timeout();
-                            match tokio::time::timeout(timeout, conn.ping()).await {
-                                Ok(Ok(())) => false,
-                                Ok(Err(err)) => {
-                                    log::warn!("MySQL connection pool '{pool_key}' is stale: {err}");
-                                    true
-                                }
-                                Err(_) => {
-                                    log::warn!("MySQL connection pool '{pool_key}' is stale: health check timed out");
-                                    true
-                                }
-                            }
-                        }
+                        crate::connection_lifecycle::PoolHealthProbeResult::Healthy => {}
                     }
+                    probe.is_stale()
                 }
                 PoolKind::Postgres(pool) => {
                     let pool = pool.clone();
                     drop(connections);
-                    let timeout = crate::db::connection_timeout();
-                    match tokio::time::timeout(HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT, pool.get()).await {
-                        Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
-                            Ok(Ok(_)) => false,
-                            Ok(Err(err)) => {
-                                log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
-                                true
-                            }
-                            Err(_) => {
-                                log::warn!("PostgreSQL connection pool '{pool_key}' is stale: health check timed out");
-                                true
-                            }
-                        },
-                        Ok(Err(err)) => {
-                            log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
-                            true
-                        }
-                        Err(_) => {
+                    let budget = self.lifecycle_budget_for_pool_key(pool_key).await;
+                    let db_type_label = self.lifecycle_db_type_label_for_pool_key(pool_key).await;
+                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+                        Some(pool_key),
+                        None,
+                        db_type_label.as_deref(),
+                    );
+                    let probe =
+                        crate::connection_lifecycle::probe_postgres_pool_health(&pool, &budget, log_context).await;
+                    match &probe {
+                        crate::connection_lifecycle::PoolHealthProbeResult::Busy => {
                             log::debug!("PostgreSQL connection pool '{pool_key}' is busy; skipping health probe");
-                            false
                         }
+                        crate::connection_lifecycle::PoolHealthProbeResult::Unhealthy { reason } => {
+                            log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {reason}");
+                        }
+                        crate::connection_lifecycle::PoolHealthProbeResult::Healthy => {}
                     }
+                    probe.is_stale()
                 }
                 PoolKind::SqlServer(client) => {
                     let client = client.clone();
@@ -2490,6 +2479,8 @@ impl AppState {
     /// Returns `Ok(())` if the pool exists and is healthy, `Err` otherwise.
     /// If the pool is unhealthy it is removed from the map so subsequent
     /// `get_or_create_pool` calls will transparently recreate it.
+    ///
+    /// PG/MySQL probes are budgeted via [`crate::connection_lifecycle`] (PR-A2).
     pub async fn check_connection_health(&self, connection_id: &str) -> Result<(), String> {
         let db_type = {
             let configs = self.configs.read().await;
@@ -2510,6 +2501,19 @@ impl AppState {
             return Err("Connection pool is unhealthy".to_string());
         }
         Ok(())
+    }
+
+    async fn lifecycle_budget_for_pool_key(&self, pool_key: &str) -> crate::connection_lifecycle::DbOperationBudget {
+        let configs = self.configs.read().await;
+        config_for_pool_key(pool_key, &configs)
+            .map(crate::connection_lifecycle::DbOperationBudget::from_connection_config)
+            .unwrap_or_else(crate::connection_lifecycle::health_budget_defaults)
+    }
+
+    async fn lifecycle_db_type_label_for_pool_key(&self, pool_key: &str) -> Option<String> {
+        let configs = self.configs.read().await;
+        config_for_pool_key(pool_key, &configs)
+            .map(|config| crate::connection_lifecycle::database_type_log_label(config.db_type))
     }
 
     pub async fn refresh_connections(&self) {
@@ -2535,34 +2539,42 @@ impl AppState {
         // Check cloned pools (async I/O, no lock held)
         for (key, pool) in &checks {
             let healthy = match pool {
-                PoolKind::Mysql(p, _) => match db::mysql::get_conn_with_health_check(p).await {
-                    Ok(_) => true,
-                    Err(e) => {
-                        log::warn!("MySQL connection pool '{key}' is unhealthy: {e}");
-                        false
-                    }
-                },
-                PoolKind::Postgres(p) => match tokio::time::timeout(timeout, p.get()).await {
-                    Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
-                        Ok(Ok(_)) => true,
-                        Ok(Err(e)) => {
-                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
+                PoolKind::Mysql(p, _) => {
+                    let budget = self.lifecycle_budget_for_pool_key(key).await;
+                    let db_type_label = self.lifecycle_db_type_label_for_pool_key(key).await;
+                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+                        Some(key.as_str()),
+                        None,
+                        db_type_label.as_deref(),
+                    );
+                    let probe = crate::connection_lifecycle::probe_mysql_pool_health(p, &budget, log_context).await;
+                    match probe {
+                        crate::connection_lifecycle::PoolHealthProbeResult::Healthy
+                        | crate::connection_lifecycle::PoolHealthProbeResult::Busy => true,
+                        crate::connection_lifecycle::PoolHealthProbeResult::Unhealthy { reason } => {
+                            log::warn!("MySQL connection pool '{key}' is unhealthy: {reason}");
                             false
                         }
-                        Err(_) => {
-                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: health check timed out");
+                    }
+                }
+                PoolKind::Postgres(p) => {
+                    let budget = self.lifecycle_budget_for_pool_key(key).await;
+                    let db_type_label = self.lifecycle_db_type_label_for_pool_key(key).await;
+                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+                        Some(key.as_str()),
+                        None,
+                        db_type_label.as_deref(),
+                    );
+                    let probe = crate::connection_lifecycle::probe_postgres_pool_health(p, &budget, log_context).await;
+                    match probe {
+                        crate::connection_lifecycle::PoolHealthProbeResult::Healthy
+                        | crate::connection_lifecycle::PoolHealthProbeResult::Busy => true,
+                        crate::connection_lifecycle::PoolHealthProbeResult::Unhealthy { reason } => {
+                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {reason}");
                             false
                         }
-                    },
-                    Ok(Err(e)) => {
-                        log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
-                        false
                     }
-                    Err(_) => {
-                        log::warn!("PostgreSQL connection pool '{key}' is unhealthy: get connection timed out");
-                        false
-                    }
-                },
+                }
                 PoolKind::SqlServer(client) => {
                     let mut client = client.lock().await;
                     match db::sqlserver::test_connection(&mut client).await {
@@ -3160,12 +3172,14 @@ fn close_removed_pools_in_background(removed: Vec<(String, PoolKind)>) {
 }
 
 async fn close_pool_kind_with_timeout(pool_key: String, pool: PoolKind) {
-    match tokio::time::timeout(Duration::from_secs(POOL_CLOSE_TIMEOUT_SECS), close_pool_kind(pool)).await {
-        Ok(()) => {}
-        Err(_) => log::warn!(
-            "Timed out closing connection pool '{pool_key}' after {POOL_CLOSE_TIMEOUT_SECS}s; cleanup will continue by dropping the pool handle."
-        ),
+    // Detach map entry first (caller), then budgeted close without holding connections lock.
+    let connection_id = crate::connection_lifecycle::connection_id_from_pool_key(&pool_key);
+    let mut log_context = crate::connection_lifecycle::StageLogContext::for_pool(Some(pool_key.as_str()), None, None);
+    if !connection_id.is_empty() {
+        log_context.connection_id = Some(connection_id);
     }
+    crate::connection_lifecycle::close_with_default_timeout(pool_key.as_str(), log_context, close_pool_kind(pool))
+        .await;
 }
 
 fn extract_auth_token_from_params(params: &str) -> Option<String> {
