@@ -22,29 +22,38 @@ live behind a single seam. Tauri commands, web routes, and the desktop store bec
 
 This is architecture review #1. It deliberately does **not** complete #2 (hide `PoolKind` behind driver traits). #2 starts after A lands.
 
-## Why this is still open (baseline audit, 2026-07-14)
+## Baseline audit (2026-07-14) → Phase A outcome (2026-07-15)
 
-PIP-0001 **stage-1 bleed-stop work has largely landed**. Do not re-implement these:
+PIP-0001 **stage-1 bleed-stop work had largely landed before Phase A**. Do not re-implement these:
 
 | PIP-0001 item | Current state | Evidence |
 | --- | --- | --- |
-| `DbOperationBudget` | **Done** | `crates/dbx-core/src/query.rs` (`from_config`, cancel/cleanup hard limits) |
+| `DbOperationBudget` | **Done** | `connection_lifecycle::budget` (re-export via `query::DbOperationBudget`) |
 | Postgres deadpool wait/create/recycle timeout | **Done** | `db/postgres.rs` pool builder |
-| `checkout_postgres_client` + cancel | **Done** | `db/postgres.rs` |
-| Postgres TLS cancel | **Done** | `cancel_postgres_query` + `PostgresCancelContext` |
-| MySQL checkout with health + cancel | **Partial / Done on main query path** | `get_conn_with_health_check_with_cancel` used from `query.rs` |
-| Frontend `ensureConnected` / health timeout | **Done** | `withConnectionHealthTimeout`, `connectionAttemptTimeoutMs` |
-| Frontend cancel UI timeout | **Done** | `withCancelQueryTimeout` in `queryStore` |
+| `checkout_postgres_client` + cancel | **Done** | `db/postgres.rs` (+ stage logs) |
+| Postgres TLS cancel | **Done** | `cancel_postgres_query` + `PostgresCancelContext` (+ lifecycle cancel logs) |
+| MySQL checkout with health + cancel | **Done on hot paths** | `get_conn_with_health_check_with_cancel[_logged]` from `query.rs` / export / import |
+| Frontend `ensureConnected` / health timeout | **Done** | `lifecycleClient` + `connectionStore` |
+| Frontend cancel UI timeout | **Done** | `lifecycleClient.withCancelQueryTimeout` in `queryStore` |
 | Keepalive default 30s (Rust + dialog) | **Done** | `default_keepalive_interval_secs`, `ConnectionDialog` |
 
-**What is still missing** (Phase A scope):
+### Architecture gaps from the 2026-07-14 audit (all Phase A scope)
 
-1. **No lifecycle owner.** Budget, checkout helpers, connect match, health, cleanup, and Tauri `test_connection`/`connect_db` still sit in separate files with duplicated knowledge.
-2. **Dual connect dispatch.** `src-tauri/src/commands/connection.rs` still contains a large `match config.db_type` for `test_connection` / connect paths; core `connection.rs` has another connect factory. Deleting either path mostly moves the match—architecture review deletion test fails.
-3. **Bare checkout still leaks.** Grep still finds unwrapped `pool.get().await` / `get_conn().await` on secondary paths (`transfer`, `database_export`, `questdb`, `ob_oracle`, `manticoresearch`, some `query.rs` branches, keepalive/health internals).
-4. **Health is not a full lifecycle phase.** `AppState::check_connection_health` is mostly “pool exists + stale remove,” while `refresh_connections` has a separate ad-hoc per-`PoolKind` ping ladder—not one budgeted health API.
-5. **Stage logging is incomplete / inconsistent.** Some checkout logs exist (`[db:pool.checkout:…]`); there is no single `LifecycleStage` + `trace_id` contract across ensureConnected → checkout → query → cancel → cleanup. → **Addressed in PR-A6** (see [stage log QA note](./2026-07-15-connection-lifecycle-stage-logs.md)).
-6. **Frontend is not yet a pure adapter.** `connectionStore.ensureConnected` works, but recovery actions (force clear pool / reconnect) and diagnostics are not centralized as lifecycle client operations. → **Addressed in PR-A5** (`lifecycleClient.ts` + `forceClearPoolsAndReconnect`).
+| # | Gap (snapshot) | Phase A response |
+| --- | --- | --- |
+| 1 | **No lifecycle owner** — budget/checkout/connect/health/cleanup scattered | **Addressed in A1–A3** — `crates/dbx-core/src/connection_lifecycle/` owns budget, stage, health, cleanup, connect/test. Optional follow-ups (not blocking A): extract `checkout.rs` / `recovery.rs` as pure re-export modules. |
+| 2 | **Dual connect dispatch** — Tauri mega-`match` + core factory | **Addressed in A3** — `connection_lifecycle::{connect,test_connection}`; Tauri/web are thin adapters (no connect/test `match config.db_type` gate). |
+| 3 | **Bare checkout leaks** on secondary paths | **Addressed in A4** for product hot paths (query/connect/health/cancel + transfer/export/questdb/ob_oracle/manticoresearch). Residual bare `get_conn` only in **tests** / ignored live tests (allowed by A4 gate). |
+| 4 | **Health not a full lifecycle phase** | **Addressed in A2** — budgeted PG/MySQL probes (`LifecycleStage::Ping`); stale remove + `refresh_connections` PG/MySQL arms go through lifecycle helpers. |
+| 5 | **Stage logging incomplete** | **Addressed in A6** (+ follow-up review fixes for `accepted`/`detail`/product `db_type`) — see [stage log QA note](./2026-07-15-connection-lifecycle-stage-logs.md). |
+| 6 | **Frontend not a pure adapter** | **Addressed in A5** — `lifecycleClient.ts`, `forceClearPoolsAndReconnect`, error-indicator reconnect. |
+
+### Residual (explicitly out of Phase A or polish-only)
+
+- **Phase B / review #2:** hide `PoolKind` behind driver traits / `DatabaseSession`.
+- **Observability polish:** `pool.recycle` / `result.fetch` stage names exist but are not fully instrumented on every driver path.
+- **Full default-feature CI** on constrained hosts: prefer `cargo test -p dbx-core --lib --no-default-features --features mq-admin -j 1` to avoid DuckDB native rebuild thrash; enable `duckdb-bundled` only with free memory and low job count.
+
 
 ## Non-goals (Phase A)
 
@@ -288,14 +297,30 @@ rg 'pool\.get\(\)\.await|get_conn\(\)\.await' crates/dbx-core/src/query.rs crate
 | `query_timeout_secs = 0` long SQL | all | SQL not killed by infra budget |
 | Session temp table (MySQL) | A4/A5 | normal multi-query session still works |
 
-Commands (per PR as applicable):
+Commands (per PR as applicable). On memory-constrained hosts (WSL thrash risk), prefer the **safe subset** — never a full default-feature rebuild that pulls `duckdb-bundled`:
 
 ```bash
-cargo test -p dbx-core --lib
-# if live DBs available:
+# Safe core unit subset (no duckdb-bundled). cargo accepts one TESTNAME filter per
+# invocation — run twice (or use a broader filter like `lifecycle`):
+CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib \
+  --no-default-features --features mq-admin -j 1 \
+  connection_lifecycle -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib \
+  --no-default-features --features mq-admin -j 1 \
+  query_cancel -- --test-threads=1
+
+# Full lib suite only when memory allows (default features may rebuild DuckDB):
+# cargo test -p dbx-core --lib -j 1
+
+# Live DBs (optional, ignored by default):
 # cargo test -p dbx-core --test live_* -- --ignored
-pnpm exec vitest run apps/desktop/src/stores/__tests__/connectionStore.timeout.spec.ts
-pnpm exec vitest run apps/desktop/src/stores/__tests__/queryStore*.spec.ts
+
+# Frontend lifecycle adapter + timeout/cancel stores
+# (from repo root; use ./node_modules/.bin/vitest if pnpm is not on PATH):
+./node_modules/.bin/vitest run \
+  apps/desktop/src/lib/connection/__tests__/lifecycleClient.spec.ts \
+  apps/desktop/src/stores/__tests__/connectionStore.timeout.spec.ts \
+  apps/desktop/src/stores/__tests__/queryStore.cancel.spec.ts
 ```
 
 ## Mapping: architecture review ↔ this plan
@@ -334,7 +359,11 @@ pnpm exec vitest run apps/desktop/src/stores/__tests__/queryStore*.spec.ts
 
 ## Immediate next step
 
-Start **PR-A1** only: module skeleton + budget re-export + stage log helper + wire one existing checkout path. Keep the PR under ~300 lines of meaningful change so review stays on the seam, not on driver behavior.
+Phase A code + docs baseline are complete on `feat/connection-lifecycle`. Optional follow-ups (not Phase A blockers):
+
+1. Open PR / push when ready (branch was intentionally kept local).
+2. Phase B: hide `PoolKind` behind driver traits / `DatabaseSession`.
+3. Polish: optional `checkout.rs` / `recovery.rs` re-export modules; broader `pool.recycle` / `result.fetch` instrumentation.
 
 ---
 
