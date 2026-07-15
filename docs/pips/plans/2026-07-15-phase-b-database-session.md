@@ -1,6 +1,6 @@
 # Phase B: Hide `PoolKind` Behind DatabaseSession
 
-**Status:** In progress — **PR-B1–B3 done** (B4 next: shrink public `PoolKind`)  
+**Status:** In progress — **PR-B1–B4 done** (B5 optional: capability traits)  
 **Date:** 2026-07-15  
 **Branch:** `feat/connection-lifecycle`
 
@@ -146,15 +146,31 @@ crates/dbx-core/src/
 
 ---
 
-### PR-B4 — Shrink public `PoolKind`
+### PR-B4 — Shrink public `PoolKind` ✅
 
 **Intent:** `PoolKind` `pub(crate)` or re-export only for tests; Tauri/web never import it.
 
-**Gate:**
+**Changes:**
+
+- `PoolKind` → `pub(crate)`
+- `AppState.connections` → `pub(crate)`
+- `insert_connection_pool` / `insert_connection_pool_for_attempt` / `external_driver_pool` /
+  `connect_sqlserver_pool_with_legacy_fallback` / `close_pool_kind` → `pub(crate)`
+- Public helpers without exposing `PoolKind`:
+  - `has_pool`, `insert_message_queue_pool_marker`, `insert_sqlite_pool`,
+    `insert_postgres_pool`, `insert_sqlserver_pool`, `sqlserver_client`, `sqlite_pool_if_open`
+- Tauri `sqlite_backup` uses `sqlite_pool_if_open`
+- Tauri/web/live tests no longer name `PoolKind` or touch `.connections`
+
+**Gate (verified 2026-07-15):**
 
 ```text
-rg 'PoolKind' apps/ src-tauri/ crates/dbx-web/   # should be empty or adapters only
+rg 'PoolKind' apps/ src-tauri/ crates/dbx-web/ crates/dbx-core/tests  # empty
+rg '\.connections' src-tauri/ crates/dbx-web/ crates/dbx-core/tests   # empty
 ```
+
+**Checks:** `dbx-core` mq-admin + default green; `dbx-web` mq-admin green.
+(`cargo check -p dbx` needs host glib for Tauri; not a B4 regression.)
 
 ---
 
@@ -192,4 +208,4 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 ## Immediate next step
 
-**PR-B4:** shrink public `PoolKind` (`pub(crate)` / stop UI imports) once product hot paths no longer need it.
+**PR-B5 (optional):** capability traits for PG/MySQL only if B1–B4 leave painful duplication; otherwise Phase B can stop at B4.

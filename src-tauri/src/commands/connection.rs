@@ -16,7 +16,7 @@ mod tests {
     #[cfg(feature = "mq-admin")]
     use {
         super::{load_connection_configs, save_connection_configs},
-        dbx_core::connection::{AppState, PoolKind},
+        dbx_core::connection::AppState,
         dbx_core::storage::Storage,
     };
 
@@ -196,7 +196,7 @@ mod tests {
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
+        state.insert_message_queue_pool_marker(&initial.id).await;
         let first = state.mq_registry.get_or_build(&initial).await.unwrap();
 
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
@@ -215,7 +215,7 @@ mod tests {
 
         let second = state.mq_registry.get_or_build(&updated).await.unwrap();
         assert!(!std::sync::Arc::ptr_eq(&first, &second));
-        assert!(!state.connections.read().await.contains_key(&initial.id));
+        assert!(!state.has_pool(&initial.id).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -231,7 +231,7 @@ mod tests {
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
         state.storage.save_connections(&[updated.clone()]).await.unwrap();
         state.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
+        state.insert_message_queue_pool_marker(&initial.id).await;
 
         let loaded = load_connection_configs(&state).await.unwrap();
 
@@ -246,7 +246,7 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
         assert_eq!(cached_admin_url.as_deref(), Some("http://127.0.0.1:8081"));
-        assert!(!state.connections.read().await.contains_key(&initial.id));
+        assert!(!state.has_pool(&initial.id).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -294,11 +294,11 @@ mod tests {
             configs.insert(kept.id.clone(), kept.clone());
             configs.insert(removed.id.clone(), removed.clone());
         }
-        state.connections.write().await.insert(removed.id.clone(), PoolKind::MessageQueue);
+        state.insert_message_queue_pool_marker(&removed.id).await;
 
         save_connection_configs(&state, &[kept.clone()]).await.unwrap();
 
-        assert!(!state.connections.read().await.contains_key(&removed.id));
+        assert!(!state.has_pool(&removed.id).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -285,7 +285,7 @@ mod tests {
     use crate::state::{LoginRateLimit, WebState};
     use axum::extract::State;
     use axum::Json;
-    use dbx_core::connection::{AppState, PoolKind};
+    use dbx_core::connection::AppState;
     use dbx_core::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
     use dbx_core::storage::Storage;
     use std::collections::{HashMap, HashSet};
@@ -462,7 +462,7 @@ mod tests {
         let config = mq_config("mq-info", "http://127.0.0.1:8080");
         state.app.storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
         state.app.configs.write().await.insert(config.id.clone(), config.clone());
-        state.app.connections.write().await.insert(config.id.clone(), PoolKind::MessageQueue);
+        state.app.insert_message_queue_pool_marker(&config.id).await;
         let database_info = DatabaseConnectionInfo {
             product_name: Some("Apache Pulsar".to_string()),
             product_version: Some("3.3.0".to_string()),
@@ -491,7 +491,7 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.app.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
+        state.app.insert_message_queue_pool_marker(&initial.id).await;
         let first = state.app.mq_registry.get_or_build(&initial).await.unwrap();
 
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
@@ -514,7 +514,7 @@ mod tests {
 
         let second = state.app.mq_registry.get_or_build(&updated).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
-        assert!(!state.app.connections.read().await.contains_key(&initial.id));
+        assert!(!state.app.has_pool(&initial.id).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -525,7 +525,7 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.app.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
+        state.app.insert_message_queue_pool_marker(&initial.id).await;
         let first = state.app.mq_registry.get_or_build(&initial).await.unwrap();
 
         let updated = mq_config("mq-conn", &spawn_pulsar_clusters_server().await);
@@ -547,7 +547,7 @@ mod tests {
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
         state.app.storage.save_connections(&[updated.clone()]).await.unwrap();
         state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.app.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
+        state.app.insert_message_queue_pool_marker(&initial.id).await;
 
         let result = load_connections(State(state.clone())).await;
         assert!(result.is_ok());
@@ -560,7 +560,7 @@ mod tests {
             .and_then(serde_json::Value::as_str);
         assert_eq!(cached_admin_url, Some("http://127.0.0.1:8081"));
         drop(configs);
-        assert!(!state.app.connections.read().await.contains_key(&initial.id));
+        assert!(!state.app.has_pool(&initial.id).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -604,13 +604,13 @@ mod tests {
             configs.insert(kept.id.clone(), kept.clone());
             configs.insert(removed.id.clone(), removed.clone());
         }
-        state.app.connections.write().await.insert(removed.id.clone(), PoolKind::MessageQueue);
+        state.app.insert_message_queue_pool_marker(&removed.id).await;
 
         let result =
             save_connections(State(state.clone()), Json(SaveConnectionsRequest { configs: vec![kept.clone()] })).await;
         assert!(result.is_ok());
 
-        assert!(!state.app.connections.read().await.contains_key(&removed.id));
+        assert!(!state.app.has_pool(&removed.id).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -625,11 +625,8 @@ mod tests {
         let conn_pool = dbx_core::db::sqlite::connect_path(&conn_path.to_string_lossy()).await.unwrap();
         let conn2_pool = dbx_core::db::sqlite::connect_path(&conn2_path.to_string_lossy()).await.unwrap();
 
-        {
-            let mut connections = state.app.connections.write().await;
-            connections.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
-            connections.insert("conn2".to_string(), PoolKind::Sqlite(conn2_pool));
-        }
+        state.app.insert_sqlite_pool("conn", conn_pool).await;
+        state.app.insert_sqlite_pool("conn2", conn2_pool).await;
 
         let result = disconnect_db(
             State(state.clone()),
@@ -638,9 +635,8 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        let connections = state.app.connections.read().await;
-        assert!(!connections.contains_key("conn"));
-        assert!(connections.contains_key("conn2"));
+        assert!(!state.app.has_pool("conn").await);
+        assert!(state.app.has_pool("conn2").await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -653,7 +649,7 @@ mod tests {
         let conn_pool = dbx_core::db::sqlite::connect_path(&conn_path.to_string_lossy()).await.unwrap();
         state.app.begin_connection_attempt_with_client_attempt("conn", Some(1)).await;
         let current_attempt = state.app.begin_connection_attempt_with_client_attempt("conn", Some(2)).await;
-        state.app.connections.write().await.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
+        state.app.insert_sqlite_pool("conn", conn_pool).await;
 
         let result = disconnect_db(
             State(state.clone()),
@@ -662,7 +658,7 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        assert!(state.app.connections.read().await.contains_key("conn"));
+        assert!(state.app.has_pool("conn").await);
         assert!(state.app.ensure_current_connection_attempt("conn", Some(current_attempt)).await.is_ok());
 
         let result = disconnect_db(
@@ -672,7 +668,7 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        assert!(!state.app.connections.read().await.contains_key("conn"));
+        assert!(!state.app.has_pool("conn").await);
         assert!(state.app.ensure_current_connection_attempt("conn", Some(current_attempt)).await.is_err());
 
         let _ = std::fs::remove_dir_all(dir);
@@ -685,10 +681,7 @@ mod tests {
         std::fs::File::create(&conn_path).unwrap();
         let conn_pool = dbx_core::db::sqlite::connect_path(&conn_path.to_string_lossy()).await.unwrap();
 
-        {
-            let mut connections = state.app.connections.write().await;
-            connections.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
-        }
+        state.app.insert_sqlite_pool("conn", conn_pool).await;
         {
             let mut configs = state.app.configs.write().await;
             configs.insert("conn".to_string(), sqlite_config("conn", &conn_path.to_string_lossy()));
@@ -713,7 +706,7 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let config = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.app.configs.write().await.insert(config.id.clone(), config.clone());
-        state.app.connections.write().await.insert(config.id.clone(), PoolKind::MessageQueue);
+        state.app.insert_message_queue_pool_marker(&config.id).await;
         let first = state.app.mq_registry.get_or_build(&config).await.unwrap();
 
         let result = disconnect_db(
@@ -723,7 +716,7 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        assert!(!state.app.connections.read().await.contains_key(&config.id));
+        assert!(!state.app.has_pool(&config.id).await);
         let second = state.app.mq_registry.get_or_build(&config).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
 

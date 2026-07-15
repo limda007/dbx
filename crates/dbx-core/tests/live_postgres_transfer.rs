@@ -1,4 +1,4 @@
-use dbx_core::connection::{AppState, PoolKind};
+use dbx_core::connection::AppState;
 use dbx_core::db::postgres;
 use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::storage::Storage;
@@ -190,8 +190,8 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
     let source_pool_key = format!("{source_connection_id}:{source_database}");
     let target_pool_key = format!("{target_connection_id}:{target_database}");
 
-    state.connections.write().await.insert(source_pool_key.clone(), PoolKind::Postgres(source_pool.clone()));
-    state.connections.write().await.insert(target_pool_key.clone(), PoolKind::Postgres(target_pool.clone()));
+    state.insert_postgres_pool(source_pool_key.clone(), source_pool.clone()).await;
+    state.insert_postgres_pool(target_pool_key.clone(), target_pool.clone()).await;
     state
         .configs
         .write()
@@ -471,8 +471,8 @@ async fn live_postgres_transfer_skips_create_ddl_for_existing_target_table() {
     let source_pool_key = format!("{source_connection_id}:{source_database}");
     let target_pool_key = format!("{target_connection_id}:{target_database}");
 
-    state.connections.write().await.insert(source_pool_key.clone(), PoolKind::Postgres(source_pool.clone()));
-    state.connections.write().await.insert(target_pool_key.clone(), PoolKind::Postgres(target_pool.clone()));
+    state.insert_postgres_pool(source_pool_key.clone(), source_pool.clone()).await;
+    state.insert_postgres_pool(target_pool_key.clone(), target_pool.clone()).await;
     state
         .configs
         .write()

@@ -81,7 +81,11 @@ fn oceanbase_mysql_setup_queries(config: &ConnectionConfig) -> Vec<String> {
     oceanbase_mysql_query_timeout_sql(config, config.query_timeout_secs).into_iter().collect()
 }
 
-pub enum PoolKind {
+/// Live connection handle registry entry.
+///
+/// Crate-private (Phase B4): product paths use [`crate::database_session`] or
+/// `AppState` helpers; Tauri/web must not match variants.
+pub(crate) enum PoolKind {
     Mysql(db::mysql::MySqlPool, MysqlMode),
     Postgres(deadpool_postgres::Pool),
     Sqlite(db::sqlite::SqliteHandle),
@@ -175,7 +179,8 @@ macro_rules! agent_connection_pool_database_type {
 }
 
 pub struct AppState {
-    pub connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    /// Crate-private registry of live pools (Phase B4). Use session/helpers outside core.
+    pub(crate) connections: Arc<RwLock<HashMap<String, PoolKind>>>,
     task_supervisor: TaskSupervisor,
     pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
     connection_attempts: RwLock<HashMap<String, ConnectionAttemptState>>,
@@ -683,7 +688,11 @@ impl AppState {
             .with_database_info(database_info_from_protocol_value(&response)))
     }
 
-    pub async fn external_driver_pool(&self, driver_id: &str, config: &ConnectionConfig) -> Result<PoolKind, String> {
+    pub(crate) async fn external_driver_pool(
+        &self,
+        driver_id: &str,
+        config: &ConnectionConfig,
+    ) -> Result<PoolKind, String> {
         let env = self.external_driver_runtime_env(driver_id)?;
         let session = self.plugins.start_driver_session_with_env(driver_id, env).await?;
         let params = serde_json::json!({ "connection": config });
@@ -751,7 +760,7 @@ impl AppState {
         }
     }
 
-    pub async fn connect_sqlserver_pool_with_legacy_fallback(
+    pub(crate) async fn connect_sqlserver_pool_with_legacy_fallback(
         &self,
         config: &ConnectionConfig,
         host: &str,
@@ -808,7 +817,7 @@ impl AppState {
         Ok(PluginRuntimeEnv::default().with_var("DBX_JAVA_BIN", java.to_string_lossy().to_string()))
     }
 
-    pub async fn insert_connection_pool(&self, pool_key: String, pool: PoolKind, config: &ConnectionConfig) {
+    pub(crate) async fn insert_connection_pool(&self, pool_key: String, pool: PoolKind, config: &ConnectionConfig) {
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.insert(pool_key.clone(), PoolActivity::now());
         self.start_keepalive_task(&pool_key, &pool, config).await;
@@ -816,6 +825,58 @@ impl AppState {
         let previous = self.connections.write().await.insert(pool_key, pool);
         if let Some(pool) = previous {
             close_pool_kind_with_timeout(previous_key, pool).await;
+        }
+    }
+
+    /// Whether a pool key is currently registered (no `PoolKind` exposure).
+    pub async fn has_pool(&self, pool_key: &str) -> bool {
+        self.connections.read().await.contains_key(pool_key)
+    }
+
+    /// Register a Message Queue admin marker pool (tests / fixtures).
+    pub async fn insert_message_queue_pool_marker(&self, connection_id: &str) {
+        self.connections.write().await.insert(connection_id.to_string(), PoolKind::MessageQueue);
+    }
+
+    /// Register an already-open SQLite handle under `pool_key` (tests / fixtures).
+    pub async fn insert_sqlite_pool(&self, pool_key: impl Into<String>, pool: db::sqlite::SqliteHandle) {
+        self.connections.write().await.insert(pool_key.into(), PoolKind::Sqlite(pool));
+    }
+
+    /// Register an already-open PostgreSQL pool under `pool_key` (live tests / fixtures).
+    pub async fn insert_postgres_pool(&self, pool_key: impl Into<String>, pool: deadpool_postgres::Pool) {
+        self.connections.write().await.insert(pool_key.into(), PoolKind::Postgres(pool));
+    }
+
+    /// Register an already-open SQL Server client under `pool_key` (live tests / fixtures).
+    pub async fn insert_sqlserver_pool(
+        &self,
+        pool_key: impl Into<String>,
+        client: Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>,
+    ) {
+        self.connections.write().await.insert(pool_key.into(), PoolKind::SqlServer(client));
+    }
+
+    /// Return a clone of the SQL Server client for `pool_key`, if present.
+    pub async fn sqlserver_client(
+        &self,
+        pool_key: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>, String> {
+        match self.connections.read().await.get(pool_key) {
+            Some(PoolKind::SqlServer(client)) => Ok(client.clone()),
+            Some(_) => Err("Not a SQL Server pool".to_string()),
+            None => Err("Pool not found".to_string()),
+        }
+    }
+
+    /// Return the open SQLite handle for `pool_key`, if any.
+    ///
+    /// Errors when a different driver is registered (e.g. backup of non-SQLite).
+    pub async fn sqlite_pool_if_open(&self, pool_key: &str) -> Result<Option<db::sqlite::SqliteHandle>, String> {
+        match self.connections.read().await.get(pool_key) {
+            Some(PoolKind::Sqlite(pool)) => Ok(Some(pool.clone())),
+            Some(_) => Err("SQLite backup is only available for SQLite connections".to_string()),
+            None => Ok(None),
         }
     }
 
@@ -876,7 +937,7 @@ impl AppState {
         }
     }
 
-    pub async fn insert_connection_pool_for_attempt(
+    pub(crate) async fn insert_connection_pool_for_attempt(
         &self,
         connection_id: &str,
         attempt: u64,
@@ -3102,7 +3163,7 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
     }
 }
 
-pub async fn close_pool_kind(pool: PoolKind) {
+pub(crate) async fn close_pool_kind(pool: PoolKind) {
     match pool {
         PoolKind::Mysql(p, _) => {
             let _ = p.disconnect().await;
