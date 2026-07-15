@@ -2778,7 +2778,7 @@ pub async fn get_conn_with_health_check_with_cancel_logged(
                 StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Done, start.elapsed().as_millis())
                     .with_timeout(timeout)
                     .with_context(log_context)
-                    .with_error("recovered after stale connection"),
+                    .with_detail("recovered after stale connection"),
             );
             Ok(conn)
         }
@@ -3195,11 +3195,12 @@ pub async fn kill_query_with_opts_logged(
 }
 
 fn log_mysql_cancel_start(timeout: Duration, connection_id: u32, log_context: StageLogContext<'_>) {
+    let detail = format!("mysql KILL QUERY target_conn_id={connection_id}");
     log_stage(
         StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0)
             .with_timeout(timeout)
             .with_context(log_context)
-            .with_error(&format!("mysql KILL QUERY target_conn_id={connection_id}")),
+            .with_detail(&detail),
     );
 }
 

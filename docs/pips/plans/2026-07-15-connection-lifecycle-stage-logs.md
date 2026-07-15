@@ -8,7 +8,7 @@
 All lifecycle stages emit through `connection_lifecycle::log_stage`:
 
 ```text
-[db:<stage>:<outcome>] elapsed_ms=… timeout_ms=… trace_id=… connection_id=… pool_key=… db_type=… client_session_id=… error=…
+[db:<stage>:<outcome>] elapsed_ms=… timeout_ms=… trace_id=… connection_id=… pool_key=… db_type=… client_session_id=… detail=… error=…
 ```
 
 | Field | Meaning |
@@ -20,7 +20,8 @@ All lifecycle stages emit through `connection_lifecycle::log_stage`:
 | `trace_id` | Usually the query `execution_id` |
 | `connection_id` / `pool_key` | Which connection / pool |
 | `db_type` | Product label (`postgres`, `opengauss`, `mysql`, …) — not the pool adapter |
-| `error` | Present on `error` (and some recovery notes on `done`) |
+| `detail` | Non-error notes (e.g. `cancel:accepted` explanation) — not a failure |
+| `error` | Present only for real failures (`outcome=error` or failed ops) |
 
 **Levels:** `error` → warn; `cancelled` → info; `start`/`done` → debug. Enable `RUST_LOG=dbx_core=debug` (or broader) to see the full sequence.
 

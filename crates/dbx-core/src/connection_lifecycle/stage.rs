@@ -122,6 +122,8 @@ pub struct StageLog<'a> {
     pub db_type: Option<&'a str>,
     pub trace_id: Option<&'a str>,
     pub client_session_id: Option<&'a str>,
+    /// Non-error explanatory text (e.g. cancel accepted notes). Never use for failures — use [`Self::error`].
+    pub detail: Option<&'a str>,
     pub error: Option<&'a str>,
 }
 
@@ -137,6 +139,7 @@ impl<'a> StageLog<'a> {
             db_type: None,
             trace_id: None,
             client_session_id: None,
+            detail: None,
             error: None,
         }
     }
@@ -173,6 +176,11 @@ impl<'a> StageLog<'a> {
 
     pub fn with_client_session_id(mut self, client_session_id: &'a str) -> Self {
         self.client_session_id = Some(client_session_id);
+        self
+    }
+
+    pub fn with_detail(mut self, detail: &'a str) -> Self {
+        self.detail = Some(detail);
         self
     }
 
@@ -229,6 +237,9 @@ fn write_stage_log(f: &mut impl Write, fields: &StageLog<'_>) -> fmt::Result {
     }
     if let Some(client_session_id) = fields.client_session_id.filter(|s| !s.is_empty()) {
         write!(f, " client_session_id={client_session_id}")?;
+    }
+    if let Some(detail) = fields.detail.filter(|s| !s.is_empty()) {
+        write!(f, " detail={detail}")?;
     }
     if let Some(error) = fields.error.filter(|s| !s.is_empty()) {
         write!(f, " error={error}")?;
@@ -290,10 +301,12 @@ mod tests {
         let line = format_stage_log(
             &StageLog::new(LifecycleStage::Cancel, StageOutcome::Accepted, 1)
                 .with_trace_id("exec-1")
-                .with_error("client cancel accepted; server cancel may still be in flight"),
+                .with_detail("client cancel accepted; server cancel may still be in flight"),
         );
         assert!(line.starts_with("[db:cancel:accepted]"));
         assert!(line.contains("trace_id=exec-1"));
+        assert!(line.contains("detail=client cancel accepted"));
+        assert!(!line.contains("error="));
         assert!(!line.contains(":done]"));
     }
 

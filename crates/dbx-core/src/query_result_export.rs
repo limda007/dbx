@@ -922,19 +922,22 @@ async fn try_export_mysql_query_result_stream(
     .await?;
     let mysql_connection_id = conn.id();
     let kill_opts = conn.opts().clone();
+    let export_db_type_label = crate::connection_lifecycle::database_type_log_label(request.database_type);
     if let Some(execution_id) = request.execution_id.clone() {
         let interrupt_kill_opts = kill_opts.clone();
         let kill_pool_key = pool_key.clone();
         let kill_trace_id = execution_id.clone();
+        let kill_db_type = export_db_type_label.clone();
         state.running_queries.register_interrupt(&execution_id, move || {
             let kill_opts = interrupt_kill_opts.clone();
             let kill_pool_key = kill_pool_key.clone();
             let kill_trace_id = kill_trace_id.clone();
+            let kill_db_type = kill_db_type.clone();
             tokio::spawn(async move {
                 let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
                     Some(kill_pool_key.as_str()),
                     Some(kill_trace_id.as_str()),
-                    Some("mysql"),
+                    Some(kill_db_type.as_str()),
                 );
                 if let Err(error) =
                     crate::db::mysql::kill_query_with_opts_logged(kill_opts, mysql_connection_id, log_context).await
@@ -1048,7 +1051,7 @@ async fn try_export_mysql_query_result_stream(
                 let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
                     Some(pool_key.as_str()),
                     request.execution_id.as_deref(),
-                    Some("mysql"),
+                    Some(export_db_type_label.as_str()),
                 );
                 let _ =
                     crate::db::mysql::kill_query_with_opts_logged(kill_opts, mysql_connection_id, log_context).await;

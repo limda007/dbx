@@ -2899,7 +2899,7 @@ async fn cancel_postgres_query(
         StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0)
             .with_timeout(cancel_timeout)
             .with_context(log_context)
-            .with_error("postgres cancel packet"),
+            .with_detail("postgres cancel packet"),
     );
     if let Some(ctx) = cancel_context {
         match make_rustls_connect_from_context(ctx) {

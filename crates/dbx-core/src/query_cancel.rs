@@ -146,7 +146,7 @@ impl RunningQueries {
         log_stage(
             StageLog::new(LifecycleStage::Cancel, StageOutcome::Accepted, start.elapsed().as_millis())
                 .with_context(log_context)
-                .with_error("client cancel accepted; server cancel may still be in flight"),
+                .with_detail("client cancel accepted; server cancel may still be in flight"),
         );
         true
     }
