@@ -161,6 +161,9 @@ Frontend adapter (later PR in this phase):
 
 ### PR-A3 — Collapse connect / test_connection dispatch into core lifecycle
 
+**Status (2026-07-14):** Implemented on `feat/connection-lifecycle`.  
+`connection_lifecycle::test_connection` / `connect` own the driver match; Tauri/web are thin adapters. Grep gate: no `match config.db_type` for connect/test in `src-tauri/src/commands/connection.rs`.
+
 **Intent:** Pass the architecture deletion test for connect: adapters stop owning the driver match.
 
 **Files:**

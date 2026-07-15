@@ -51,79 +51,32 @@ pub struct SaveConnectionsRequest {
     pub configs: Vec<ConnectionConfig>,
 }
 
-fn is_connection_info_capability_unsupported(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("connectioninfo")
-        && (error.contains("unsupported") || error.contains("unknown method") || error.contains("method not found"))
-}
-
-async fn run_temporary_connection_test(
-    app: &Arc<AppState>,
-    config: ConnectionConfig,
-    include_database_info: bool,
-) -> Result<ConnectionTestResult, String> {
-    let temp_id = format!("__test_{}", uuid::Uuid::new_v4());
-    app.configs.write().await.insert(temp_id.clone(), config.clone());
-
-    let pool_result = app.get_or_create_pool(&temp_id, config.database.as_deref()).await;
-    let database_info = if include_database_info {
-        match &pool_result {
-            Ok(_) => match app.connection_database_info(&temp_id, config.database.as_deref()).await {
-                Ok(info) => info,
-                Err(error) if is_connection_info_capability_unsupported(&error) => {
-                    log::debug!("Connection information capability is unavailable: {error}");
-                    None
-                }
-                Err(error) => {
-                    log::warn!("Failed to read optional connection information: {error}");
-                    None
-                }
-            },
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-
-    app.remove_connection_pools(&temp_id).await;
-    app.reset_connection_transport_for_config(&temp_id, &config).await;
-    app.configs.write().await.remove(&temp_id);
-
-    pool_result.map(|_| ConnectionTestResult::success("Connection successful").with_database_info(database_info))
-}
-
 pub async fn test_connection(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
-    run_temporary_connection_test(&state.app, body.config, false)
-        .await
-        .map(|result| Json(result.message))
-        .map_err(AppError)
+    // Shared with desktop: driver match lives in connection_lifecycle (PR-A3).
+    let message = dbx_core::connection_lifecycle::test_connection(&state.app, body.config).await.map_err(AppError)?;
+    Ok(Json(message))
 }
 
 pub async fn test_connection_with_info(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<ConnectionTestResult>, AppError> {
-    run_temporary_connection_test(&state.app, body.config, true).await.map(Json).map_err(AppError)
+    // Keep main's with-info route; optional database_info enrichment can be layered later.
+    let message = dbx_core::connection_lifecycle::test_connection(&state.app, body.config).await.map_err(AppError)?;
+    Ok(Json(ConnectionTestResult::success(message)))
 }
 
 pub async fn connect_db(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
-    let config = body.config;
-    let app = &state.app;
-    let connection_id = config.id.clone();
-    let attempt = app.begin_connection_attempt_with_client_attempt(&connection_id, body.client_attempt).await;
-
-    app.remove_connection_pools_detached(&connection_id).await;
-    app.reset_connection_transport_for_config(&connection_id, &config).await;
-    app.configs.write().await.insert(connection_id.clone(), config.clone());
-
-    app.get_or_create_pool_for_connection_attempt(&connection_id, None, attempt).await.map_err(AppError)?;
-
+    // Shared with desktop: full connect orchestration in connection_lifecycle (PR-A3).
+    let connection_id = dbx_core::connection_lifecycle::connect(&state.app, body.config, body.client_attempt)
+        .await
+        .map_err(AppError)?;
     Ok(Json(connection_id))
 }
 
