@@ -6,6 +6,8 @@
 
 mod execute;
 mod schema;
+mod transfer;
 
 pub(crate) use execute::execute_sql;
 pub(crate) use schema::{list_databases, list_schemas, list_tables};
+pub(crate) use transfer::{execute_transfer_sql, get_columns_for_transfer, stream_native_table_rows};

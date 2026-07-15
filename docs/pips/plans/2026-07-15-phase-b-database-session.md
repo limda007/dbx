@@ -1,6 +1,6 @@
 # Phase B: Hide `PoolKind` Behind DatabaseSession
 
-**Status:** In progress — **PR-B1 + B2 done** (B3 next: transfer/export)  
+**Status:** In progress — **PR-B1–B3 done** (B4 next: shrink public `PoolKind`)  
 **Date:** 2026-07-15  
 **Branch:** `feat/connection-lifecycle`
 
@@ -125,9 +125,24 @@ crates/dbx-core/src/
 
 ---
 
-### PR-B3 — Transfer + export checkout via session
+### PR-B3 — Transfer + export checkout via session ✅
 
 **Intent:** transfer/export obtain driver handles through session APIs (budgeted checkout already from A).
+
+**Files:**
+
+- add `database_session/transfer.rs`:
+  - `execute_transfer_sql` — transfer `execute_on_pool_once` multi-arm match
+  - `get_columns_for_transfer` — transfer column lookup dispatch
+  - `stream_native_table_rows` — table-export MySQL/PG/SqlServer stream path
+- `transfer.rs` / `table_export.rs` keep retries, agent session, cancel, product orchestration
+
+**Acceptance (verified 2026-07-15):**
+
+- transfer multi-arm execute + columns + native stream matches live in session (~20 `PoolKind::`)
+- residual: transfer PG-only sequence helpers (4), table_export Agent session (4), query_result_export typed streams (later)
+- `cargo check` mq-admin + default/duckdb green
+- `transfer::tests` 109 ok; `table_export::tests` 19 ok; `connection_lifecycle` 26 ok
 
 ---
 
@@ -177,4 +192,4 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 ## Immediate next step
 
-**PR-B3:** transfer/export obtain driver handles through session APIs.
+**PR-B4:** shrink public `PoolKind` (`pub(crate)` / stop UI imports) once product hot paths no longer need it.

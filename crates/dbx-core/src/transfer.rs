@@ -8,10 +8,8 @@ use crate::db;
 use crate::db::mongo_driver::MongoDocumentResult;
 use crate::models::connection::DatabaseType;
 use crate::object_source_sql::{build_executable_object_source_statements, EditableObjectSourceSqlInput};
-use crate::query::{agent_execute_query_params, pool_error_action, PoolErrorAction, QueryExecutionOptions};
+use crate::query::{pool_error_action, PoolErrorAction};
 use crate::sql::split_sql_statements;
-#[cfg(feature = "duckdb-bundled")]
-use crate::sql::starts_with_executable_sql_keyword;
 use crate::sql_dialect::{qualified_transfer_table, quote_transfer_identifier};
 
 static CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
@@ -2735,138 +2733,7 @@ async fn execute_on_pool_once(
 ) -> Result<db::QueryResult, String> {
     // Read-only check: block transfer operations in readonly mode
     crate::query::check_read_only_for_connection(state, pool_key, sql).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(pool_key).ok_or("Connection not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, mode) => {
-            let p = p.clone();
-            let bare = *mode == crate::connection::MysqlMode::Bare;
-            drop(connections);
-            db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows, Default::default()).await
-        }
-        PoolKind::Postgres(p) => {
-            let p = p.clone();
-            drop(connections);
-            db::postgres::execute_query_with_max_rows(&p, sql, max_rows).await
-        }
-        PoolKind::Sqlite(p) => {
-            let p = p.clone();
-            drop(connections);
-            db::sqlite::execute_query_with_max_rows(&p, sql, max_rows).await
-        }
-        PoolKind::ClickHouse(client) => {
-            let client = client.clone();
-            let database = database_from_pool_key(pool_key).unwrap_or("default").to_string();
-            drop(connections);
-            db::clickhouse_driver::execute_query_with_max_rows(&client, &database, sql, max_rows).await
-        }
-        PoolKind::SqlServer(client) => {
-            let client = client.clone();
-            drop(connections);
-            let mut client = client.lock().await;
-            let result = db::sqlserver::execute_query_with_max_rows(&mut client, sql, max_rows).await;
-            drop(client);
-            result
-        }
-        PoolKind::Agent(client) => {
-            let client = client.clone();
-            let database = database_from_pool_key(pool_key).map(str::to_string);
-            let sql = sql.to_string();
-            drop(connections);
-            let mut client = client.lock().await;
-            let params = agent_execute_query_params(
-                &sql,
-                database.as_deref(),
-                None,
-                QueryExecutionOptions { max_rows, fetch_size: max_rows, ..QueryExecutionOptions::default() },
-            );
-            client.execute_query(params).await
-        }
-        #[cfg(feature = "duckdb-bundled")]
-        PoolKind::DuckDb(con) => {
-            let con = con.clone();
-            let sql = sql.to_string();
-            drop(connections);
-            tokio::task::spawn_blocking(move || {
-                let con = con.lock().map_err(|e| e.to_string())?;
-                if max_rows.is_some()
-                    && starts_with_executable_sql_keyword(&sql, &["SELECT", "SHOW", "DESCRIBE", "WITH", "PRAGMA"])
-                {
-                    return crate::query::duckdb_execute_with_max_rows(&con, &sql, max_rows);
-                }
-                let start = std::time::Instant::now();
-                if starts_with_executable_sql_keyword(&sql, &["SELECT", "SHOW", "DESCRIBE", "WITH", "PRAGMA"]) {
-                    let mut stmt = con.prepare(&sql).map_err(|e| e.to_string())?;
-                    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-                    let stmt_ref = rows.as_ref().ok_or("DuckDB statement unavailable")?;
-                    let col_count = stmt_ref.column_count();
-                    let columns: Vec<String> = (0..col_count)
-                        .map(|i| stmt_ref.column_name(i).map(|s| s.to_string()).unwrap_or_else(|_| "?".to_string()))
-                        .collect();
-                    let mut result_rows = Vec::new();
-                    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                        let vals: Vec<serde_json::Value> = (0..col_count)
-                            .map(|i| {
-                                row.get::<_, String>(i)
-                                    .map(serde_json::Value::String)
-                                    .or_else(|_| row.get::<_, i64>(i).map(|v| serde_json::Value::Number(v.into())))
-                                    .or_else(|_| {
-                                        row.get::<_, f64>(i).map(|v| {
-                                            serde_json::Number::from_f64(v)
-                                                .map(serde_json::Value::Number)
-                                                .unwrap_or(serde_json::Value::Null)
-                                        })
-                                    })
-                                    .or_else(|_| row.get::<_, bool>(i).map(serde_json::Value::Bool))
-                                    .unwrap_or(serde_json::Value::Null)
-                            })
-                            .collect();
-                        result_rows.push(vals);
-                    }
-                    Ok(db::QueryResult {
-                        columns,
-                        column_types: Vec::new(),
-                        column_sortables: vec![],
-                        rows: result_rows,
-                        affected_rows: 0,
-                        execution_time_ms: start.elapsed().as_millis(),
-                        truncated: false,
-                        session_id: None,
-                        has_more: false,
-                    })
-                } else {
-                    let affected = con.execute(&sql, []).map_err(|e| e.to_string())?;
-                    Ok(db::QueryResult {
-                        columns: vec![],
-                        column_types: Vec::new(),
-                        column_sortables: vec![],
-                        rows: vec![],
-                        affected_rows: affected as u64,
-                        execution_time_ms: start.elapsed().as_millis(),
-                        truncated: false,
-                        session_id: None,
-                        has_more: false,
-                    })
-                }
-            })
-            .await
-            .map_err(|e| e.to_string())?
-        }
-        #[cfg(feature = "duckdb-bundled")]
-        PoolKind::ExternalTabular(ext_pool) => {
-            let con = ext_pool.cache.clone();
-            let sql = sql.to_string();
-            drop(connections);
-            tokio::task::spawn_blocking(move || {
-                let con = con.lock().map_err(|e| e.to_string())?;
-                crate::query::duckdb_execute_with_max_rows(&con, &sql, max_rows)
-            })
-            .await
-            .map_err(|e| e.to_string())?
-        }
-        _ => Err("Unsupported database type for transfer".to_string()),
-    }
+    crate::database_session::execute_transfer_sql(state, pool_key, sql, max_rows).await
 }
 
 fn database_from_pool_key(pool_key: &str) -> Option<&str> {
@@ -2892,88 +2759,7 @@ pub async fn get_columns_for_transfer(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::ColumnInfo>, String> {
-    let connections = state.connections.read().await;
-
-    #[cfg(feature = "duckdb-bundled")]
-    if let Some(PoolKind::DuckDb(con)) = connections.get(pool_key) {
-        let con = con.clone();
-        drop(connections);
-        let table = table.to_string();
-        let schema = schema.to_string();
-        return tokio::task::spawn_blocking(move || {
-            let con = con.lock().map_err(|e| e.to_string())?;
-            crate::schema::duckdb_query_columns_in_database(&con, "main", &schema, &table)
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    #[cfg(feature = "duckdb-bundled")]
-    if let Some(PoolKind::ExternalTabular(ext_pool)) = connections.get(pool_key) {
-        let con = ext_pool.cache.clone();
-        drop(connections);
-        let table = table.to_string();
-        let schema = schema.to_string();
-        return tokio::task::spawn_blocking(move || {
-            let con = con.lock().map_err(|e| e.to_string())?;
-            crate::schema::duckdb_query_columns_in_database(&con, "main", &schema, &table)
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    if let Some(PoolKind::ClickHouse(client)) = connections.get(pool_key) {
-        let client = client.clone();
-        let database = database.to_string();
-        let table = table.to_string();
-        drop(connections);
-        return db::clickhouse_driver::get_columns(&client, &database, &table).await;
-    }
-    if let Some(PoolKind::SqlServer(client)) = connections.get(pool_key) {
-        let client = client.clone();
-        let schema = schema.to_string();
-        let table = table.to_string();
-        drop(connections);
-        let mut client = client.lock().await;
-        return db::sqlserver::get_columns(&mut client, &schema, &table).await;
-    }
-    if let Some(PoolKind::InfluxDb(client)) = connections.get(pool_key) {
-        let client = client.clone();
-        let database = database.to_string();
-        let table = table.to_string();
-        drop(connections);
-        return db::influxdb_driver::get_columns(&client, &database, &table).await;
-    }
-    if let Some(PoolKind::Agent(client)) = connections.get(pool_key) {
-        let client = client.clone();
-        let database = database.to_string();
-        let schema = schema.to_string();
-        let table = table.to_string();
-        drop(connections);
-        let mut client = client.lock().await;
-        return client.get_columns(&database, &schema, &table, None).await;
-    }
-    let pool = connections.get(pool_key).ok_or("Pool not found")?;
-    let schema = schema.to_string();
-    let table = table.to_string();
-    match pool {
-        PoolKind::Mysql(p, _) => {
-            let p = p.clone();
-            drop(connections);
-            db::mysql::get_columns(&p, &schema, &table).await
-        }
-        PoolKind::Postgres(p) => {
-            let p = p.clone();
-            drop(connections);
-            db::postgres::get_columns(&p, &schema, &table).await
-        }
-        PoolKind::Sqlite(p) => {
-            let p = p.clone();
-            drop(connections);
-            db::sqlite::get_columns(&p, &schema, &table).await
-        }
-        _ => Err("Unsupported database type".to_string()),
-    }
+    crate::database_session::get_columns_for_transfer(state, pool_key, database, schema, table).await
 }
 
 async fn get_postgres_indexes_for_transfer(

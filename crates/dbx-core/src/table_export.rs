@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::MysqlMode;
 use crate::connection::{task_client_session_id, AppState, PoolKind};
 use crate::csv_export::{escape_csv, format_csv, format_tsv, format_tsv_rows, value_to_csv_text};
 pub use crate::database_export::ExportStatus;
@@ -434,46 +433,17 @@ async fn stream_native_table_rows(
     cancel_token: CancellationToken,
     on_row: impl FnMut(&[Value]) -> Result<(), String>,
 ) -> Result<bool, String> {
-    let connections = state.connections.read().await;
-    match connections.get(pool_key) {
-        Some(PoolKind::Mysql(pool, mode)) => {
-            let pool = pool.clone();
-            let bare = *mode == MysqlMode::Bare;
-            drop(connections);
-            crate::db::mysql::stream_query_rows(
-                &pool,
-                sql,
-                bare,
-                row_limit,
-                crate::db::mysql::MySqlQueryDialect::for_connection(*db_type, None),
-                cancelled,
-                on_row,
-            )
-            .await?;
-            Ok(true)
-        }
-        Some(PoolKind::Postgres(pool)) => {
-            let pool = pool.clone();
-            drop(connections);
-            crate::db::postgres::stream_query_rows(&pool, sql, row_limit, cancelled, on_row).await?;
-            Ok(true)
-        }
-        Some(PoolKind::SqlServer(client)) => {
-            let client = client.clone();
-            drop(connections);
-            let mut on_row = on_row;
-            let mut client = client.lock().await;
-            crate::db::sqlserver::stream_first_result_set(&mut client, sql, row_limit, Some(cancel_token), |item| {
-                if let crate::db::sqlserver::SqlServerStreamItem::Row(row) = item {
-                    on_row(row)?;
-                }
-                Ok(())
-            })
-            .await?;
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
+    crate::database_session::stream_native_table_rows(
+        state,
+        pool_key,
+        db_type,
+        sql,
+        row_limit,
+        cancelled,
+        cancel_token,
+        on_row,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
