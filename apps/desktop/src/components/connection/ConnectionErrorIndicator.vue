@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, X } from "@lucide/vue";
+import { AlertTriangle, RefreshCcw, X } from "@lucide/vue";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useConnectionStore } from "@/stores/connectionStore";
 
@@ -18,11 +18,29 @@ const props = withDefaults(
 
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
+const reconnecting = ref(false);
 
 const errorMessage = computed(() => (props.connectionId ? connectionStore.connectionErrors[props.connectionId] : ""));
 
+const diagnostics = computed(() => {
+  if (!props.connectionId) return null;
+  return connectionStore.getConnectionLifecycleDiagnostics(props.connectionId);
+});
+
 function clearError() {
   if (props.connectionId) connectionStore.clearConnectionError(props.connectionId);
+}
+
+async function forceReconnect() {
+  if (!props.connectionId || reconnecting.value) return;
+  reconnecting.value = true;
+  try {
+    await connectionStore.forceClearPoolsAndReconnect(props.connectionId);
+  } catch {
+    // Error is recorded on the connection; keep the indicator visible.
+  } finally {
+    reconnecting.value = false;
+  }
 }
 </script>
 
@@ -42,11 +60,25 @@ function clearError() {
           <div class="mt-1 max-h-36 overflow-auto whitespace-pre-wrap break-words text-muted-foreground">
             {{ errorMessage }}
           </div>
+          <div v-if="diagnostics" class="mt-1.5 text-[10px] leading-relaxed text-muted-foreground/80">
+            <span v-if="diagnostics.dbType">{{ diagnostics.dbType }} · </span>
+            <span>{{ diagnostics.connected ? t("connection.connected") : t("connection.disconnected") }}</span>
+          </div>
         </div>
         <button type="button" class="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground" :title="t('connection.clearError')" @click="clearError">
           <X class="h-3.5 w-3.5" />
         </button>
       </div>
+      <button
+        type="button"
+        class="mt-1 inline-flex w-full items-center justify-center gap-1.5 rounded border border-border bg-background px-2 py-1 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-60"
+        :disabled="reconnecting"
+        :title="t('connection.forceReconnectHint')"
+        @click="forceReconnect"
+      >
+        <RefreshCcw class="h-3 w-3" :class="{ 'animate-spin': reconnecting }" />
+        {{ reconnecting ? t("connection.forceReconnecting") : t("connection.forceReconnect") }}
+      </button>
     </PopoverContent>
   </Popover>
 </template>

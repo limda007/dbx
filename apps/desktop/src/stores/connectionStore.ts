@@ -50,6 +50,7 @@ import { collapseExpandedTreeNodes } from "@/lib/sidebar/sidebarTreeCollapse";
 import { findDatabaseTreeNode } from "@/lib/sidebar/treeRefreshTarget";
 import { shouldMarkDisconnected } from "@/lib/connection/connectionHealth";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
+import { CONNECTION_HEALTH_CHECK_TTL_MS, connectionLifecycleDiagnostics, withEnsureConnectedHealthTimeout } from "@/lib/connection/lifecycleClient";
 import { requiresSqlServerLegacyCompatibilityComponent, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { deleteTabResultSnapshotsForOwner } from "@/lib/tabs/tabResultCache";
 import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, filterSchemaNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/database/visibleDatabases";
@@ -97,8 +98,6 @@ import type { MqAdminConfig } from "@/types/mq";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
 const ACTIVE_CONNECTION_STORAGE_KEY = "dbx-active-connection";
-const CONNECTION_HEALTH_CHECK_TTL_MS = 2000;
-const CONNECTION_HEALTH_CHECK_TIMEOUT_MS = 5000;
 const METADATA_LOAD_MIN_TIMEOUT_MS = 15_000;
 const METADATA_LOAD_DISABLED_QUERY_TIMEOUT_MS = 60_000;
 const DISCONNECT_REQUEST_TIMEOUT_MS = 5_000;
@@ -682,21 +681,12 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function withConnectionHealthTimeout(connectionId: string, promise: Promise<void>): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await Promise.race([
-        promise,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error(`Connection health check timed out after ${Math.ceil(CONNECTION_HEALTH_CHECK_TIMEOUT_MS / 1000)}s.`));
-          }, CONNECTION_HEALTH_CHECK_TIMEOUT_MS);
-        }),
-      ]);
+      // PIP ensureConnected health fast-path: fixed 5s (lifecycleClient).
+      return await withEnsureConnectedHealthTimeout(promise);
     } catch (error) {
       clearConnectionNodeLoading(connectionId);
       throw error;
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 
@@ -2137,7 +2127,7 @@ export const useConnectionStore = defineStore("connection", () => {
   async function ensureConnected(connectionId: string) {
     if (connectedIds.value.has(connectionId)) {
       if (hasRecentConnectionHealthCheck(connectionId)) return;
-      // Optimistic: verify backend pool is actually healthy
+      // Optimistic: verify backend pool is actually healthy (lifecycleClient 5s budget).
       try {
         await withConnectionHealthTimeout(connectionId, api.checkConnectionHealth(connectionId));
         markConnectionHealthChecked(connectionId);
@@ -2169,6 +2159,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const connectPromise = (async () => {
       await beforeConnectHandler?.(config);
       ensureLocalConnectionAttemptActive(connectionId, localAttempt);
+      // Connect budget: connectionAttemptTimeoutMs from PIP (via lifecycleClient re-export).
       const id = await withConnectionAttemptTimeout(api.connectDb(config, localAttempt), config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(connectionId, localAttempt, id);
       await syncMongoLegacyDriverFallback(connectionId, config);
@@ -2206,6 +2197,50 @@ export const useConnectionStore = defineStore("connection", () => {
       }
       finishLocalConnectionAttempt(connectionId, localAttempt);
     }
+  }
+
+  /**
+   * Drop backend pools and reconnect without restarting the app (PIP stage 2 UI recovery).
+   * Does not close editor tabs — only clears pool / connected flags, then ensureConnected.
+   */
+  async function forceClearPoolsAndReconnect(connectionId: string): Promise<void> {
+    clearConnectionNodeLoading(connectionId);
+    clearConnectionHealthCheck(connectionId);
+    connectedIds.value.delete(connectionId);
+    clearConnectionIdentifierQuote(connectionId);
+    if (activeConnectionId.value === connectionId) activeConnectionId.value = null;
+
+    cancelLocalConnectionAttempt(connectionId);
+    forgetSuccessfulLocalConnectionAttempt(connectionId);
+
+    // Best-effort pool cleanup; hang is bounded by DISCONNECT_REQUEST_TIMEOUT_MS.
+    try {
+      await startDisconnectRequest(connectionId);
+    } catch (error) {
+      console.warn("[DBX][connection:force-clear-disconnect]", {
+        ...connectionLifecycleDiagnostics({
+          connectionId,
+          dbType: getConfig(connectionId)?.db_type,
+          connected: false,
+          connecting: connectingIds.value.has(connectionId),
+          lastError: connectionErrorMessage(error),
+        }),
+        error,
+      });
+    }
+
+    await ensureConnected(connectionId);
+  }
+
+  function getConnectionLifecycleDiagnostics(connectionId: string) {
+    const config = getConfig(connectionId);
+    return connectionLifecycleDiagnostics({
+      connectionId,
+      dbType: config?.db_type,
+      connected: connectedIds.value.has(connectionId),
+      connecting: connectingIds.value.has(connectionId),
+      lastError: connectionErrors.value[connectionId],
+    });
   }
 
   function setBeforeConnectHandler(handler: BeforeConnectHandler | null) {
@@ -5367,6 +5402,8 @@ export const useConnectionStore = defineStore("connection", () => {
     disconnect,
     closeDatabaseConnection,
     ensureConnected,
+    forceClearPoolsAndReconnect,
+    getConnectionLifecycleDiagnostics,
     isTreeNodeChildrenLoaded,
     releaseCollapsedTreeNodeChildren,
     setBeforeConnectHandler,

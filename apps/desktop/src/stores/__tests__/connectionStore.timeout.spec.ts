@@ -392,6 +392,54 @@ describe("connectionStore timeout recovery", () => {
     expect(store.connectionErrors[connection.id]).toBe("reconnect failed");
   }, 10_000);
 
+  it("forceClearPoolsAndReconnect disconnects then reconnects and clears loading", async () => {
+    const disconnectDb = vi.fn().mockResolvedValue(undefined);
+    const connectDb = vi.fn().mockResolvedValue("pg-1");
+    const checkConnectionHealth = vi.fn().mockResolvedValue(undefined);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth,
+      connectDb,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      disconnectDb,
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection({ connect_timeout_secs: 10 });
+    const node: TreeNode = {
+      id: connection.id,
+      label: connection.name,
+      type: "connection",
+      connectionId: connection.id,
+      isLoading: true,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.connectionErrors[connection.id] = "stale pool";
+    store.treeNodes = [node];
+
+    await store.forceClearPoolsAndReconnect(connection.id);
+
+    // No prior successful attempt → clientAttempt is undefined (full pool clear).
+    expect(disconnectDb).toHaveBeenCalledWith(connection.id, undefined);
+    expect(connectDb).toHaveBeenCalledWith(connection, expect.any(Number));
+    expect(store.connectedIds.has(connection.id)).toBe(true);
+    expect(store.connectionErrors[connection.id]).toBeUndefined();
+    expect(node.isLoading).toBe(false);
+    expect(store.getConnectionLifecycleDiagnostics(connection.id)).toMatchObject({
+      connectionId: connection.id,
+      dbType: "postgres",
+      connected: true,
+      connecting: false,
+    });
+  }, 10_000);
+
   it("scopes a normal disconnect to the active connection attempt when one is running", async () => {
     let resolveConnect!: (connectionId: string) => void;
     const connectDb = vi.fn(

@@ -43,7 +43,7 @@ PIP-0001 **stage-1 bleed-stop work has largely landed**. Do not re-implement the
 3. **Bare checkout still leaks.** Grep still finds unwrapped `pool.get().await` / `get_conn().await` on secondary paths (`transfer`, `database_export`, `questdb`, `ob_oracle`, `manticoresearch`, some `query.rs` branches, keepalive/health internals).
 4. **Health is not a full lifecycle phase.** `AppState::check_connection_health` is mostly “pool exists + stale remove,” while `refresh_connections` has a separate ad-hoc per-`PoolKind` ping ladder—not one budgeted health API.
 5. **Stage logging is incomplete / inconsistent.** Some checkout logs exist (`[db:pool.checkout:…]`); there is no single `LifecycleStage` + `trace_id` contract across ensureConnected → checkout → query → cancel → cleanup.
-6. **Frontend is not yet a pure adapter.** `connectionStore.ensureConnected` works, but recovery actions (force clear pool / reconnect) and diagnostics are not centralized as lifecycle client operations.
+6. **Frontend is not yet a pure adapter.** `connectionStore.ensureConnected` works, but recovery actions (force clear pool / reconnect) and diagnostics are not centralized as lifecycle client operations. → **Addressed in PR-A5** (`lifecycleClient.ts` + `forceClearPoolsAndReconnect`).
 
 ## Non-goals (Phase A)
 
@@ -227,6 +227,8 @@ rg 'pool\.get\(\)\.await|get_conn\(\)\.await' crates/dbx-core/src/query.rs crate
 ---
 
 ### PR-A5 — Frontend lifecycle adapter + force recovery
+
+**Status:** Done (on `feat/connection-lifecycle`)
 
 **Intent:** UI becomes adapter; recovery without restart (PIP stage 2 UI).
 
