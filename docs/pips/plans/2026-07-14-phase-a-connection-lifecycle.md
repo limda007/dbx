@@ -195,6 +195,9 @@ Frontend adapter (later PR in this phase):
 
 ### PR-A4 — Checkout audit: kill bare `pool.get` on hot paths
 
+**Status (2026-07-15):** Implemented on `feat/connection-lifecycle`.  
+Hot paths in `query.rs` / `connection.rs` (non-test) use budgeted checkout helpers. Secondary: transfer, database_export, questdb, ob_oracle, manticoresearch. Remaining bare `get_conn` only in ignored live tests.
+
 **Intent:** PIP P0-3 completion for paths that can hang the product.
 
 **Priority order:**

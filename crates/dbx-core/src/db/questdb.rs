@@ -32,7 +32,7 @@ pub async fn list_tables(pool: &Pool, _schema: &str) -> Result<Vec<TableInfo>, S
 }
 
 async fn list_tables_new_version(pool: &Pool, _schema: &str) -> Result<Vec<TableInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = crate::db::postgres::checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
 
     let stmt = client.prepare_cached(questdb_tables_sql_new_version()).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[]).await.map_err(|e| e.to_string())?;
@@ -62,7 +62,7 @@ fn questdb_tables_sql_new_version() -> &'static str {
 }
 
 async fn list_tables_older_version(pool: &Pool, _schema: &str) -> Result<Vec<TableInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = crate::db::postgres::checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
 
     let stmt = client.prepare_cached(questdb_tables_sql_older_version()).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[]).await.map_err(|e| e.to_string())?;
@@ -88,7 +88,7 @@ fn questdb_tables_sql_older_version() -> &'static str {
 }
 
 pub async fn get_columns(pool: &Pool, _schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = crate::db::postgres::checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let sql = format!("SHOW COLUMNS FROM {}", quote_table_identifier(Some(DatabaseType::Questdb), table));
     let stmt = client.prepare_cached(&sql).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[]).await.map_err(|e| e.to_string())?;
@@ -119,7 +119,7 @@ pub async fn get_columns(pool: &Pool, _schema: &str, table: &str) -> Result<Vec<
 }
 
 pub async fn list_indexes(pool: &Pool, _schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = crate::db::postgres::checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let sql = format!("SHOW COLUMNS FROM {}", quote_table_identifier(Some(DatabaseType::Questdb), table));
     let stmt = client.prepare_cached(&sql).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[]).await.map_err(|e| e.to_string())?;

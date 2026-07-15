@@ -58,7 +58,7 @@ pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Object
 }
 
 async fn list_udf_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter("SHOW PLUGINS").await.map_err(|err| err.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|err| err.to_string())?;
     Ok(rows
@@ -122,7 +122,7 @@ pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Resul
 
 async fn column_properties(pool: &MySqlPool, database: &str, table: &str) -> Result<HashMap<String, String>, String> {
     let sql = show_columns_sql(database, table, true);
-    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let rows: Vec<mysql_async::Row> = match conn.query_iter(&sql).await {
         Ok(result) => result.collect_and_drop().await.map_err(|err| err.to_string())?,
         Err(_) => {
@@ -156,7 +156,7 @@ fn show_columns_sql(database: &str, table: &str, full: bool) -> String {
 
 pub async fn list_indexes(pool: &MySqlPool, table: &str) -> Result<Vec<IndexInfo>, String> {
     let sql = list_indexes_sql(table);
-    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|err| err.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|err| err.to_string())?;
 

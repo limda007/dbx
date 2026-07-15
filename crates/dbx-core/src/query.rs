@@ -2869,9 +2869,13 @@ pub async fn begin_manual_transaction(
         }
     }; // connections lock released here
 
+    // Budgeted checkout: bare pool.get/get_conn can hang forever on a saturated pool (PR-A4).
+    let budget = configured_operation_budget_for_pool_key(state, &pool_key).await;
     let txn_conn = match pool_handle {
         TxnPoolHandle::Postgres(pg_pool) => {
-            let conn = pg_pool.get().await.map_err(|e| format!("Failed to get Postgres connection: {e}"))?;
+            let conn = db::postgres::checkout_postgres_client(&pg_pool, None, budget.checkout_timeout)
+                .await
+                .map_err(|e| format!("Failed to get Postgres connection: {e}"))?;
             conn.execute("BEGIN", &[]).await.map_err(|e| format!("BEGIN failed: {e}"))?;
             if let Some(schema) = schema {
                 conn.execute(&format!("SET LOCAL search_path TO {}", db::postgres::pg_quote_ident(schema)), &[])
@@ -2881,7 +2885,9 @@ pub async fn begin_manual_transaction(
             TxnConnection::Postgres(Box::new(conn))
         }
         TxnPoolHandle::Mysql(mysql_pool) => {
-            let mut conn = mysql_pool.get_conn().await.map_err(|e| format!("Failed to get MySQL connection: {e}"))?;
+            let mut conn = db::mysql::get_conn_with_timeout(&mysql_pool, budget.checkout_timeout)
+                .await
+                .map_err(|e| format!("Failed to get MySQL connection: {e}"))?;
             conn.query_drop("START TRANSACTION").await.map_err(|e| format!("START TRANSACTION failed: {e}"))?;
             TxnConnection::Mysql(conn)
         }

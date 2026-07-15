@@ -2882,7 +2882,9 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
             conn.ping().await.map_err(|e| e.to_string())
         }
         KeepaliveTarget::Postgres(pool) => {
-            let client = pool.get().await.map_err(|e| format!("PostgreSQL pool error: {e}"))?;
+            let client = db::postgres::checkout_postgres_client(pool, None, timeout)
+                .await
+                .map_err(|e| format!("PostgreSQL pool error: {e}"))?;
             client.simple_query("SELECT 1").await.map(|_| ()).map_err(|e| e.to_string())
         }
         KeepaliveTarget::Rqlite(client) => db::rqlite_driver::test_connection(client, timeout).await,
@@ -3376,7 +3378,7 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
     if !profile.contains("oceanbase") {
         return MysqlMode::Normal;
     }
-    let mut conn = match pool.get_conn().await {
+    let mut conn = match db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await {
         Ok(c) => c,
         Err(_) => return MysqlMode::Normal,
     };

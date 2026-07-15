@@ -3023,7 +3023,7 @@ async fn get_postgres_owned_sequences_for_transfer(
             _ => return Ok(Vec::new()),
         }
     };
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = crate::db::postgres::checkout_postgres_client(&pool, None, crate::db::connection_timeout()).await?;
     let rows = client
         .query(
             "SELECT c.relname, \
@@ -3075,7 +3075,7 @@ async fn get_postgres_sequence_snapshots_for_transfer(
             _ => return Ok(Vec::new()),
         }
     };
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = crate::db::postgres::checkout_postgres_client(&pool, None, crate::db::connection_timeout()).await?;
     let rows = client
         .query(
             "SELECT c.relname, \
