@@ -22,6 +22,7 @@ pub mod data_grid_sql;
 pub mod database_capabilities;
 pub mod database_export;
 pub mod database_search_sql;
+pub mod database_session;
 pub mod db;
 pub mod db_admin_sql;
 pub mod document_ops;
