@@ -267,10 +267,48 @@ mod tests {
     fn stage_names_match_pip_vocabulary() {
         assert_eq!(LifecycleStage::EnsureConnected.as_str(), "ensureConnected");
         assert_eq!(LifecycleStage::PoolCheckout.as_str(), "pool.checkout");
+        assert_eq!(LifecycleStage::PoolRecycle.as_str(), "pool.recycle");
+        assert_eq!(LifecycleStage::Ping.as_str(), "ping");
         assert_eq!(LifecycleStage::SchemaSet.as_str(), "schema.set");
         assert_eq!(LifecycleStage::QueryExecute.as_str(), "query.execute");
+        assert_eq!(LifecycleStage::ResultFetch.as_str(), "result.fetch");
         assert_eq!(LifecycleStage::Cancel.as_str(), "cancel");
         assert_eq!(LifecycleStage::Cleanup.as_str(), "cleanup");
+    }
+
+    #[test]
+    fn format_stage_log_sequence_is_parseable_for_hung_query_triage() {
+        // Engineer workflow: last stage with matching trace_id names the stuck phase.
+        let lines = [
+            format_stage_log(
+                &StageLog::new(LifecycleStage::QueryExecute, StageOutcome::Start, 0)
+                    .with_trace_id("exec-9")
+                    .with_connection_id("c1")
+                    .with_pool_key("c1:app")
+                    .with_db_type("postgres"),
+            ),
+            format_stage_log(
+                &StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Error, 10_012)
+                    .with_timeout(Duration::from_secs(10))
+                    .with_trace_id("exec-9")
+                    .with_connection_id("c1")
+                    .with_pool_key("c1:app")
+                    .with_db_type("postgres")
+                    .with_error("checkout timed out"),
+            ),
+            format_stage_log(
+                &StageLog::new(LifecycleStage::QueryExecute, StageOutcome::Error, 10_015)
+                    .with_trace_id("exec-9")
+                    .with_connection_id("c1")
+                    .with_error("checkout timed out"),
+            ),
+        ];
+        assert!(lines[0].starts_with("[db:query.execute:start]"));
+        assert!(lines[1].contains("pool.checkout:error"));
+        assert!(lines[1].contains("error=checkout timed out"));
+        assert!(lines.iter().all(|line| line.contains("trace_id=exec-9")));
+        // Stuck stage name from the first error line:
+        assert!(lines[1].contains("[db:pool.checkout:error]"));
     }
 
     #[test]

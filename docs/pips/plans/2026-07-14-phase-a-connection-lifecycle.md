@@ -1,7 +1,8 @@
 # Phase A: Collapse Connection Lifecycle Dispatch
 
-**Status:** Ready for implementation  
+**Status:** Phase A complete (A1–A6 on `feat/connection-lifecycle`)  
 **Date:** 2026-07-14  
+
 **Anchors:**
 
 - Architecture review candidate #1 (top recommendation): *Collapse connection lifecycle dispatch*
@@ -42,7 +43,7 @@ PIP-0001 **stage-1 bleed-stop work has largely landed**. Do not re-implement the
 2. **Dual connect dispatch.** `src-tauri/src/commands/connection.rs` still contains a large `match config.db_type` for `test_connection` / connect paths; core `connection.rs` has another connect factory. Deleting either path mostly moves the match—architecture review deletion test fails.
 3. **Bare checkout still leaks.** Grep still finds unwrapped `pool.get().await` / `get_conn().await` on secondary paths (`transfer`, `database_export`, `questdb`, `ob_oracle`, `manticoresearch`, some `query.rs` branches, keepalive/health internals).
 4. **Health is not a full lifecycle phase.** `AppState::check_connection_health` is mostly “pool exists + stale remove,” while `refresh_connections` has a separate ad-hoc per-`PoolKind` ping ladder—not one budgeted health API.
-5. **Stage logging is incomplete / inconsistent.** Some checkout logs exist (`[db:pool.checkout:…]`); there is no single `LifecycleStage` + `trace_id` contract across ensureConnected → checkout → query → cancel → cleanup.
+5. **Stage logging is incomplete / inconsistent.** Some checkout logs exist (`[db:pool.checkout:…]`); there is no single `LifecycleStage` + `trace_id` contract across ensureConnected → checkout → query → cancel → cleanup. → **Addressed in PR-A6** (see [stage log QA note](./2026-07-15-connection-lifecycle-stage-logs.md)).
 6. **Frontend is not yet a pure adapter.** `connectionStore.ensureConnected` works, but recovery actions (force clear pool / reconnect) and diagnostics are not centralized as lifecycle client operations. → **Addressed in PR-A5** (`lifecycleClient.ts` + `forceClearPoolsAndReconnect`).
 
 ## Non-goals (Phase A)
@@ -255,13 +256,15 @@ rg 'pool\.get\(\)\.await|get_conn\(\)\.await' crates/dbx-core/src/query.rs crate
 
 ### PR-A6 — Stage logging completeness + docs
 
+**Status:** Done (on `feat/connection-lifecycle`)
+
 **Intent:** PIP stage 4 observability lite.
 
 **Files:**
 
 - ensure stages: `ensureConnected`, `pool.checkout`, `ping`, `schema.set`, `query.execute`, `cancel`, `cleanup` emit consistent fields
 - update PIP-0001 status notes or this plan’s “Done” table when complete
-- short QA note under `docs/pips/plans/` or existing troubleshooting doc: how to read stage logs
+- short QA note: [2026-07-15-connection-lifecycle-stage-logs.md](./2026-07-15-connection-lifecycle-stage-logs.md)
 
 **Acceptance:**
 

@@ -2,7 +2,9 @@
 
 ## 状态
 
-Proposed
+In progress (Phase A bleed-stop + lifecycle facade landed on `feat/connection-lifecycle`; remaining product hardening tracked outside Phase A)
+
+Stage-log reading guide: `docs/pips/plans/2026-07-15-connection-lifecycle-stage-logs.md`
 
 ## 摘要
 

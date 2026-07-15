@@ -12,6 +12,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::connection_lifecycle::{log_stage, LifecycleStage, StageLog, StageLogContext, StageOutcome};
 use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
@@ -2704,18 +2705,41 @@ pub async fn get_conn_with_health_check_with_cancel(
     cleanup_timeout: Duration,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<mysql_async::Conn, String> {
+    get_conn_with_health_check_with_cancel_logged(
+        pool,
+        timeout,
+        cleanup_timeout,
+        cancel_token,
+        StageLogContext::empty(),
+    )
+    .await
+}
+
+/// Same as [`get_conn_with_health_check_with_cancel`], with lifecycle correlation fields on stage logs.
+pub async fn get_conn_with_health_check_with_cancel_logged(
+    pool: &MySqlPool,
+    timeout: Duration,
+    cleanup_timeout: Duration,
+    cancel_token: Option<&CancellationToken>,
+    log_context: StageLogContext<'_>,
+) -> Result<mysql_async::Conn, String> {
     let start = Instant::now();
-    let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token).await?;
+    let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token, log_context).await?;
     match ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
         Ok(()) => {
-            log::debug!(
-                "[db:health.check:done] elapsed_ms={} timeout_ms={}",
-                start.elapsed().as_millis(),
-                timeout.as_millis()
+            log_stage(
+                StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Done, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_context(log_context),
             );
             Ok(conn)
         }
         Err(err) if err == crate::query::QUERY_CANCELED => {
+            log_stage(
+                StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Cancelled, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_context(log_context),
+            );
             let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
             Err(err)
         }
@@ -2727,17 +2751,34 @@ pub async fn get_conn_with_health_check_with_cancel(
                 err
             );
             let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
-            let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token).await?;
+            let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token, log_context).await?;
             if let Err(err) = ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
                 if err == crate::query::QUERY_CANCELED {
+                    log_stage(
+                        StageLog::new(
+                            LifecycleStage::PoolCheckout,
+                            StageOutcome::Cancelled,
+                            start.elapsed().as_millis(),
+                        )
+                        .with_timeout(timeout)
+                        .with_context(log_context),
+                    );
                     let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
+                } else {
+                    log_stage(
+                        StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Error, start.elapsed().as_millis())
+                            .with_timeout(timeout)
+                            .with_context(log_context)
+                            .with_error(&err),
+                    );
                 }
                 return Err(err);
             }
-            log::info!(
-                "[db:health.check:recovered] elapsed_ms={} timeout_ms={}",
-                start.elapsed().as_millis(),
-                timeout.as_millis()
+            log_stage(
+                StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Done, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_context(log_context)
+                    .with_error("recovered after stale connection"),
             );
             Ok(conn)
         }
@@ -2748,19 +2789,46 @@ async fn get_conn_with_timeout_and_cancel(
     pool: &MySqlPool,
     timeout: Duration,
     cancel_token: Option<&CancellationToken>,
+    log_context: StageLogContext<'_>,
 ) -> Result<mysql_async::Conn, String> {
+    let start = Instant::now();
     let get_future = async {
         tokio::time::timeout(timeout, pool.get_conn())
             .await
-            .map_err(|_| "MySQL get connection timed out".to_string())?
-            .map_err(|e| e.to_string())
+            .map_err(|_| {
+                let error = format!("MySQL connection pool checkout timed out ({}s)", timeout.as_secs());
+                log_stage(
+                    StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Error, start.elapsed().as_millis())
+                        .with_timeout(timeout)
+                        .with_context(log_context)
+                        .with_error("checkout timed out"),
+                );
+                error
+            })?
+            .map_err(|e| {
+                let err = e.to_string();
+                log_stage(
+                    StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Error, start.elapsed().as_millis())
+                        .with_timeout(timeout)
+                        .with_context(log_context)
+                        .with_error(&err),
+                );
+                err
+            })
     };
 
     match cancel_token {
         Some(token) => {
             tokio::select! {
                 biased;
-                _ = token.cancelled() => Err(crate::query::canceled_error()),
+                _ = token.cancelled() => {
+                    log_stage(
+                        StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Cancelled, start.elapsed().as_millis())
+                            .with_timeout(timeout)
+                            .with_context(log_context),
+                    );
+                    Err(crate::query::canceled_error())
+                }
                 result = get_future => result,
             }
         }
@@ -3072,30 +3140,58 @@ async fn stream_query_result_prepared(
 pub async fn kill_query(pool: &MySqlPool, connection_id: u32) -> Result<(), String> {
     let start = Instant::now();
     let timeout = super::connection_timeout();
+    log_stage(
+        StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0)
+            .with_timeout(timeout)
+            .with_error(&format!("mysql kill query conn_id={connection_id}")),
+    );
     let mut conn = tokio::time::timeout(timeout, pool.get_conn())
         .await
         .map_err(|_| {
-            log::warn!(
-                "[db:cancel:error] elapsed_ms={} timeout_ms={} error=MySQL kill connection checkout timed out",
-                start.elapsed().as_millis(),
-                timeout.as_millis()
+            let error = "MySQL kill connection checkout timed out".to_string();
+            log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_error(&error),
             );
-            "MySQL kill connection checkout timed out".to_string()
+            error
         })?
-        .map_err(|e| e.to_string())?;
-    tokio::time::timeout(timeout, conn.query_drop(format!("KILL QUERY {connection_id}")))
-        .await
-        .map_err(|_| {
-            log::warn!(
-                "[db:cancel:error] elapsed_ms={} timeout_ms={} error=MySQL KILL QUERY timed out",
-                start.elapsed().as_millis(),
-                timeout.as_millis()
+        .map_err(|e| {
+            let err = e.to_string();
+            log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_error(&err),
             );
-            "MySQL KILL QUERY timed out".to_string()
-        })?
-        .map_err(|e| e.to_string())?;
-    log::info!("[db:cancel:done] elapsed_ms={} timeout_ms={}", start.elapsed().as_millis(), timeout.as_millis());
-    Ok(())
+            err
+        })?;
+    match tokio::time::timeout(timeout, conn.query_drop(format!("KILL QUERY {connection_id}"))).await {
+        Ok(Ok(())) => {
+            log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Done, start.elapsed().as_millis())
+                    .with_timeout(timeout),
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            let err = e.to_string();
+            log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_error(&err),
+            );
+            Err(err)
+        }
+        Err(_) => {
+            let error = "MySQL KILL QUERY timed out".to_string();
+            log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_error(&error),
+            );
+            Err(error)
+        }
+    }
 }
 
 pub async fn kill_query_with_opts(opts: mysql_async::Opts, connection_id: u32) -> Result<(), String> {

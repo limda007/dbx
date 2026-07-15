@@ -4,6 +4,7 @@
 //! call these entry points and do not host `match config.db_type` for connect.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::agent_connection::{
     agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver, oracle_alternate_connect_config,
@@ -13,6 +14,9 @@ use crate::connection::{
     agent_connect_timeout, connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_url_for_endpoint,
     metadata_connection_config, prestosql_jdbc_config_for_endpoint, probe_connection_endpoint,
     redacted_connection_url_for_endpoint, AppState, MysqlMode, PoolKind,
+};
+use crate::connection_lifecycle::{
+    database_type_log_label, log_stage, LifecycleStage, StageLog, StageLogContext, StageOutcome,
 };
 use crate::database_capabilities;
 use crate::db;
@@ -426,7 +430,7 @@ pub async fn test_connection(state: &AppState, config: ConnectionConfig) -> Resu
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
                 let mqc = state.mq_admin_config_for_connection(connection_id, &config).await?;
-                let kafka_launch = dbx_core::mq::service::resolve_kafka_launch_spec(&mqc, &state);
+                let kafka_launch = crate::mq::service::resolve_kafka_launch_spec(&mqc, &state);
                 let adapter = match state.mq_registry.get_or_build_config(connection_id, mqc, kafka_launch).await {
                     Ok(adapter) => adapter,
                     Err(err) => {
@@ -482,25 +486,73 @@ pub async fn connect(
     let config = config.canonicalized();
     let id = config.id.clone();
     let db_config = metadata_connection_config(&config);
-    let attempt = state.begin_connection_attempt_with_client_attempt(&id, client_attempt).await;
+    let connect_timeout = std::time::Duration::from_secs(db_config.effective_connect_timeout_secs());
+    let db_type_label = database_type_log_label(db_config.db_type);
+    let stage_started = Instant::now();
+    let log_context = StageLogContext {
+        connection_id: Some(id.as_str()),
+        pool_key: Some(id.as_str()),
+        db_type: Some(db_type_label.as_str()),
+        trace_id: None,
+        client_session_id: None,
+    };
+    log_stage(
+        StageLog::new(LifecycleStage::EnsureConnected, StageOutcome::Start, 0)
+            .with_timeout(connect_timeout)
+            .with_context(log_context),
+    );
+
+    let result = connect_inner(state, config, client_attempt, &id, db_config, connect_timeout).await;
+    match &result {
+        Ok(_) => {
+            log_stage(
+                StageLog::new(LifecycleStage::EnsureConnected, StageOutcome::Done, stage_started.elapsed().as_millis())
+                    .with_timeout(connect_timeout)
+                    .with_context(log_context),
+            );
+        }
+        Err(err) => {
+            log_stage(
+                StageLog::new(
+                    LifecycleStage::EnsureConnected,
+                    StageOutcome::Error,
+                    stage_started.elapsed().as_millis(),
+                )
+                .with_timeout(connect_timeout)
+                .with_context(log_context)
+                .with_error(err),
+            );
+        }
+    }
+    result
+}
+
+async fn connect_inner(
+    state: &AppState,
+    config: ConnectionConfig,
+    client_attempt: Option<u64>,
+    id: &str,
+    db_config: ConnectionConfig,
+    connect_timeout: std::time::Duration,
+) -> Result<String, String> {
+    let attempt = state.begin_connection_attempt_with_client_attempt(id, client_attempt).await;
     let mut connected_config = config.clone();
     let mut connected_db_config = db_config.clone();
 
-    state.remove_connection_pools_detached(&id).await;
-    state.reset_connection_transport_for_config(&id, &db_config).await;
+    state.remove_connection_pools_detached(id).await;
+    state.reset_connection_transport_for_config(id, &db_config).await;
 
-    let (host, port) = state.connection_host_port(&id, &db_config).await?;
-    if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
-        state.reset_connection_transport_for_config(&id, &db_config).await;
+    let (host, port) = state.connection_host_port(id, &db_config).await?;
+    if let Err(err) = state.ensure_current_connection_attempt(id, Some(attempt)).await {
+        state.reset_connection_transport_for_config(id, &db_config).await;
         return Err(err);
     }
     probe_connection_endpoint(&db_config, &host, port).await?;
-    if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
-        state.reset_connection_transport_for_config(&id, &db_config).await;
+    if let Err(err) = state.ensure_current_connection_attempt(id, Some(attempt)).await {
+        state.reset_connection_transport_for_config(id, &db_config).await;
         return Err(err);
     }
     let url = connection_url_for_endpoint(&db_config, &host, port);
-    let connect_timeout = std::time::Duration::from_secs(db_config.effective_connect_timeout_secs());
     let idle_timeout = std::time::Duration::from_secs(db_config.idle_timeout_secs);
 
     let pool = match db_config.db_type {
@@ -523,11 +575,11 @@ pub async fn connect(
         DatabaseType::Redis => {
             let con = if db_config.uses_redis_cluster() {
                 PoolKind::Redis(db::redis_driver::RedisConnection::Cluster(
-                    state.connect_redis_cluster(&id, &db_config).await?,
+                    state.connect_redis_cluster(id, &db_config).await?,
                 ))
             } else if db_config.uses_redis_sentinel() {
                 PoolKind::Redis(db::redis_driver::RedisConnection::Direct(tokio::sync::Mutex::new(
-                    state.connect_redis_sentinel(&id, &db_config).await?,
+                    state.connect_redis_sentinel(id, &db_config).await?,
                 )))
             } else {
                 PoolKind::Redis(db::redis_driver::RedisConnection::Direct(tokio::sync::Mutex::new(
@@ -542,7 +594,7 @@ pub async fn connect(
             {
                 let locked = con.lock().map_err(|e| e.to_string())?;
                 for attached in &db_config.attached_databases {
-                    dbx_core::schema::duckdb_attach_database(&locked, &attached.name, &expand_tilde(&attached.path))?;
+                    crate::schema::duckdb_attach_database(&locked, &attached.name, &expand_tilde(&attached.path))?;
                 }
                 if let Some(script) = db_config.init_script.as_deref() {
                     db::duckdb_driver::run_init_script(&locked, script)?;
@@ -556,17 +608,17 @@ pub async fn connect(
             if mongo_uses_legacy_driver(&db_config) {
                 let mut client =
                     state.agent_manager.spawn(&db_config.db_type, Some(MONGO_LEGACY_DRIVER_PROFILE)).await?;
-                state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                state.ensure_current_connection_attempt(id, Some(attempt)).await?;
                 client
                     .connect(mongo_legacy_connect_params(&db_config, &host, port))
                     .await
                     .map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
-                state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                state.ensure_current_connection_attempt(id, Some(attempt)).await?;
                 PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
             } else {
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                     Ok(client) => {
-                        state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                        state.ensure_current_connection_attempt(id, Some(attempt)).await?;
                         match db::mongo_driver::test_connection(
                             &client,
                             connect_timeout,
@@ -575,22 +627,22 @@ pub async fn connect(
                         .await
                         {
                             Ok(()) => {
-                                state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                                state.ensure_current_connection_attempt(id, Some(attempt)).await?;
                                 if let Err(err) = state
                                     .insert_connection_pool_for_attempt(
-                                        &id,
+                                        id,
                                         attempt,
-                                        id.clone(),
+                                        id.to_string(),
                                         PoolKind::MongoDb(client),
                                         &db_config,
                                     )
                                     .await
                                 {
-                                    state.reset_connection_transport_for_config(&id, &db_config).await;
+                                    state.reset_connection_transport_for_config(id, &db_config).await;
                                     return Err(err);
                                 }
-                                state.configs.write().await.insert(id.clone(), config);
-                                return Ok(id);
+                                state.configs.write().await.insert(id.to_string(), config);
+                                return Ok(id.to_string());
                             }
                             Err(e) => e,
                         }
@@ -601,14 +653,14 @@ pub async fn connect(
                     log::info!("Native MongoDB driver failed ({native_err}), falling back to agent driver");
                     let mut client =
                         state.agent_manager.spawn(&db_config.db_type, Some(MONGO_LEGACY_DRIVER_PROFILE)).await?;
-                    state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                    state.ensure_current_connection_attempt(id, Some(attempt)).await?;
                     client.connect(mongo_legacy_connect_params(&db_config, &host, port)).await.map_err(|err| {
                         format!(
                             "{native_err}\n\nFallback with MongoDB (Legacy) driver failed: {}",
                             mongo_legacy_error_with_auth_hint(&err)
                         )
                     })?;
-                    state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                    state.ensure_current_connection_attempt(id, Some(attempt)).await?;
                     mark_mongo_legacy_driver(&mut connected_config);
                     connected_db_config = metadata_connection_config(&connected_config);
                     persist_mongo_legacy_driver_profile(state, &connected_config).await?;
@@ -711,32 +763,32 @@ pub async fn connect(
             PoolKind::InfluxDb(client)
         }
         DatabaseType::Nacos => {
-            let admin_config = state.nacos_admin_config_for_connection(&id, &config).await?;
+            let admin_config = state.nacos_admin_config_for_connection(id, &config).await?;
             let adapter = state.nacos_registry.build_transient_config(admin_config).await?;
             adapter.test_connection().await?;
             PoolKind::Nacos
         }
         #[cfg(feature = "mq-admin")]
         DatabaseType::MessageQueue => {
-            let mqc = state.mq_admin_config_for_connection(&id, &config).await?;
-            let kafka_launch = dbx_core::mq::service::resolve_kafka_launch_spec(&mqc, &state);
-            let adapter = match state.mq_registry.get_or_build_config(&id, mqc, kafka_launch).await {
+            let mqc = state.mq_admin_config_for_connection(id, &config).await?;
+            let kafka_launch = crate::mq::service::resolve_kafka_launch_spec(&mqc, &state);
+            let adapter = match state.mq_registry.get_or_build_config(id, mqc, kafka_launch).await {
                 Ok(adapter) => adapter,
                 Err(err) => {
-                    state.mq_registry.drop_connection(&id).await;
+                    state.mq_registry.drop_connection(id).await;
                     return Err(err);
                 }
             };
-            if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
-                state.mq_registry.drop_connection(&id).await;
+            if let Err(err) = state.ensure_current_connection_attempt(id, Some(attempt)).await {
+                state.mq_registry.drop_connection(id).await;
                 return Err(err);
             }
             if let Err(err) = adapter.test_connection().await {
-                state.mq_registry.drop_connection(&id).await;
+                state.mq_registry.drop_connection(id).await;
                 return Err(err);
             }
-            if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
-                state.mq_registry.drop_connection(&id).await;
+            if let Err(err) = state.ensure_current_connection_attempt(id, Some(attempt)).await {
+                state.mq_registry.drop_connection(id).await;
                 return Err(err);
             }
             PoolKind::MessageQueue
@@ -760,14 +812,14 @@ pub async fn connect(
     };
 
     if let Err(err) =
-        state.insert_connection_pool_for_attempt(&id, attempt, id.clone(), pool, &connected_db_config).await
+        state.insert_connection_pool_for_attempt(id, attempt, id.to_string(), pool, &connected_db_config).await
     {
-        state.reset_connection_transport_for_config(&id, &connected_db_config).await;
+        state.reset_connection_transport_for_config(id, &connected_db_config).await;
         return Err(err);
     }
-    state.configs.write().await.insert(id.clone(), connected_config);
+    state.configs.write().await.insert(id.to_string(), connected_config);
 
-    Ok(id)
+    Ok(id.to_string())
 }
 
 #[cfg(test)]

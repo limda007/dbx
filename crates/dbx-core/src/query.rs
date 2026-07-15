@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "duckdb-bundled")]
 use tokio::task::JoinHandle;
 #[cfg(feature = "duckdb-bundled")]
@@ -1152,8 +1152,48 @@ pub async fn do_execute(
         crate::query_execution_sql::check_read_only(sql, &name, database_type)?;
     }
     let pool_db_type = connection_database_type_for_pool_key(state, pool_key).await;
+    // Own correlation strings so stage logs do not borrow `options` across async moves below.
+    let db_type_label = connection_lifecycle::optional_database_type_log_label(pool_db_type);
+    let execution_id_owned = options.execution_id.clone();
+    let client_session_id_owned = options.client_session_id.clone();
+    let mut execute_log_context = connection_lifecycle::StageLogContext::for_pool(
+        Some(pool_key),
+        execution_id_owned.as_deref(),
+        db_type_label.as_deref(),
+    );
+    if let Some(ref client_session_id) = client_session_id_owned {
+        execute_log_context.client_session_id = Some(client_session_id.as_str());
+    }
+    let execute_started = Instant::now();
+    {
+        let mut start_log = connection_lifecycle::StageLog::new(
+            connection_lifecycle::LifecycleStage::QueryExecute,
+            connection_lifecycle::StageOutcome::Start,
+            0,
+        )
+        .with_context(execute_log_context);
+        if let Some(timeout) = query_timeout {
+            start_log = start_log.with_timeout(timeout);
+        }
+        connection_lifecycle::log_stage(start_log);
+    }
+
     let connections = state.connections.read().await;
-    let pool = connections.get(pool_key).ok_or("Connection not found")?;
+    let pool = match connections.get(pool_key) {
+        Some(pool) => pool,
+        None => {
+            connection_lifecycle::log_stage(
+                connection_lifecycle::StageLog::new(
+                    connection_lifecycle::LifecycleStage::QueryExecute,
+                    connection_lifecycle::StageOutcome::Error,
+                    execute_started.elapsed().as_millis(),
+                )
+                .with_context(execute_log_context)
+                .with_error("Connection not found"),
+            );
+            return Err("Connection not found".to_string());
+        }
+    };
 
     let result = match pool {
         #[cfg(feature = "duckdb-bundled")]
@@ -1161,7 +1201,17 @@ pub async fn do_execute(
             let con = con.clone();
             if con.is_draining() {
                 drop(connections);
-                return Err(duckdb_draining_error());
+                let error = duckdb_draining_error();
+                connection_lifecycle::log_stage(
+                    connection_lifecycle::StageLog::new(
+                        connection_lifecycle::LifecycleStage::QueryExecute,
+                        connection_lifecycle::StageOutcome::Error,
+                        execute_started.elapsed().as_millis(),
+                    )
+                    .with_context(execute_log_context)
+                    .with_error(&error),
+                );
+                return Err(error);
             }
             let interrupt_handle = con.interrupt_handle();
             if let Some(ref execution_id) = options.execution_id {
@@ -1220,31 +1270,71 @@ pub async fn do_execute(
         }
         #[cfg(not(feature = "duckdb-bundled"))]
         PoolKind::DuckDb(_) => {
-            return Err("DuckDB support is not compiled in this build".to_string());
+            let error = "DuckDB support is not compiled in this build".to_string();
+            connection_lifecycle::log_stage(
+                connection_lifecycle::StageLog::new(
+                    connection_lifecycle::LifecycleStage::QueryExecute,
+                    connection_lifecycle::StageOutcome::Error,
+                    execute_started.elapsed().as_millis(),
+                )
+                .with_context(execute_log_context)
+                .with_error(&error),
+            );
+            return Err(error);
         }
         #[cfg(not(feature = "duckdb-bundled"))]
         PoolKind::DuckDbWorker(_) => {
-            return Err("DuckDB worker support is not compiled in this build".to_string());
+            let error = "DuckDB worker support is not compiled in this build".to_string();
+            connection_lifecycle::log_stage(
+                connection_lifecycle::StageLog::new(
+                    connection_lifecycle::LifecycleStage::QueryExecute,
+                    connection_lifecycle::StageOutcome::Error,
+                    execute_started.elapsed().as_millis(),
+                )
+                .with_context(execute_log_context)
+                .with_error(&error),
+            );
+            return Err(error);
         }
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
             let bare = *mode == crate::connection::MysqlMode::Bare;
             let max_rows = options.max_rows;
             drop(connections);
-            let mut conn = match db::mysql::get_conn_with_health_check_with_cancel(
+            let mut conn = match db::mysql::get_conn_with_health_check_with_cancel_logged(
                 &p,
                 operation_budget.checkout_timeout,
                 operation_budget.cleanup_timeout,
                 cancel_token.as_ref(),
+                execute_log_context,
             )
             .await
             {
                 Ok(conn) => conn,
                 Err(err) if err == QUERY_CANCELED => {
                     state.remove_pool_by_key(pool_key).await;
+                    connection_lifecycle::log_stage(
+                        connection_lifecycle::StageLog::new(
+                            connection_lifecycle::LifecycleStage::QueryExecute,
+                            connection_lifecycle::StageOutcome::Cancelled,
+                            execute_started.elapsed().as_millis(),
+                        )
+                        .with_context(execute_log_context),
+                    );
                     return Err(err);
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    connection_lifecycle::log_stage(
+                        connection_lifecycle::StageLog::new(
+                            connection_lifecycle::LifecycleStage::QueryExecute,
+                            connection_lifecycle::StageOutcome::Error,
+                            execute_started.elapsed().as_millis(),
+                        )
+                        .with_context(execute_log_context)
+                        .with_error(&err),
+                    );
+                    return Err(err);
+                }
             };
             let connection_id = conn.id();
             if let Some(ref execution_id) = options.execution_id {
@@ -1371,7 +1461,17 @@ pub async fn do_execute(
             let mut client = match cancel_token.as_ref() {
                 Some(token) => tokio::select! {
                     biased;
-                    _ = token.cancelled() => return Err(canceled_error()),
+                    _ = token.cancelled() => {
+                        connection_lifecycle::log_stage(
+                            connection_lifecycle::StageLog::new(
+                                connection_lifecycle::LifecycleStage::QueryExecute,
+                                connection_lifecycle::StageOutcome::Cancelled,
+                                execute_started.elapsed().as_millis(),
+                            )
+                            .with_context(execute_log_context),
+                        );
+                        return Err(canceled_error());
+                    }
                     guard = client.lock() => guard,
                 },
                 None => client.lock().await,
@@ -1450,6 +1550,14 @@ pub async fn do_execute(
             let rpc_timeout = query_timeout;
             drop(connections);
             if is_canceled(&cancel_token) {
+                connection_lifecycle::log_stage(
+                    connection_lifecycle::StageLog::new(
+                        connection_lifecycle::LifecycleStage::QueryExecute,
+                        connection_lifecycle::StageOutcome::Cancelled,
+                        execute_started.elapsed().as_millis(),
+                    )
+                    .with_context(execute_log_context),
+                );
                 return Err(canceled_error());
             }
             let cancel_for_agent = cancel_token.clone();
@@ -1544,6 +1652,30 @@ pub async fn do_execute(
             .map(|result| truncate_result_with_max_rows(result, max_rows))
         }
     };
+
+    {
+        let outcome = match &result {
+            Ok(_) => connection_lifecycle::StageOutcome::Done,
+            Err(err) if err == QUERY_CANCELED => connection_lifecycle::StageOutcome::Cancelled,
+            Err(_) => connection_lifecycle::StageOutcome::Error,
+        };
+        let mut end_log = connection_lifecycle::StageLog::new(
+            connection_lifecycle::LifecycleStage::QueryExecute,
+            outcome,
+            execute_started.elapsed().as_millis(),
+        )
+        .with_context(execute_log_context);
+        if let Some(timeout) = query_timeout {
+            end_log = end_log.with_timeout(timeout);
+        }
+        if let Err(err) = &result {
+            if err != QUERY_CANCELED {
+                end_log = end_log.with_error(err);
+            }
+        }
+        connection_lifecycle::log_stage(end_log);
+    }
+
     result.map(normalize_query_result_for_js)
 }
 

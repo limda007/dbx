@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+use crate::connection_lifecycle::{log_stage, LifecycleStage, StageLog, StageLogContext, StageOutcome};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunningQueryDiagnostics {
@@ -101,19 +104,47 @@ impl RunningQueries {
     }
 
     pub fn cancel(&self, execution_id: &str) -> bool {
-        let token =
-            self.inner.lock().unwrap_or_else(|e| e.into_inner()).get(execution_id).map(|task| task.token.clone());
+        let start = Instant::now();
+        let task_snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner()).get(execution_id).map(|task| {
+            (
+                task.token.clone(),
+                task.metadata.connection_id.clone(),
+                task.pool_key.clone(),
+                task.metadata.client_session_id.clone(),
+            )
+        });
         let interrupt = self.interrupts.lock().unwrap_or_else(|e| e.into_inner()).remove(execution_id);
+
+        let Some((token, connection_id, pool_key, client_session_id)) = task_snapshot else {
+            log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                    .with_trace_id(execution_id)
+                    .with_error("execution not found"),
+            );
+            return false;
+        };
+
+        let connection_id_ref = connection_id.as_deref();
+        let pool_key_ref = pool_key.as_deref();
+        let client_session_id_ref = client_session_id.as_deref();
+        let log_context = StageLogContext {
+            connection_id: connection_id_ref,
+            pool_key: pool_key_ref,
+            db_type: None,
+            trace_id: Some(execution_id),
+            client_session_id: client_session_id_ref,
+        };
+        log_stage(StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0).with_context(log_context));
 
         if let Some(interrupt) = interrupt {
             interrupt();
         }
-        if let Some(token) = token {
-            token.cancel();
-            true
-        } else {
-            false
-        }
+        token.cancel();
+        log_stage(
+            StageLog::new(LifecycleStage::Cancel, StageOutcome::Done, start.elapsed().as_millis())
+                .with_context(log_context),
+        );
+        true
     }
 
     pub fn cancel_connection(&self, connection_id: &str) -> usize {

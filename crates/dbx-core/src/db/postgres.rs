@@ -2877,17 +2877,40 @@ async fn cancel_postgres_query(
     cancel_context: Option<&PostgresCancelContext>,
     cancel_timeout: Duration,
 ) {
+    let start = Instant::now();
     let cancel_timeout = postgres_cancel_attempt_timeout(cancel_timeout, cancel_context);
+    connection_lifecycle::log_stage(
+        StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0).with_timeout(cancel_timeout),
+    );
     if let Some(ctx) = cancel_context {
         match make_rustls_connect_from_context(ctx) {
             Ok(tls) => match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(tls)).await {
-                Ok(Ok(())) => return,
+                Ok(Ok(())) => {
+                    connection_lifecycle::log_stage(
+                        StageLog::new(LifecycleStage::Cancel, StageOutcome::Done, start.elapsed().as_millis())
+                            .with_timeout(cancel_timeout),
+                    );
+                    return;
+                }
                 Ok(Err(err)) => {
-                    log::warn!("Failed to send PostgreSQL TLS cancel request: {err}");
+                    let error = format!("Failed to send PostgreSQL TLS cancel request: {err}");
+                    log::warn!("{error}");
+                    connection_lifecycle::log_stage(
+                        StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                            .with_timeout(cancel_timeout)
+                            .with_error(&error),
+                    );
                     return;
                 }
                 Err(_) => {
-                    log::warn!("Timed out sending PostgreSQL TLS cancel request ({}s)", cancel_timeout.as_secs());
+                    let error =
+                        format!("Timed out sending PostgreSQL TLS cancel request ({}s)", cancel_timeout.as_secs());
+                    log::warn!("{error}");
+                    connection_lifecycle::log_stage(
+                        StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                            .with_timeout(cancel_timeout)
+                            .with_error(&error),
+                    );
                     return;
                 }
             },
@@ -2897,9 +2920,30 @@ async fn cancel_postgres_query(
         }
     }
     match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(NoTls)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => log::warn!("Failed to send PostgreSQL cancel request: {err}"),
-        Err(_) => log::warn!("Timed out sending PostgreSQL cancel request ({}s)", cancel_timeout.as_secs()),
+        Ok(Ok(())) => {
+            connection_lifecycle::log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Done, start.elapsed().as_millis())
+                    .with_timeout(cancel_timeout),
+            );
+        }
+        Ok(Err(err)) => {
+            let error = format!("Failed to send PostgreSQL cancel request: {err}");
+            log::warn!("{error}");
+            connection_lifecycle::log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                    .with_timeout(cancel_timeout)
+                    .with_error(&error),
+            );
+        }
+        Err(_) => {
+            let error = format!("Timed out sending PostgreSQL cancel request ({}s)", cancel_timeout.as_secs());
+            log::warn!("{error}");
+            connection_lifecycle::log_stage(
+                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+                    .with_timeout(cancel_timeout)
+                    .with_error(&error),
+            );
+        }
     }
 }
 
