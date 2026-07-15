@@ -57,7 +57,7 @@ pub async fn probe_postgres_pool_health(
                 StageLog::new(LifecycleStage::Ping, StageOutcome::Done, start.elapsed().as_millis())
                     .with_timeout(ping_timeout)
                     .with_context(log_context)
-                    .with_error("pool busy; skipped health probe"),
+                    .with_detail("pool busy; skipped health probe"),
             );
             return PoolHealthProbeResult::Busy;
         }
@@ -128,7 +128,7 @@ pub async fn probe_mysql_pool_health(
                 StageLog::new(LifecycleStage::Ping, StageOutcome::Done, start.elapsed().as_millis())
                     .with_timeout(ping_timeout)
                     .with_context(log_context)
-                    .with_error("pool busy; skipped health probe"),
+                    .with_detail("pool busy; skipped health probe"),
             );
             return PoolHealthProbeResult::Busy;
         }
