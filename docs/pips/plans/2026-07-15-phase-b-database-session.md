@@ -1,6 +1,6 @@
 # Phase B: Hide `PoolKind` Behind DatabaseSession
 
-**Status:** In progress — **PR-B1 done** (B2 next: schema hot paths)  
+**Status:** In progress — **PR-B1 + B2 done** (B3 next: transfer/export)  
 **Date:** 2026-07-15  
 **Branch:** `feat/connection-lifecycle`
 
@@ -104,14 +104,24 @@ crates/dbx-core/src/
 
 ---
 
-### PR-B2 — Schema hot paths via session
+### PR-B2 — Schema hot paths via session ✅
 
 **Intent:** `list_databases` / `list_schemas` / `list_tables` (and primary tree loaders) call session helpers.
 
-**Acceptance:**
+**Files:**
 
-- native schema provider no longer owns multi-arm `PoolKind` matches for those three
-- external driver / plugin path still works
+- add `database_session/schema.rs` with `list_databases` / `list_schemas` / `list_tables`
+- `schema::{list_databases_once,list_schemas_once,list_tables_once}` final multi-arm matches → session
+- orchestration (retry, ExternalDriver, Agent, SqlServer, ClickHouse, DuckDb early paths) stays in `schema.rs`
+- note: `schema/providers/native.rs` is **not compiled** (orphan under `schema/` dir while `schema.rs` is the module root); real seam is `schema.rs`
+
+**Acceptance (verified 2026-07-15):**
+
+- final `match pool` for the three list hot paths lives in `database_session/schema.rs` (~23 arms)
+- `schema.rs` residual `PoolKind::` ~81 (agent/external/columns/objects/DDL — later slices)
+- `cargo check` mq-admin + default/duckdb green
+- `schema::tests` 42 ok; `connection_lifecycle` still green
+- external driver / plugin path still handled before session dispatch
 
 ---
 
@@ -167,4 +177,4 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 ## Immediate next step
 
-**PR-B2:** move schema hot paths (`list_databases` / `list_schemas` / `list_tables`) into `database_session`.
+**PR-B3:** transfer/export obtain driver handles through session APIs.

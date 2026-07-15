@@ -601,7 +601,7 @@ fn duckdb_completion_like_pattern(request: &db::CompletionAssistantRequest) -> S
 }
 
 #[cfg(feature = "duckdb-bundled")]
-async fn duckdb_attached_database_names(state: &AppState, connection_id: &str) -> Vec<String> {
+pub(crate) async fn duckdb_attached_database_names(state: &AppState, connection_id: &str) -> Vec<String> {
     state.configs.read().await.get(connection_id).map(crate::db::duckdb_sql::config_attached_names).unwrap_or_default()
 }
 
@@ -925,34 +925,10 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
 
     #[cfg(feature = "duckdb-bundled")]
     let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
+    #[cfg(not(feature = "duckdb-bundled"))]
+    let duckdb_attached_names: Vec<String> = Vec::new();
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(connection_id).ok_or("Connection not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
-            db::mysql::list_databases_show(p)
-                .await
-                .map(|databases| filter_mysql_system_databases_for_config(databases, db_config.as_ref()))
-        }
-        PoolKind::Mysql(p, mode) => dispatch_mysql!(p, mode, db::mysql::list_databases, db::ob_oracle::list_databases),
-        PoolKind::Postgres(p) => db::postgres::list_databases(p).await,
-        PoolKind::Sqlite(p) => db::sqlite::list_databases(p).await,
-        PoolKind::Rqlite(client) => db::rqlite_driver::list_databases(client).await,
-        #[cfg(feature = "duckdb-bundled")]
-        PoolKind::DuckDb(con) => {
-            let con = con.lock().map_err(|e| e.to_string())?;
-            duckdb_list_databases_with_attached(&con, &duckdb_attached_names)
-        }
-        #[cfg(feature = "duckdb-bundled")]
-        PoolKind::DuckDbWorker(client) => {
-            let client = client.clone();
-            drop(connections);
-            client.list_databases().await
-        }
-        PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_databases(client).await,
-        _ => Ok(vec![]),
-    }
+    crate::database_session::list_databases(state, connection_id, db_config.as_ref(), &duckdb_attached_names).await
 }
 
 pub async fn list_schemas_core(state: &AppState, connection_id: &str, database: &str) -> Result<Vec<String>, String> {
@@ -1134,35 +1110,9 @@ async fn list_schemas_once(
         }
     }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => db::ob_oracle::list_schemas(p)
-            .await
-            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
-        PoolKind::Postgres(p) => db::postgres::list_schemas(p)
-            .await
-            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
-        #[cfg(feature = "duckdb-bundled")]
-        PoolKind::DuckDb(con) => {
-            let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
-            let con = con.lock().map_err(|e| e.to_string())?;
-            duckdb_list_schemas_with_attached(&con, database, &duckdb_attached_names)
-                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
-        }
-        #[cfg(feature = "duckdb-bundled")]
-        PoolKind::DuckDbWorker(client) => {
-            let client = client.clone();
-            let database = database.to_string();
-            drop(connections);
-            client
-                .list_schemas(database)
-                .await
-                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
-        }
-        _ => Ok(vec![]),
-    }
+    crate::database_session::list_schemas(state, &pool_key, database, connection_id)
+        .await
+        .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
 }
 
 fn visible_schema_filter(
@@ -1993,72 +1943,21 @@ async fn list_tables_once(
         }
     }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
-            db::mysql::list_tables_show(p, database)
-                .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
-        }
-        PoolKind::Mysql(p, mode) => {
-            if *mode == MysqlMode::OceanBaseOracle {
-                let tables = db::ob_oracle::list_tables(p, schema).await?;
-                Ok(filter_table_infos(tables, filter, limit, offset, object_types))
-            } else {
-                db::mysql::list_tables_filtered(
-                    p,
-                    mysql_table_metadata_catalog(database, schema),
-                    filter,
-                    limit,
-                    offset,
-                    object_types,
-                )
-                .await
-                .map(|tables| filter_table_infos(tables, None, None, None, object_types))
-            }
-        }
-        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
-            db::questdb::list_tables(p, schema)
-                .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
-        }
-        PoolKind::Postgres(p) => {
-            if object_types.is_some() {
-                db::postgres::list_tables_filtered(p, schema, filter, None, None)
-                    .await
-                    .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
-            } else {
-                db::postgres::list_tables_filtered(p, schema, filter, limit, offset).await
-            }
-        }
-        PoolKind::Sqlite(p) => db::sqlite::list_tables(p, schema)
-            .await
-            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
-        PoolKind::Rqlite(client) => db::rqlite_driver::list_tables(client, schema)
-            .await
-            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
-        PoolKind::MongoDb(client) => db::mongo_driver::list_collections(client, database)
-            .await
-            .map(|names| collection_names_to_tables(names, "COLLECTION"))
-            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
-        PoolKind::Elasticsearch(client) => db::elasticsearch_driver::list_indices(client)
-            .await
-            .map(|names| collection_names_to_tables(names, "INDEX"))
-            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
-        PoolKind::VectorDb(client) => db::vector_driver::list_collections(client)
-            .await
-            .map(|infos| collection_names_to_tables(infos.into_iter().map(|i| i.name).collect(), "COLLECTION"))
-            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
-        PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_tables(client, schema)
-            .await
-            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
-        _ => Ok(vec![]),
-    }
+    crate::database_session::list_tables(
+        state,
+        &pool_key,
+        db_config.as_ref(),
+        database,
+        schema,
+        filter,
+        limit,
+        offset,
+        object_types,
+    )
+    .await
 }
 
-fn collection_names_to_tables(names: Vec<String>, table_type: &str) -> Vec<db::TableInfo> {
+pub(crate) fn collection_names_to_tables(names: Vec<String>, table_type: &str) -> Vec<db::TableInfo> {
     names
         .into_iter()
         .map(|name| db::TableInfo {
@@ -2071,7 +1970,7 @@ fn collection_names_to_tables(names: Vec<String>, table_type: &str) -> Vec<db::T
         .collect()
 }
 
-fn filter_table_infos(
+pub(crate) fn filter_table_infos(
     tables: Vec<db::TableInfo>,
     filter: Option<&str>,
     limit: Option<usize>,
@@ -2391,7 +2290,7 @@ fn normalize_information_schema_table_type(table_type: &str) -> String {
     }
 }
 
-fn mysql_table_metadata_catalog<'a>(database: &'a str, schema: &'a str) -> &'a str {
+pub(crate) fn mysql_table_metadata_catalog<'a>(database: &'a str, schema: &'a str) -> &'a str {
     if schema.trim().is_empty() {
         database
     } else {
@@ -4835,7 +4734,7 @@ fn oracle_agent_paging_likely_applied(enabled: bool, limit: Option<usize>, retur
     enabled && limit.is_some_and(|limit| returned_len <= limit)
 }
 
-fn is_doris_family_config(config: &ConnectionConfig) -> bool {
+pub(crate) fn is_doris_family_config(config: &ConnectionConfig) -> bool {
     matches!(config.db_type, DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch)
         || matches!(config.driver_profile.as_deref(), Some("doris" | "selectdb" | "starrocks" | "manticoresearch"))
 }
@@ -4861,7 +4760,7 @@ fn mysql_show_metadata_database_for_config<'a>(config: Option<&ConnectionConfig>
     }
 }
 
-fn filter_mysql_system_databases_for_config(
+pub(crate) fn filter_mysql_system_databases_for_config(
     databases: Vec<db::DatabaseInfo>,
     config: Option<&ConnectionConfig>,
 ) -> Vec<db::DatabaseInfo> {
@@ -4876,7 +4775,7 @@ fn is_mysql_system_database(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "information_schema" | "mysql" | "performance_schema" | "sys")
 }
 
-fn is_questdb_config(config: &ConnectionConfig) -> bool {
+pub(crate) fn is_questdb_config(config: &ConnectionConfig) -> bool {
     matches!(config.db_type, DatabaseType::Questdb) || matches!(config.driver_profile.as_deref(), Some("questdb"))
 }
 
