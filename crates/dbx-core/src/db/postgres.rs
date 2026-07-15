@@ -2399,6 +2399,7 @@ pub async fn execute_query_with_max_rows_and_cancel_logged(
         cancel_token,
         budget.query_timeout,
         budget.cancel_timeout,
+        log_context,
         execute_query_with_max_rows_inner(&client, sql, max_rows),
     )
     .await
@@ -2486,6 +2487,7 @@ pub async fn stream_select_query_with_cancel_logged(
         cancel_token,
         budget.query_timeout,
         budget.cancel_timeout,
+        log_context,
         stream_select_query_inner(&client, sql, row_limit, &mut on_item),
     )
     .await;
@@ -2614,6 +2616,7 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel_logged(
             cancel_token,
             budget.query_timeout,
             budget.cancel_timeout,
+            log_context,
             execute_query_with_max_rows_inner(&client, sql, max_rows),
         )
         .await;
@@ -2660,6 +2663,7 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel_logged(
         cancel_token,
         budget.query_timeout,
         budget.cancel_timeout,
+        log_context,
         execute_query_with_max_rows_inner(&client, sql, max_rows),
     )
     .await;
@@ -2742,7 +2746,16 @@ pub(crate) async fn wait_postgres_operation<T, F>(
 where
     F: Future<Output = Result<T, String>>,
 {
-    wait_postgres_query(pg_cancel_token, cancel_context, None, timeout_duration, cancel_timeout, future).await
+    wait_postgres_query(
+        pg_cancel_token,
+        cancel_context,
+        None,
+        timeout_duration,
+        cancel_timeout,
+        StageLogContext::empty(),
+        future,
+    )
+    .await
 }
 
 async fn wait_postgres_query<T, F>(
@@ -2751,6 +2764,7 @@ async fn wait_postgres_query<T, F>(
     cancel_token: Option<CancellationToken>,
     timeout_duration: Option<Duration>,
     cancel_timeout: Duration,
+    log_context: StageLogContext<'_>,
     future: F,
 ) -> Result<T, String>
 where
@@ -2761,13 +2775,13 @@ where
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout).await;
+                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout, log_context).await;
                     Err(crate::query::canceled_error())
                 }
                 result = tokio::time::timeout(duration, future) => match result {
                     Ok(result) => result,
                     Err(_) => {
-                        cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout).await;
+                        cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout, log_context).await;
                         Err(format!("Query timed out after {} seconds", duration.as_secs()))
                     }
                 },
@@ -2776,7 +2790,7 @@ where
         (None, Some(duration)) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
             Err(_) => {
-                cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout).await;
+                cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout, log_context).await;
                 Err(format!("Query timed out after {} seconds", duration.as_secs()))
             }
         },
@@ -2784,7 +2798,7 @@ where
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout).await;
+                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout, log_context).await;
                     Err(crate::query::canceled_error())
                 }
                 result = future => result,
@@ -2876,11 +2890,16 @@ async fn cancel_postgres_query(
     pg_cancel_token: tokio_postgres::CancelToken,
     cancel_context: Option<&PostgresCancelContext>,
     cancel_timeout: Duration,
+    log_context: StageLogContext<'_>,
 ) {
     let start = Instant::now();
     let cancel_timeout = postgres_cancel_attempt_timeout(cancel_timeout, cancel_context);
+    // Server-side cancel only — client acceptance is logged by RunningQueries::cancel as cancel:accepted.
     connection_lifecycle::log_stage(
-        StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0).with_timeout(cancel_timeout),
+        StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0)
+            .with_timeout(cancel_timeout)
+            .with_context(log_context)
+            .with_error("postgres cancel packet"),
     );
     if let Some(ctx) = cancel_context {
         match make_rustls_connect_from_context(ctx) {
@@ -2888,7 +2907,8 @@ async fn cancel_postgres_query(
                 Ok(Ok(())) => {
                     connection_lifecycle::log_stage(
                         StageLog::new(LifecycleStage::Cancel, StageOutcome::Done, start.elapsed().as_millis())
-                            .with_timeout(cancel_timeout),
+                            .with_timeout(cancel_timeout)
+                            .with_context(log_context),
                     );
                     return;
                 }
@@ -2898,6 +2918,7 @@ async fn cancel_postgres_query(
                     connection_lifecycle::log_stage(
                         StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
                             .with_timeout(cancel_timeout)
+                            .with_context(log_context)
                             .with_error(&error),
                     );
                     return;
@@ -2909,6 +2930,7 @@ async fn cancel_postgres_query(
                     connection_lifecycle::log_stage(
                         StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
                             .with_timeout(cancel_timeout)
+                            .with_context(log_context)
                             .with_error(&error),
                     );
                     return;
@@ -2923,7 +2945,8 @@ async fn cancel_postgres_query(
         Ok(Ok(())) => {
             connection_lifecycle::log_stage(
                 StageLog::new(LifecycleStage::Cancel, StageOutcome::Done, start.elapsed().as_millis())
-                    .with_timeout(cancel_timeout),
+                    .with_timeout(cancel_timeout)
+                    .with_context(log_context),
             );
         }
         Ok(Err(err)) => {
@@ -2932,6 +2955,7 @@ async fn cancel_postgres_query(
             connection_lifecycle::log_stage(
                 StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
                     .with_timeout(cancel_timeout)
+                    .with_context(log_context)
                     .with_error(&error),
             );
         }
@@ -2941,6 +2965,7 @@ async fn cancel_postgres_query(
             connection_lifecycle::log_stage(
                 StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
                     .with_timeout(cancel_timeout)
+                    .with_context(log_context)
                     .with_error(&error),
             );
         }

@@ -39,6 +39,8 @@ impl LifecycleStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StageOutcome {
     Start,
+    /// Client accepted the request (e.g. cancel token fired); server work may still be in flight.
+    Accepted,
     Done,
     Error,
     Cancelled,
@@ -48,6 +50,7 @@ impl StageOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::Accepted => "accepted",
             Self::Done => "done",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
@@ -249,13 +252,17 @@ pub fn log_stage(fields: StageLog<'_>) {
         StageOutcome::Error if log::log_enabled!(log::Level::Warn) => {
             log::warn!("{}", StageLogDisplay(&fields));
         }
-        StageOutcome::Cancelled if log::log_enabled!(log::Level::Info) => {
+        StageOutcome::Cancelled | StageOutcome::Accepted if log::log_enabled!(log::Level::Info) => {
             log::info!("{}", StageLogDisplay(&fields));
         }
         StageOutcome::Start | StageOutcome::Done if log::log_enabled!(log::Level::Debug) => {
             log::debug!("{}", StageLogDisplay(&fields));
         }
-        StageOutcome::Error | StageOutcome::Cancelled | StageOutcome::Start | StageOutcome::Done => {}
+        StageOutcome::Error
+        | StageOutcome::Cancelled
+        | StageOutcome::Accepted
+        | StageOutcome::Start
+        | StageOutcome::Done => {}
     }
 }
 
@@ -274,6 +281,20 @@ mod tests {
         assert_eq!(LifecycleStage::ResultFetch.as_str(), "result.fetch");
         assert_eq!(LifecycleStage::Cancel.as_str(), "cancel");
         assert_eq!(LifecycleStage::Cleanup.as_str(), "cleanup");
+    }
+
+    #[test]
+    fn cancel_accepted_is_distinct_from_done() {
+        assert_eq!(StageOutcome::Accepted.as_str(), "accepted");
+        assert_ne!(StageOutcome::Accepted.as_str(), StageOutcome::Done.as_str());
+        let line = format_stage_log(
+            &StageLog::new(LifecycleStage::Cancel, StageOutcome::Accepted, 1)
+                .with_trace_id("exec-1")
+                .with_error("client cancel accepted; server cancel may still be in flight"),
+        );
+        assert!(line.starts_with("[db:cancel:accepted]"));
+        assert!(line.contains("trace_id=exec-1"));
+        assert!(!line.contains(":done]"));
     }
 
     #[test]

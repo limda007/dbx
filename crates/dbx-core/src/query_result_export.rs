@@ -924,10 +924,21 @@ async fn try_export_mysql_query_result_stream(
     let kill_opts = conn.opts().clone();
     if let Some(execution_id) = request.execution_id.clone() {
         let interrupt_kill_opts = kill_opts.clone();
+        let kill_pool_key = pool_key.clone();
+        let kill_trace_id = execution_id.clone();
         state.running_queries.register_interrupt(&execution_id, move || {
             let kill_opts = interrupt_kill_opts.clone();
+            let kill_pool_key = kill_pool_key.clone();
+            let kill_trace_id = kill_trace_id.clone();
             tokio::spawn(async move {
-                if let Err(error) = crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id).await {
+                let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+                    Some(kill_pool_key.as_str()),
+                    Some(kill_trace_id.as_str()),
+                    Some("mysql"),
+                );
+                if let Err(error) =
+                    crate::db::mysql::kill_query_with_opts_logged(kill_opts, mysql_connection_id, log_context).await
+                {
                     log::warn!("Failed to cancel MySQL export query {mysql_connection_id}: {error}");
                 }
             });
@@ -1034,7 +1045,13 @@ async fn try_export_mysql_query_result_stream(
         Some(timeout) => match tokio::time::timeout(timeout, stream_future).await {
             Ok(result) => result,
             Err(_) => {
-                let _ = crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id).await;
+                let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+                    Some(pool_key.as_str()),
+                    request.execution_id.as_deref(),
+                    Some("mysql"),
+                );
+                let _ =
+                    crate::db::mysql::kill_query_with_opts_logged(kill_opts, mysql_connection_id, log_context).await;
                 Err(format!("Query timed out after {} seconds", timeout.as_secs()))
             }
         },

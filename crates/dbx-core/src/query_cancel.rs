@@ -134,6 +134,9 @@ impl RunningQueries {
             trace_id: Some(execution_id),
             client_session_id: client_session_id_ref,
         };
+        // Client-side cancel only: fire token + optional interrupt (often spawns async server kill).
+        // Do NOT log cancel:done here — server cancel completion is logged by PG cancel /
+        // MySQL kill_query_with_opts when those futures settle.
         log_stage(StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0).with_context(log_context));
 
         if let Some(interrupt) = interrupt {
@@ -141,8 +144,9 @@ impl RunningQueries {
         }
         token.cancel();
         log_stage(
-            StageLog::new(LifecycleStage::Cancel, StageOutcome::Done, start.elapsed().as_millis())
-                .with_context(log_context),
+            StageLog::new(LifecycleStage::Cancel, StageOutcome::Accepted, start.elapsed().as_millis())
+                .with_context(log_context)
+                .with_error("client cancel accepted; server cancel may still be in flight"),
         );
         true
     }

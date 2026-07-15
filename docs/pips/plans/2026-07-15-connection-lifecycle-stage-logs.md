@@ -14,7 +14,7 @@ All lifecycle stages emit through `connection_lifecycle::log_stage`:
 | Field | Meaning |
 | --- | --- |
 | `stage` | Named phase (PIP vocabulary) |
-| `outcome` | `start` / `done` / `error` / `cancelled` |
+| `outcome` | `start` / `accepted` / `done` / `error` / `cancelled` |
 | `elapsed_ms` | Wall time spent in that stage so far |
 | `timeout_ms` | Budget for the stage (when known) |
 | `trace_id` | Usually the query `execution_id` |
@@ -73,12 +73,18 @@ All lifecycle stages emit through `connection_lifecycle::log_stage`:
 
 ### Example user cancel during SQL
 
+Client cancel is **accepted** immediately; server cancel (`KILL QUERY` / PG cancel packet) logs its own `start` → `done`/`error` when that future settles.
+
 ```text
 [db:query.execute:start] …
-[db:cancel:start] trace_id=exec-3 …
-[db:cancel:done] …
+[db:cancel:start] trace_id=exec-3 …          # RunningQueries::cancel
+[db:cancel:accepted] trace_id=exec-3 …       # token fired; server kill may still be in flight
+[db:cancel:start] trace_id=exec-3 …          # MySQL KILL / PG cancel packet
+[db:cancel:done] trace_id=exec-3 …           # server cancel finished (or :error if stuck/failed)
 [db:query.execute:cancelled] …
 ```
+
+Do **not** treat the first `cancel:accepted` as “server cancel succeeded”.
 
 ## Frontend notes
 

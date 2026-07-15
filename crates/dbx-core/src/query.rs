@@ -1339,10 +1339,23 @@ pub async fn do_execute(
             let connection_id = conn.id();
             if let Some(ref execution_id) = options.execution_id {
                 let kill_opts = conn.opts().clone();
+                let kill_pool_key = pool_key.to_string();
+                let kill_trace_id = execution_id.clone();
+                let kill_db_type = db_type_label.clone();
                 state.running_queries.register_interrupt(execution_id, move || {
                     let kill_opts = kill_opts.clone();
+                    let kill_pool_key = kill_pool_key.clone();
+                    let kill_trace_id = kill_trace_id.clone();
+                    let kill_db_type = kill_db_type.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = db::mysql::kill_query_with_opts(kill_opts, connection_id).await {
+                        let log_context = connection_lifecycle::StageLogContext::for_pool(
+                            Some(kill_pool_key.as_str()),
+                            Some(kill_trace_id.as_str()),
+                            kill_db_type.as_deref(),
+                        );
+                        if let Err(error) =
+                            db::mysql::kill_query_with_opts_logged(kill_opts, connection_id, log_context).await
+                        {
                             log::warn!("Failed to cancel MySQL query {connection_id}: {error}");
                         }
                     });

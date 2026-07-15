@@ -3137,90 +3137,106 @@ async fn stream_query_result_prepared(
     Ok(rows_exported)
 }
 
+/// Kill a running MySQL query using a connection from `pool` (secondary path).
 pub async fn kill_query(pool: &MySqlPool, connection_id: u32) -> Result<(), String> {
+    kill_query_logged(pool, connection_id, StageLogContext::empty()).await
+}
+
+pub async fn kill_query_logged(
+    pool: &MySqlPool,
+    connection_id: u32,
+    log_context: StageLogContext<'_>,
+) -> Result<(), String> {
     let start = Instant::now();
     let timeout = super::connection_timeout();
+    log_mysql_cancel_start(timeout, connection_id, log_context);
+    let mut conn = match tokio::time::timeout(timeout, pool.get_conn()).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => return Err(log_mysql_cancel_error(start, timeout, log_context, e.to_string())),
+        Err(_) => {
+            return Err(log_mysql_cancel_error(
+                start,
+                timeout,
+                log_context,
+                "MySQL kill connection checkout timed out".to_string(),
+            ));
+        }
+    };
+    run_mysql_kill_query(&mut conn, connection_id, start, timeout, log_context).await
+}
+
+/// Primary cancel path used by query/export interrupts (opens a dedicated kill session).
+pub async fn kill_query_with_opts(opts: mysql_async::Opts, connection_id: u32) -> Result<(), String> {
+    kill_query_with_opts_logged(opts, connection_id, StageLogContext::empty()).await
+}
+
+/// Same as [`kill_query_with_opts`], with lifecycle correlation (`trace_id`, pool, connection).
+pub async fn kill_query_with_opts_logged(
+    opts: mysql_async::Opts,
+    connection_id: u32,
+    log_context: StageLogContext<'_>,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let timeout = super::connection_timeout();
+    log_mysql_cancel_start(timeout, connection_id, log_context);
+    let mut conn = match tokio::time::timeout(timeout, mysql_async::Conn::new(opts)).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => return Err(log_mysql_cancel_error(start, timeout, log_context, e.to_string())),
+        Err(_) => {
+            return Err(log_mysql_cancel_error(
+                start,
+                timeout,
+                log_context,
+                "MySQL kill connection timed out".to_string(),
+            ));
+        }
+    };
+    run_mysql_kill_query(&mut conn, connection_id, start, timeout, log_context).await
+}
+
+fn log_mysql_cancel_start(timeout: Duration, connection_id: u32, log_context: StageLogContext<'_>) {
     log_stage(
         StageLog::new(LifecycleStage::Cancel, StageOutcome::Start, 0)
             .with_timeout(timeout)
-            .with_error(&format!("mysql kill query conn_id={connection_id}")),
+            .with_context(log_context)
+            .with_error(&format!("mysql KILL QUERY target_conn_id={connection_id}")),
     );
-    let mut conn = tokio::time::timeout(timeout, pool.get_conn())
-        .await
-        .map_err(|_| {
-            let error = "MySQL kill connection checkout timed out".to_string();
-            log_stage(
-                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
-                    .with_timeout(timeout)
-                    .with_error(&error),
-            );
-            error
-        })?
-        .map_err(|e| {
-            let err = e.to_string();
-            log_stage(
-                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
-                    .with_timeout(timeout)
-                    .with_error(&err),
-            );
-            err
-        })?;
+}
+
+fn log_mysql_cancel_error(
+    start: Instant,
+    timeout: Duration,
+    log_context: StageLogContext<'_>,
+    error: String,
+) -> String {
+    log_stage(
+        StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
+            .with_timeout(timeout)
+            .with_context(log_context)
+            .with_error(&error),
+    );
+    error
+}
+
+async fn run_mysql_kill_query(
+    conn: &mut mysql_async::Conn,
+    connection_id: u32,
+    start: Instant,
+    timeout: Duration,
+    log_context: StageLogContext<'_>,
+) -> Result<(), String> {
     match tokio::time::timeout(timeout, conn.query_drop(format!("KILL QUERY {connection_id}"))).await {
         Ok(Ok(())) => {
             log_stage(
                 StageLog::new(LifecycleStage::Cancel, StageOutcome::Done, start.elapsed().as_millis())
-                    .with_timeout(timeout),
+                    .with_timeout(timeout)
+                    .with_context(log_context),
             );
             Ok(())
         }
-        Ok(Err(e)) => {
-            let err = e.to_string();
-            log_stage(
-                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
-                    .with_timeout(timeout)
-                    .with_error(&err),
-            );
-            Err(err)
-        }
-        Err(_) => {
-            let error = "MySQL KILL QUERY timed out".to_string();
-            log_stage(
-                StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
-                    .with_timeout(timeout)
-                    .with_error(&error),
-            );
-            Err(error)
-        }
+        Ok(Err(e)) => Err(log_mysql_cancel_error(start, timeout, log_context, e.to_string())),
+        Err(_) => Err(log_mysql_cancel_error(start, timeout, log_context, "MySQL KILL QUERY timed out".to_string())),
     }
-}
-
-pub async fn kill_query_with_opts(opts: mysql_async::Opts, connection_id: u32) -> Result<(), String> {
-    let start = Instant::now();
-    let timeout = super::connection_timeout();
-    let mut conn = tokio::time::timeout(timeout, mysql_async::Conn::new(opts))
-        .await
-        .map_err(|_| {
-            log::warn!(
-                "[db:cancel:error] elapsed_ms={} timeout_ms={} error=MySQL kill connection timed out",
-                start.elapsed().as_millis(),
-                timeout.as_millis()
-            );
-            "MySQL kill connection timed out".to_string()
-        })?
-        .map_err(|e| e.to_string())?;
-    tokio::time::timeout(timeout, conn.query_drop(format!("KILL QUERY {connection_id}")))
-        .await
-        .map_err(|_| {
-            log::warn!(
-                "[db:cancel:error] elapsed_ms={} timeout_ms={} error=MySQL KILL QUERY execution timed out",
-                start.elapsed().as_millis(),
-                timeout.as_millis()
-            );
-            "MySQL KILL QUERY execution timed out".to_string()
-        })?
-        .map_err(|e| e.to_string())?;
-    log::info!("[db:cancel:done] elapsed_ms={} timeout_ms={}", start.elapsed().as_millis(), timeout.as_millis());
-    Ok(())
 }
 
 pub async fn execute_query_on_conn_with_max_rows(
