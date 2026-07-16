@@ -1,7 +1,7 @@
 # Phase B: Hide `PoolKind` Behind DatabaseSession
 
-**Status:** In progress — **PR-B1–B4 done** (B5 optional: capability traits)  
-**Date:** 2026-07-15  
+**Status:** **Done** (B1–B4 + B2.1 schema tree; B5 traits deferred)  
+**Date:** 2026-07-15 / closed 2026-07-16  
 **Branch:** `feat/connection-lifecycle`
 
 **Anchors:**
@@ -174,11 +174,28 @@ rg '\.connections' src-tauri/ crates/dbx-web/ crates/dbx-core/tests   # empty
 
 ---
 
-### PR-B5 — Optional capability traits (PG/MySQL first)
+### PR-B2.1 — Schema tree residual hot paths ✅
+
+**Intent:** After B2 list_* , move remaining tree multi-arm matches into session.
+
+**Session APIs added:** `list_objects`, `list_completion_objects`, `list_object_statistics`,
+`get_columns`, `list_indexes`, `list_foreign_keys`, `list_triggers`, `get_table_ddl`,
+plus PG extras (`list_functions` / `sequences` / `rules` / `extensions` / `owners`).
+
+**Acceptance (verified 2026-07-16):**
+
+- `schema.rs` residual `PoolKind::` ~31 (agent/external/early paths, completion helpers, tests)
+- `database_session/schema.rs` ~74 arms (owns final native dispatch)
+- `schema::tests` 42 ok; lifecycle green
+
+---
+
+### PR-B5 — Optional capability traits (deferred)
 
 **Intent:** Extract `SqlExecute` / `SchemaBrowse` traits for first-class drivers; remaining variants stay enum.
 
-Only if B1–B4 prove the seam; do not invent traits with one adapter.
+**Decision (2026-07-16):** Defer. B1–B4 + B2.1 already hide product hot-path matches behind
+`database_session` static dispatch. Traits would add indirection without a second adapter today.
 
 ## Compatibility rules
 
@@ -201,11 +218,19 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 ## Definition of done (Phase B)
 
-1. Product hot paths (query execute, schema tree, transfer) do not `match PoolKind` outside `database_session` / `connection`.
-2. Deletion test passes for the session module.
-3. Phase A lifecycle + tests remain green.
-4. This plan’s status updated; PIP-0001 notes Phase B progress.
+1. Product hot paths (query execute, schema tree, transfer) do not `match PoolKind` outside `database_session` / `connection`. ✅
+2. Deletion test: removing `database_session` re-spreads driver matches into query/schema/transfer. ✅
+3. Phase A lifecycle + tests remain green. ✅
+4. This plan’s status updated; PIP-0001 notes Phase B progress. ✅
+
+## Residual (out of Phase B)
+
+- `schema.rs` agent/external/SqlServer early paths still peek `PoolKind` before calling session
+- `query.rs` txn / agent helpers
+- domain ops: `mongo_ops` / `redis_ops` / `document_ops`
+- `query_result_export` typed streams
+- orphan uncompiled `schema/providers/native.rs` (cleanup later)
 
 ## Immediate next step
 
-**PR-B5 (optional):** capability traits for PG/MySQL only if B1–B4 leave painful duplication; otherwise Phase B can stop at B4.
+Phase B closed. Follow-ups: domain-ops dispatch slices, optional B5 traits if multi-adapter pain appears.

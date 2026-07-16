@@ -16,16 +16,6 @@ macro_rules! extract_pool {
     };
 }
 
-macro_rules! dispatch_mysql {
-    ($p:expr, $mode:expr, $mysql:path, $ob:path $(, $arg:expr)*) => {
-        if *$mode == MysqlMode::OceanBaseOracle {
-            $ob($p $(, $arg)*).await
-        } else {
-            $mysql($p $(, $arg)*).await
-        }
-    };
-}
-
 macro_rules! try_sqlserver {
     ($connections:expr, $pool_key:expr, $method:ident $(, $arg:expr)*) => {
         if let Some(client) = extract_pool!(&$connections, $pool_key, SqlServer) {
@@ -3606,30 +3596,16 @@ async fn list_object_statistics_once(
             .await;
         }
     }
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    match pool {
-        PoolKind::Mysql(p, mode) => {
-            if *mode == MysqlMode::OceanBaseOracle || db_config.as_ref().is_some_and(is_manticoresearch_config) {
-                Ok(vec![])
-            } else {
-                db::mysql::list_object_statistics(p, database).await
-            }
-        }
-        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => Ok(vec![]),
-        PoolKind::Postgres(p) => db::postgres::list_object_statistics(p, schema).await,
-        PoolKind::ClickHouse(client) => {
-            db::clickhouse_driver::list_object_statistics(client, clickhouse_metadata_database(database, schema)).await
-        }
-        _ => Ok(vec![]),
-    }
+    drop(connections);
+    crate::database_session::list_object_statistics(state, &pool_key, db_config.as_ref(), database, schema).await
 }
 
-struct ObjectListOutcome {
-    objects: Vec<db::ObjectInfo>,
-    paging_applied: bool,
+pub(crate) struct ObjectListOutcome {
+    pub objects: Vec<db::ObjectInfo>,
+    pub paging_applied: bool,
 }
 
-fn unpaged_object_list(objects: Vec<db::ObjectInfo>) -> ObjectListOutcome {
+pub(crate) fn unpaged_object_list(objects: Vec<db::ObjectInfo>) -> ObjectListOutcome {
     ObjectListOutcome { objects, paging_applied: false }
 }
 
@@ -3807,48 +3783,36 @@ async fn list_objects_once(
         }
     }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, mode) => {
-            // Note: mysql and ob_oracle take different second args (database vs schema)
-            if *mode == MysqlMode::OceanBaseOracle {
-                db::ob_oracle::list_objects(p, schema).await.map(unpaged_object_list)
-            } else if db_config.as_ref().is_some_and(is_manticoresearch_config) {
-                db::manticoresearch::list_objects(p, database).await.map(unpaged_object_list)
-            } else if db_config.as_ref().is_some_and(is_doris_family_config) {
-                db::mysql::list_table_objects_show(p, database).await.map(unpaged_object_list)
-            } else {
-                db::mysql::list_objects(p, database, object_types, mysql_limit, mysql_offset)
-                    .await
-                    .map(|result| ObjectListOutcome { objects: result.objects, paging_applied: result.paging_applied })
-            }
-        }
-        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
-            db::questdb::list_objects(p, schema).await.map(unpaged_object_list)
-        }
-        PoolKind::Postgres(p) => db::postgres::list_objects(p, schema).await.map(unpaged_object_list),
-        _ => {
-            drop(connections);
-            Ok(unpaged_object_list(
-                list_tables_core(state, connection_id, database, schema, None, None, None, None)
-                    .await?
-                    .into_iter()
-                    .map(|table| db::ObjectInfo {
-                        name: table.name,
-                        object_type: table.table_type,
-                        schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
-                        signature: None,
-                        comment: table.comment,
-                        created_at: None,
-                        updated_at: None,
-                        parent_schema: table.parent_schema,
-                        parent_name: table.parent_name,
-                    })
-                    .collect(),
-            ))
-        }
+    match crate::database_session::list_objects(
+        state,
+        &pool_key,
+        db_config.as_ref(),
+        database,
+        schema,
+        object_types,
+        mysql_limit,
+        mysql_offset,
+    )
+    .await?
+    {
+        Some(outcome) => Ok(outcome),
+        None => Ok(unpaged_object_list(
+            list_tables_core(state, connection_id, database, schema, None, None, None, None)
+                .await?
+                .into_iter()
+                .map(|table| db::ObjectInfo {
+                    name: table.name,
+                    object_type: table.table_type,
+                    schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
+                    signature: None,
+                    comment: table.comment,
+                    created_at: None,
+                    updated_at: None,
+                    parent_schema: table.parent_schema,
+                    parent_name: table.parent_name,
+                })
+                .collect(),
+        )),
     }
 }
 
@@ -3931,29 +3895,21 @@ async fn list_completion_objects_once(
         };
         return Ok(filter_completion_objects(objects));
     }
+    drop(connections);
 
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    match pool {
-        PoolKind::Mysql(p, mode) if *mode != MysqlMode::OceanBaseOracle => {
-            db::mysql::list_completion_objects(p, database).await
-        }
-        PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => {
-            db::ob_oracle::list_objects(p, schema).await.map(filter_completion_objects)
-        }
-        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
-            db::questdb::list_objects(p, schema).await.map(filter_completion_objects)
-        }
-        PoolKind::Postgres(p) => db::postgres::list_objects(p, schema).await.map(filter_completion_objects),
-        PoolKind::SqlServer(_) => {
-            drop(connections);
+    match crate::database_session::list_completion_objects(state, &pool_key, db_config.as_ref(), database, schema)
+        .await?
+    {
+        Some(objects) => Ok(objects),
+        None => {
+            // SqlServer: reuse full object list path.
             let outcome = list_objects_once(state, connection_id, database, schema, None, None, None, None).await?;
             Ok(filter_completion_objects(outcome.objects))
         }
-        _ => Ok(Vec::new()),
     }
 }
 
-fn filter_completion_objects(objects: Vec<db::ObjectInfo>) -> Vec<db::ObjectInfo> {
+pub(crate) fn filter_completion_objects(objects: Vec<db::ObjectInfo>) -> Vec<db::ObjectInfo> {
     objects
         .into_iter()
         .filter(|object| {
@@ -4211,49 +4167,20 @@ pub async fn get_columns_core(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_manticoresearch_config) => {
-                let metadata_database = mysql_show_metadata_database_for_config(db_config.as_ref(), database);
-                db::manticoresearch::get_columns(p, metadata_database, table).await.map(deduplicate_column_infos)
-            }
-            PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
-                let metadata_database = mysql_show_metadata_database_for_config(db_config.as_ref(), database);
-                // Doris/StarRocks previously went straight to `SHOW COLUMNS` for
-                // speed (see perf(doris) commit), but `SHOW COLUMNS` reports the
-                // `Key` column as `YES`/`NO` rather than MySQL's `PRI`, so primary
-                // keys were never detected. `get_columns` queries
-                // information_schema.COLUMNS first — where `COLUMN_KEY = 'PRI'`
-                // correctly identifies primary keys (and only real primary keys,
-                // not duplicate-key sort columns) — and falls back to `SHOW COLUMNS`
-                // automatically when information_schema is unavailable.
-                db::mysql::get_columns(p, metadata_database, table).await.map(deduplicate_column_infos)
-            }
-            PoolKind::Mysql(p, mode) => {
-                let effective_db = mysql_table_metadata_catalog(database, schema);
-                dispatch_mysql!(p, mode, db::mysql::get_columns, db::ob_oracle::get_columns, effective_db, table)
-                    .map(deduplicate_column_infos)
-            }
-            PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
-                db::questdb::get_columns(p, schema, table).await.map(deduplicate_column_infos)
-            }
-            PoolKind::Postgres(p) => db::postgres::get_columns(p, schema, table).await.map(deduplicate_column_infos),
-            PoolKind::Sqlite(p) => db::sqlite::get_columns(p, schema, table).await.map(deduplicate_column_infos),
-            PoolKind::Rqlite(client) => {
-                db::rqlite_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
-            }
-            PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::get_columns(client, schema, table)
-                .await
-                .map(deduplicate_column_infos),
-            _ => Ok(vec![]),
-        }
+        crate::database_session::get_columns(
+            state,
+            &pool_key,
+            db_config.as_ref(),
+            database,
+            schema,
+            table,
+        )
+        .await
     })
     .await
 }
 
-fn deduplicate_column_infos(columns: Vec<db::ColumnInfo>) -> Vec<db::ColumnInfo> {
+pub(crate) fn deduplicate_column_infos(columns: Vec<db::ColumnInfo>) -> Vec<db::ColumnInfo> {
     let mut result: Vec<db::ColumnInfo> = Vec::with_capacity(columns.len());
     for column in columns {
         if let Some(existing) = result.iter_mut().find(|existing| existing.name == column.name) {
@@ -4320,32 +4247,7 @@ pub async fn list_indexes_core(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Mysql(p, mode) => {
-                if db_config.as_ref().is_some_and(is_manticoresearch_config) {
-                    return db::manticoresearch::list_indexes(p, table).await;
-                }
-                if *mode == MysqlMode::OceanBaseOracle {
-                    db::ob_oracle::list_indexes(p, schema, table).await
-                } else if db_config.as_ref().is_some_and(is_doris_family_config) {
-                    db::mysql::list_doris_family_indexes(p, mysql_table_metadata_catalog(database, schema), table).await
-                } else {
-                    db::mysql::list_indexes(p, mysql_table_metadata_catalog(database, schema), table).await
-                }
-            }
-            PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
-                db::questdb::list_indexes(p, schema, table).await
-            }
-            PoolKind::Postgres(p) => db::postgres::list_indexes(p, schema, table).await,
-            PoolKind::Sqlite(p) => db::sqlite::list_indexes(p, schema, table).await,
-            PoolKind::Rqlite(client) => db::rqlite_driver::list_indexes(client, schema, table).await,
-            PoolKind::MongoDb(client) => db::mongo_driver::list_indexes(client, database, table).await,
-            PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_indexes(client, schema, table).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_indexes(state, &pool_key, db_config.as_ref(), database, schema, table).await
     })
     .await
 }
@@ -4376,23 +4278,7 @@ pub async fn list_foreign_keys_core(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Mysql(p, mode) => {
-                if *mode == MysqlMode::OceanBaseOracle {
-                    db::ob_oracle::list_foreign_keys(p, schema, table).await
-                } else {
-                    db::mysql::list_foreign_keys(p, mysql_table_metadata_catalog(database, schema), table).await
-                }
-            }
-            PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
-            PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
-            PoolKind::Rqlite(client) => db::rqlite_driver::list_foreign_keys(client, schema, table).await,
-            PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_foreign_keys(client, schema, table).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_foreign_keys(state, &pool_key, database, schema, table).await
     })
     .await
 }
@@ -4421,23 +4307,7 @@ pub async fn list_triggers_core(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Mysql(p, mode) => {
-                if *mode == MysqlMode::OceanBaseOracle {
-                    db::ob_oracle::list_triggers(p, schema, table).await
-                } else {
-                    db::mysql::list_triggers(p, mysql_table_metadata_catalog(database, schema), table).await
-                }
-            }
-            PoolKind::Postgres(p) => db::postgres::list_triggers(p, schema, table).await,
-            PoolKind::Sqlite(p) => db::sqlite::list_triggers(p, schema, table).await,
-            PoolKind::Rqlite(client) => db::rqlite_driver::list_triggers(client, schema, table).await,
-            PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_triggers(client, schema, table).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_triggers(state, &pool_key, database, schema, table).await
     })
     .await
 }
@@ -4450,13 +4320,7 @@ pub async fn list_functions_core(
 ) -> Result<Vec<db::FunctionInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Postgres(p) => db::postgres::list_functions(p, schema).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_functions(state, &pool_key, schema).await
     })
     .await
 }
@@ -4470,13 +4334,7 @@ pub async fn list_sequences_core(
 ) -> Result<Vec<db::SequenceInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Postgres(p) => db::postgres::list_sequences(p, schema, with_last_values).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_sequences(state, &pool_key, schema, with_last_values).await
     })
     .await
 }
@@ -4489,13 +4347,7 @@ pub async fn list_rules_core(
 ) -> Result<Vec<db::RuleInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Postgres(p) => db::postgres::list_rules(p, schema).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_rules(state, &pool_key, schema).await
     })
     .await
 }
@@ -4508,13 +4360,7 @@ pub async fn list_extensions_core(
 ) -> Result<Vec<db::ExtensionInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Postgres(p) => db::postgres::list_extensions(p, schema).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_extensions(state, &pool_key, schema).await
     })
     .await
 }
@@ -4526,13 +4372,7 @@ pub async fn list_available_extensions_core(
 ) -> Result<Vec<db::ExtensionInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Postgres(p) => db::postgres::list_available_extensions(p).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_available_extensions(state, &pool_key).await
     })
     .await
 }
@@ -4545,13 +4385,7 @@ pub async fn list_owners_core(
 ) -> Result<Vec<db::OwnerInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Postgres(p) => db::postgres::list_owners(p, schema).await,
-            _ => Ok(vec![]),
-        }
+        crate::database_session::list_owners(state, &pool_key, schema).await
     })
     .await
 }
@@ -4690,36 +4524,14 @@ pub async fn get_table_ddl_core(
         }
     }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-    match pool {
-        PoolKind::Mysql(p, _) => mysql_ddl(p, mysql_table_metadata_catalog(database, schema), table).await,
-        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_opengauss_family_config) => {
-            match opengauss_table_ddl(p, schema, table).await {
-                Ok(ddl) => Ok(ddl),
-                Err(_) => pg_ddl(p, schema, table).await,
-            }
-        }
-        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
-            match db::questdb::questdb_table_or_view_ddl(p, table).await {
-                Ok(ddl) => Ok(ddl),
-                Err(_) => pg_ddl(p, schema, table).await,
-            }
-        }
-        PoolKind::Postgres(p) => pg_ddl(p, schema, table).await,
-        PoolKind::Sqlite(p) => sqlite_ddl(p, table).await,
-        PoolKind::Rqlite(client) => db::rqlite_driver::table_ddl(client, table).await,
-        PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::table_ddl(client, table).await,
-        _ => Err("DDL not supported for this database type".to_string()),
-    }
+    crate::database_session::get_table_ddl(state, &pool_key, db_config.as_ref(), database, schema, table).await
 }
 
 async fn connection_config(state: &AppState, connection_id: &str) -> Option<ConnectionConfig> {
     state.configs.read().await.get(connection_id).cloned()
 }
 
-fn is_opengauss_family_config(config: &ConnectionConfig) -> bool {
+pub(crate) fn is_opengauss_family_config(config: &ConnectionConfig) -> bool {
     matches!(config.db_type, DatabaseType::OpenGauss | DatabaseType::Gaussdb)
         || matches!(config.driver_profile.as_deref(), Some("opengauss" | "gaussdb"))
 }
@@ -4747,12 +4559,15 @@ pub fn is_doris_family_catalog_capable_config(config: &ConnectionConfig) -> bool
         || matches!(config.driver_profile.as_deref(), Some("doris" | "selectdb" | "starrocks"))
 }
 
-fn is_manticoresearch_config(config: &ConnectionConfig) -> bool {
+pub(crate) fn is_manticoresearch_config(config: &ConnectionConfig) -> bool {
     matches!(config.db_type, DatabaseType::ManticoreSearch)
         || matches!(config.driver_profile.as_deref(), Some("manticoresearch"))
 }
 
-fn mysql_show_metadata_database_for_config<'a>(config: Option<&ConnectionConfig>, database: &'a str) -> &'a str {
+pub(crate) fn mysql_show_metadata_database_for_config<'a>(
+    config: Option<&ConnectionConfig>,
+    database: &'a str,
+) -> &'a str {
     if config.is_some_and(is_manticoresearch_config) {
         ""
     } else {

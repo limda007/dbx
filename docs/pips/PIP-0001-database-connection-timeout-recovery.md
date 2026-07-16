@@ -2,9 +2,10 @@
 
 ## 状态
 
-In progress (Phase A complete on `feat/connection-lifecycle`: lifecycle facade, budgeted health/cleanup/checkout, frontend force reconnect, stage logs. Remaining product hardening / Phase B tracked outside Phase A)
+In progress (Phase A + Phase B complete on `feat/connection-lifecycle`: lifecycle facade/budgets/stage logs; `DatabaseSession` hides execute/schema-tree/transfer `PoolKind` dispatch; `PoolKind` is crate-private)
 
 Phase A plan: `docs/pips/plans/2026-07-14-phase-a-connection-lifecycle.md`  
+Phase B plan: `docs/pips/plans/2026-07-15-phase-b-database-session.md`  
 Stage-log reading guide: `docs/pips/plans/2026-07-15-connection-lifecycle-stage-logs.md`
 
 ## 摘要
