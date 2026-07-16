@@ -207,10 +207,13 @@ plus PG extras (`list_functions` / `sequences` / `rules` / `extensions` / `owner
 ## Verification
 
 ```bash
-# Safe (WSL):
+# Safe (WSL) — cargo accepts only one TESTNAME per invocation:
 CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib \
   --no-default-features --features mq-admin -j 1 \
-  database_session connection_lifecycle -- --test-threads=1
+  connection_lifecycle -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib \
+  --no-default-features --features mq-admin -j 1 \
+  schema::tests -- --test-threads=1
 
 # Full when memory allows:
 CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1

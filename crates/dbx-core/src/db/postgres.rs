@@ -2830,6 +2830,11 @@ pub async fn checkout_postgres_client_logged(
     log_context: StageLogContext<'_>,
 ) -> Result<deadpool_postgres::Object, String> {
     let start = Instant::now();
+    connection_lifecycle::log_stage(
+        StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Start, 0)
+            .with_timeout(checkout_timeout)
+            .with_context(log_context),
+    );
     let get_future = async {
         tokio::time::timeout(checkout_timeout, pool.get())
             .await

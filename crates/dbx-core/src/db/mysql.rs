@@ -2716,6 +2716,8 @@ pub async fn get_conn_with_health_check_with_cancel(
 }
 
 /// Same as [`get_conn_with_health_check_with_cancel`], with lifecycle correlation fields on stage logs.
+///
+/// Stage sequence: `pool.checkout:start` → checkout terminal → `ping:start` → ping terminal.
 pub async fn get_conn_with_health_check_with_cancel_logged(
     pool: &MySqlPool,
     timeout: Duration,
@@ -2723,63 +2725,26 @@ pub async fn get_conn_with_health_check_with_cancel_logged(
     cancel_token: Option<&CancellationToken>,
     log_context: StageLogContext<'_>,
 ) -> Result<mysql_async::Conn, String> {
-    let start = Instant::now();
     let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token, log_context).await?;
-    match ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
-        Ok(()) => {
-            log_stage(
-                StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Done, start.elapsed().as_millis())
-                    .with_timeout(timeout)
-                    .with_context(log_context),
-            );
-            Ok(conn)
-        }
+    match ping_conn_with_timeout_and_cancel_logged(&mut conn, timeout, cancel_token, log_context).await {
+        Ok(()) => Ok(conn),
         Err(err) if err == crate::query::QUERY_CANCELED => {
-            log_stage(
-                StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Cancelled, start.elapsed().as_millis())
-                    .with_timeout(timeout)
-                    .with_context(log_context),
-            );
             let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
             Err(err)
         }
         Err(err) => {
-            log::warn!(
-                "[db:health.check:error] elapsed_ms={} timeout_ms={} error={}; retrying",
-                start.elapsed().as_millis(),
-                timeout.as_millis(),
-                err
-            );
+            log::warn!("[db:health.check:error] timeout_ms={} error={}; retrying", timeout.as_millis(), err);
             let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
             let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token, log_context).await?;
-            if let Err(err) = ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
+            if let Err(err) =
+                ping_conn_with_timeout_and_cancel_logged(&mut conn, timeout, cancel_token, log_context).await
+            {
                 if err == crate::query::QUERY_CANCELED {
-                    log_stage(
-                        StageLog::new(
-                            LifecycleStage::PoolCheckout,
-                            StageOutcome::Cancelled,
-                            start.elapsed().as_millis(),
-                        )
-                        .with_timeout(timeout)
-                        .with_context(log_context),
-                    );
                     let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
-                } else {
-                    log_stage(
-                        StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Error, start.elapsed().as_millis())
-                            .with_timeout(timeout)
-                            .with_context(log_context)
-                            .with_error(&err),
-                    );
                 }
                 return Err(err);
             }
-            log_stage(
-                StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Done, start.elapsed().as_millis())
-                    .with_timeout(timeout)
-                    .with_context(log_context)
-                    .with_detail("recovered after stale connection"),
-            );
+            // Second checkout+ping already emitted terminal stages; success means recovered.
             Ok(conn)
         }
     }
@@ -2792,6 +2757,11 @@ async fn get_conn_with_timeout_and_cancel(
     log_context: StageLogContext<'_>,
 ) -> Result<mysql_async::Conn, String> {
     let start = Instant::now();
+    log_stage(
+        StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Start, 0)
+            .with_timeout(timeout)
+            .with_context(log_context),
+    );
     let get_future = async {
         tokio::time::timeout(timeout, pool.get_conn())
             .await
@@ -2817,7 +2787,7 @@ async fn get_conn_with_timeout_and_cancel(
             })
     };
 
-    match cancel_token {
+    let result = match cancel_token {
         Some(token) => {
             tokio::select! {
                 biased;
@@ -2833,7 +2803,15 @@ async fn get_conn_with_timeout_and_cancel(
             }
         }
         None => get_future.await,
+    };
+    if result.is_ok() {
+        log_stage(
+            StageLog::new(LifecycleStage::PoolCheckout, StageOutcome::Done, start.elapsed().as_millis())
+                .with_timeout(timeout)
+                .with_context(log_context),
+        );
     }
+    result
 }
 
 pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
@@ -2843,11 +2821,16 @@ pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Resul
         .map_err(|e| e.to_string())
 }
 
-async fn ping_conn_with_timeout_and_cancel(
+async fn ping_conn_with_timeout_and_cancel_logged(
     conn: &mut mysql_async::Conn,
     timeout: Duration,
     cancel_token: Option<&CancellationToken>,
+    log_context: StageLogContext<'_>,
 ) -> Result<(), String> {
+    let start = Instant::now();
+    log_stage(
+        StageLog::new(LifecycleStage::Ping, StageOutcome::Start, 0).with_timeout(timeout).with_context(log_context),
+    );
     let ping_future = async {
         tokio::time::timeout(timeout, conn.ping())
             .await
@@ -2855,7 +2838,7 @@ async fn ping_conn_with_timeout_and_cancel(
             .map_err(|e| e.to_string())
     };
 
-    match cancel_token {
+    let result = match cancel_token {
         Some(token) => {
             tokio::select! {
                 biased;
@@ -2864,7 +2847,32 @@ async fn ping_conn_with_timeout_and_cancel(
             }
         }
         None => ping_future.await,
+    };
+    match &result {
+        Ok(()) => {
+            log_stage(
+                StageLog::new(LifecycleStage::Ping, StageOutcome::Done, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_context(log_context),
+            );
+        }
+        Err(err) if err == crate::query::QUERY_CANCELED => {
+            log_stage(
+                StageLog::new(LifecycleStage::Ping, StageOutcome::Cancelled, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_context(log_context),
+            );
+        }
+        Err(err) => {
+            log_stage(
+                StageLog::new(LifecycleStage::Ping, StageOutcome::Error, start.elapsed().as_millis())
+                    .with_timeout(timeout)
+                    .with_context(log_context)
+                    .with_error(err),
+            );
+        }
     }
+    result
 }
 
 async fn execute_result_set_with_text_protocol_on_conn(

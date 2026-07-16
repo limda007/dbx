@@ -201,6 +201,19 @@ pub struct AppState {
     pub transaction_sessions: Arc<RwLock<HashMap<String, TransactionSession>>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
+    /// Test-only: park attempt-gated transport reset at fixed points while the
+    /// `connection_attempts` write lock is held (deterministic race coverage).
+    #[cfg(test)]
+    transport_reset_test_hold: tokio::sync::Mutex<Option<TransportResetTestHold>>,
+}
+
+/// Oneshot barriers for tests: after check (before reset), and after reset (before unlock).
+#[cfg(test)]
+struct TransportResetTestHold {
+    after_check: Option<tokio::sync::oneshot::Sender<()>>,
+    release_for_reset: Option<tokio::sync::oneshot::Receiver<()>>,
+    after_reset: Option<tokio::sync::oneshot::Sender<()>>,
+    release_for_unlock: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -594,6 +607,8 @@ impl AppState {
             transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "mq-admin")]
             mq_registry: crate::mq::MqAdminRegistry::new(),
+            #[cfg(test)]
+            transport_reset_test_hold: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -935,6 +950,94 @@ impl AppState {
         } else {
             Err("Connection attempt was superseded by a newer attempt".to_string())
         }
+    }
+
+    /// Reset transport only when `attempt` is still current, under one critical section.
+    ///
+    /// Holds the connection-attempt write lock for the full check + tunnel stop so a
+    /// newer attempt cannot `begin_connection_attempt` (and open tunnels) between the
+    /// check and the stop — which would otherwise let a stale cleanup kill the new tunnel.
+    ///
+    /// Returns `true` when transport was reset for this attempt.
+    pub(crate) async fn reset_connection_transport_if_attempt_current(
+        &self,
+        connection_id: &str,
+        attempt: u64,
+        config: &ConnectionConfig,
+    ) -> bool {
+        let attempts = self.connection_attempts.write().await;
+        let is_current = attempts.get(connection_id).map(|state| state.server_attempt) == Some(attempt);
+        if !is_current {
+            return false;
+        }
+
+        // Test hold is taken once and kept across both park points so the lock spans
+        // check → reset → unlock (not only the pre-reset window).
+        #[cfg(test)]
+        let mut test_hold = self.transport_reset_test_hold.lock().await.take();
+        #[cfg(test)]
+        {
+            if let Some(hold) = test_hold.as_mut() {
+                if let Some(after_check) = hold.after_check.take() {
+                    let _ = after_check.send(());
+                }
+                if let Some(release_for_reset) = hold.release_for_reset.take() {
+                    let _ = release_for_reset.await;
+                }
+            }
+        }
+
+        let existing_layer_count = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id).map(|cfg| cfg.effective_transport_layers().len()).unwrap_or(0)
+        };
+        let layer_count = existing_layer_count.max(config.effective_transport_layers().len());
+        // Keep `attempts` write-locked until stop completes so begin/supersede wait.
+        self.reset_connection_transport_layers(connection_id, layer_count).await;
+
+        #[cfg(test)]
+        {
+            if let Some(hold) = test_hold.as_mut() {
+                if let Some(after_reset) = hold.after_reset.take() {
+                    let _ = after_reset.send(());
+                }
+                if let Some(release_for_unlock) = hold.release_for_unlock.take() {
+                    let _ = release_for_unlock.await;
+                }
+            }
+        }
+
+        drop(attempts);
+        true
+    }
+
+    /// Arm barriers for [`reset_connection_transport_if_attempt_current`].
+    ///
+    /// Returns:
+    /// - `after_check`: fires after the current-attempt check (lock held, reset not yet run)
+    /// - `release_for_reset`: send to allow tunnel stop to run
+    /// - `after_reset`: fires after tunnel stop (lock still held)
+    /// - `release_for_unlock`: send to allow the attempt write lock to drop
+    #[cfg(test)]
+    pub(crate) async fn arm_transport_reset_hold_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (after_check_tx, after_check_rx) = tokio::sync::oneshot::channel();
+        let (release_for_reset_tx, release_for_reset_rx) = tokio::sync::oneshot::channel();
+        let (after_reset_tx, after_reset_rx) = tokio::sync::oneshot::channel();
+        let (release_for_unlock_tx, release_for_unlock_rx) = tokio::sync::oneshot::channel();
+        *self.transport_reset_test_hold.lock().await = Some(TransportResetTestHold {
+            after_check: Some(after_check_tx),
+            release_for_reset: Some(release_for_reset_rx),
+            after_reset: Some(after_reset_tx),
+            release_for_unlock: Some(release_for_unlock_rx),
+        });
+        (after_check_rx, release_for_reset_tx, after_reset_rx, release_for_unlock_tx)
     }
 
     pub(crate) async fn insert_connection_pool_for_attempt(
