@@ -433,10 +433,7 @@ pub async fn test_connection_with_info(
     state: State<'_, Arc<AppState>>,
     config: ConnectionConfig,
 ) -> Result<ConnectionTestResult, String> {
-    // Database-info enrichment is optional for adapters that only need connectivity.
-    // Full with-info dispatch remains a follow-up once lifecycle returns ConnectionTestResult.
-    let message = dbx_core::connection_lifecycle::test_connection(state.inner().as_ref(), config).await?;
-    Ok(ConnectionTestResult::success(message))
+    dbx_core::connection_lifecycle::test_connection_with_info(state.inner().as_ref(), config).await
 }
 
 #[tauri::command]

@@ -64,9 +64,9 @@ pub async fn test_connection_with_info(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<ConnectionTestResult>, AppError> {
-    // Keep main's with-info route; optional database_info enrichment can be layered later.
-    let message = dbx_core::connection_lifecycle::test_connection(&state.app, body.config).await.map_err(AppError)?;
-    Ok(Json(ConnectionTestResult::success(message)))
+    let result =
+        dbx_core::connection_lifecycle::test_connection_with_info(&state.app, body.config).await.map_err(AppError)?;
+    Ok(Json(result))
 }
 
 pub async fn connect_db(

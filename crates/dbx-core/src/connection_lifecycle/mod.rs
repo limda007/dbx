@@ -18,7 +18,7 @@ pub use budget::{
 pub use cleanup::{
     cleanup_timeout_from_budget, close_with_default_timeout, close_with_timeout, DEFAULT_POOL_CLOSE_TIMEOUT,
 };
-pub use connect::{connect, test_connection};
+pub use connect::{connect, test_connection, test_connection_with_info};
 pub use health::{
     health_budget_defaults, health_budget_from_connect_timeout_secs, probe_mysql_pool_health,
     probe_postgres_pool_health, PoolHealthProbeResult, HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT,

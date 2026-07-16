@@ -129,6 +129,7 @@ mod tests {
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
+            database_info: None,
             one_time: false,
             read_only: false,
             is_production: false,
