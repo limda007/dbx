@@ -2,11 +2,24 @@
 
 ## 状态
 
-In progress (Phase A + Phase B complete on `feat/connection-lifecycle`: lifecycle facade/budgets/stage logs; `DatabaseSession` hides execute/schema-tree/transfer `PoolKind` dispatch; `PoolKind` is crate-private)
+In progress (Phase A + Phase B complete on `feat/connection-lifecycle`: lifecycle facade/budgets/stage logs; `DatabaseSession` hides execute/schema-tree/transfer `PoolKind` dispatch; `PoolKind` is crate-private). Code-level follow-up closure is tracked below; this PIP remains open until the Windows/database acceptance matrix is recorded.
 
 Phase A plan: `docs/pips/plans/2026-07-14-phase-a-connection-lifecycle.md`  
 Phase B plan: `docs/pips/plans/2026-07-15-phase-b-database-session.md`  
 Stage-log reading guide: `docs/pips/plans/2026-07-15-connection-lifecycle-stage-logs.md`
+
+### 2026-07-16 implementation update
+
+Completed in this follow-up slice:
+
+- Table-detail, schema, and shared paged object metadata requests use the existing per-request metadata budget, so a hung backend request clears its tree loading state and produces a reconnectable connection error.
+- The connection dialog warns when a user disables keepalive, including the VPN/NAT/firewall/sleep risk.
+- The error popover can copy a privacy-safe diagnostics snapshot: connection state, active-query count, pool keys, latest health-check result, and the latest error. It excludes SQL text, execution IDs, credentials, and connection configuration.
+- `result.fetch` now emits `start` and terminal stage logs for real Agent and external-driver cursor-page fetches. A disabled query timeout remains absent from the log budget.
+
+Known observability boundary:
+
+- `pool.recycle` is still not emitted in production. Deadpool PostgreSQL Fast recycle is internal to `pool.get()` and that call also includes queue wait/create work, so labelling the whole call as recycle would produce misleading diagnostics. Add an explicit deadpool recycle hook with a dedicated live-pool test before closing this item; do not switch to verified recycle merely to add a log line.
 
 ## 摘要
 
@@ -418,6 +431,12 @@ PostgreSQL/openGauss 的 schema 执行上下文行为保持不变，但 `SET sea
 - MySQL：ping timeout、kill query timeout、connection error 分类。
 - 前端：执行超时后清理 tab 状态；取消超时后清理 `isCancelling`；连接树刷新失败后清理 loading。
 
+本次代码级回归补充：
+
+- 表级 columns/indexes/foreign keys/triggers、schema 列表和共享 tables 分页请求超时后，断言 tree loading 状态清除并进入连接错误状态。
+- 复制诊断文本不包含 SQL 或 execution id，且能合并后端运行态与最近一次失败 health check。
+- `result.fetch` 的 stage-log 格式与终态映射覆盖 `start`、`done`、`cancelled`、`error`，并保留可选 timeout。
+
 ### 手工测试
 
 Windows 环境验证：
@@ -435,6 +454,20 @@ Windows 环境验证：
 - PostgreSQL/openGauss：`SELECT pg_sleep(60)`。
 - MySQL：`SELECT SLEEP(60)`。
 - 点击取消后，UI 必须在 2 到 5 秒内退出取消中状态。
+
+### 关单前验收记录
+
+以下矩阵必须在目标 Windows 环境和真实数据库上执行并把日期、构建版本、日志/截图位置记录到本 PIP；本地单元测试不能替代这些验证。
+
+| 场景 | PostgreSQL / openGauss | MySQL | 预期 |
+| --- | --- | --- | --- |
+| 空闲后断链 | 停止服务、断开 VPN 或切换 Wi-Fi 后执行 `SELECT 1` | 同左 | 不会永久执行或持续 loading；恢复网络后可重连，无需重启应用 |
+| 取消长查询 | `SELECT pg_sleep(60)` 后点击取消 | `SELECT SLEEP(60)` 后点击取消 | 2–5 秒内退出取消中；日志能按 trace_id 显示 cancel 与 query 终态 |
+| 元数据刷新 | 展开 schema、tables、columns、indexes、foreign keys、triggers | 同左 | 失败有明确错误，树节点停止转圈；恢复后刷新成功 |
+| keepalive 关闭 | 保存 interval `0` | 保存 interval `0` | UI 显示 VPN/NAT/firewall/sleep 风险提示；配置仍允许关闭 |
+| 诊断复制 | 连接错误 Popover 点击“复制诊断” | 同左 | 包含状态、活跃查询数、pool key、health 结果和错误，不包含 SQL/凭据/execution id |
+
+当前工作树尚未连接这些真实环境，因此上表仍是待执行验收项。
 
 ## 风险
 

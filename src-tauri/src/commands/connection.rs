@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tauri::State;
 
-pub use dbx_core::connection::{metadata_connection_config, AppState};
+pub use dbx_core::connection::{metadata_connection_config, AppState, ConnectionRuntimeDiagnostics};
 use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseType};
 
 #[cfg(test)]
@@ -509,6 +509,14 @@ pub async fn refresh_connections(state: State<'_, Arc<AppState>>) -> Result<(), 
 #[tauri::command]
 pub async fn check_connection_health(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
     state.check_connection_health(&connection_id).await
+}
+
+#[tauri::command]
+pub async fn connection_runtime_diagnostics(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<ConnectionRuntimeDiagnostics, String> {
+    Ok(state.connection_runtime_diagnostics(&connection_id).await)
 }
 
 #[tauri::command]

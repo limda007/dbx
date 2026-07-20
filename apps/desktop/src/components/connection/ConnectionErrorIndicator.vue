@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, RefreshCcw, X } from "@lucide/vue";
+import { AlertTriangle, Copy, RefreshCcw, X } from "@lucide/vue";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { copyToClipboard } from "@/lib/common/clipboard";
+import { formatConnectionLifecycleDiagnostics } from "@/lib/connection/lifecycleClient";
 import { useConnectionStore } from "@/stores/connectionStore";
 
 const props = withDefaults(
@@ -18,6 +20,7 @@ const props = withDefaults(
 
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
+const copying = ref(false);
 const reconnecting = ref(false);
 
 const errorMessage = computed(() => (props.connectionId ? connectionStore.connectionErrors[props.connectionId] : ""));
@@ -29,6 +32,17 @@ const diagnostics = computed(() => {
 
 function clearError() {
   if (props.connectionId) connectionStore.clearConnectionError(props.connectionId);
+}
+
+async function copyDiagnostics() {
+  if (!props.connectionId || copying.value) return;
+  copying.value = true;
+  try {
+    const snapshot = await connectionStore.loadConnectionLifecycleDiagnostics(props.connectionId);
+    await copyToClipboard(formatConnectionLifecycleDiagnostics(snapshot));
+  } finally {
+    copying.value = false;
+  }
 }
 
 async function forceReconnect() {
@@ -69,6 +83,10 @@ async function forceReconnect() {
           <X class="h-3.5 w-3.5" />
         </button>
       </div>
+      <button type="button" class="mt-1 inline-flex w-full items-center justify-center gap-1.5 rounded border border-border bg-background px-2 py-1 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-60" :disabled="copying" @click="copyDiagnostics">
+        <Copy class="h-3 w-3" :class="{ 'animate-pulse': copying }" />
+        {{ t("connection.copyDiagnostics") }}
+      </button>
       <button
         type="button"
         class="mt-1 inline-flex w-full items-center justify-center gap-1.5 rounded border border-border bg-background px-2 py-1 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-60"

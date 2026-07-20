@@ -435,6 +435,8 @@ export default {
     queryTimeout: "Query Timeout (seconds)",
     idleTimeout: "Idle Timeout (seconds)",
     keepaliveInterval: "Keepalive Interval (seconds)",
+    keepaliveDisabledHint: "Keepalive is disabled. VPNs, NATs, firewalls, or sleeping devices may silently drop idle connections.",
+    copyDiagnostics: "Copy diagnostics",
     readOnly: "Read Only",
     readOnlyHint: "Block all write operations (INSERT, UPDATE, DELETE, etc.)",
     readOnlyBadge: "Read-only",

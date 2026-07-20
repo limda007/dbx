@@ -383,6 +383,8 @@ export default withEnglishFallback({
     queryTimeout: "クエリタイムアウト（秒）",
     idleTimeout: "アイドルタイムアウト（秒）",
     keepaliveInterval: "Keepalive 間隔（秒）",
+    keepaliveDisabledHint: "Keepalive は無効です。VPN、NAT、ファイアウォール、またはスリープ中の端末により、アイドル接続が通知なく切断される場合があります。",
+    copyDiagnostics: "診断情報をコピー",
     readOnly: "読み取り専用",
     readOnlyHint: "すべての書き込み操作（INSERT, UPDATE, DELETEなど）をブロックします",
     readOnlyBadge: "読み取り専用",

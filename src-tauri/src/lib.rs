@@ -1073,6 +1073,7 @@ pub fn run() {
             commands::connection::close_database_connection,
             commands::connection::refresh_connections,
             commands::connection::check_connection_health,
+            commands::connection::connection_runtime_diagnostics,
             commands::connection::connection_identifier_quote,
             commands::connection::connection_database_info,
             commands::connection::save_connection_database_info,

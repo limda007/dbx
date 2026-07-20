@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionConfig,
+  ConnectionRuntimeDiagnostics,
   ConnectionTestResult,
   DatabaseConnectionInfo,
   DatabaseInfo,
@@ -672,6 +673,10 @@ export async function disconnectDb(connectionId: string, clientAttempt?: number)
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return invoke("check_connection_health", { connectionId });
+}
+
+export async function connectionRuntimeDiagnostics(connectionId: string): Promise<ConnectionRuntimeDiagnostics> {
+  return invoke("connection_runtime_diagnostics", { connectionId });
 }
 
 export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {

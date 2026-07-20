@@ -7,6 +7,7 @@ import type {
   CompletionAssistantObjectKind,
   CompletionAssistantRequest,
   ConnectionConfig,
+  ConnectionRuntimeDiagnostics,
   DatabaseConnectionInfo,
   CatalogInfo,
   ForeignKeyInfo,
@@ -50,7 +51,7 @@ import { collapseExpandedTreeNodes } from "@/lib/sidebar/sidebarTreeCollapse";
 import { findDatabaseTreeNode } from "@/lib/sidebar/treeRefreshTarget";
 import { shouldMarkDisconnected } from "@/lib/connection/connectionHealth";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
-import { CONNECTION_HEALTH_CHECK_TTL_MS, connectionLifecycleDiagnostics, withEnsureConnectedHealthTimeout } from "@/lib/connection/lifecycleClient";
+import { CONNECTION_HEALTH_CHECK_TTL_MS, connectionLifecycleDiagnostics, type ConnectionHealthSnapshot, withEnsureConnectedHealthTimeout } from "@/lib/connection/lifecycleClient";
 import { requiresSqlServerLegacyCompatibilityComponent, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { deleteTabResultSnapshotsForOwner } from "@/lib/tabs/tabResultCache";
 import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, filterSchemaNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/database/visibleDatabases";
@@ -254,6 +255,8 @@ export const useConnectionStore = defineStore("connection", () => {
   const connectedIds = ref<Set<string>>(new Set());
   const identifierQuotes = ref<Record<string, string>>({});
   const lastConnectionHealthCheckAt = ref<Record<string, number>>({});
+  const lastConnectionHealth = ref<Record<string, ConnectionHealthSnapshot>>({});
+  const runtimeConnectionDiagnostics = ref<Record<string, ConnectionRuntimeDiagnostics>>({});
   const agentDrivers = ref<AgentDriverInstallState[]>([]);
   let agentDriversRefreshPromise: Promise<void> | null = null;
   const loadedTreeNodeChildrenIds = ref<Set<string>>(new Set());
@@ -373,7 +376,8 @@ export const useConnectionStore = defineStore("connection", () => {
     }
 
     logMetadataLoadTrace(metadataTraceLogger, trace, "cache-miss", { cacheStatus: options?.force ? "refresh" : "miss", force: options?.force === true });
-    const result = await load();
+    const label = scope.kind === "table-list-page" ? "tables" : scope.kind === "object-list-page" ? "objects" : "metadata";
+    const result = await (scope.connectionId ? withMetadataLoadTimeout(scope.connectionId, load(), label) : load());
     metadataListPageCache.set(scope, result);
     logMetadataLoadTrace(metadataTraceLogger, trace, "done", {
       cacheStatus: options?.force ? "refresh" : "miss",
@@ -658,9 +662,19 @@ export const useConnectionStore = defineStore("connection", () => {
     lastConnectionHealthCheckAt.value[connectionId] = Date.now();
   }
 
+  function recordConnectionHealthResult(connectionId: string, healthy: boolean, error?: unknown) {
+    lastConnectionHealth.value[connectionId] = {
+      checkedAt: Date.now(),
+      healthy,
+      error: healthy || error === undefined ? undefined : connectionErrorMessage(error),
+    };
+  }
+
   function clearConnectionHealthCheck(connectionId: string) {
-    if (!lastConnectionHealthCheckAt.value[connectionId]) return;
+    if (!lastConnectionHealthCheckAt.value[connectionId] && !lastConnectionHealth.value[connectionId] && !runtimeConnectionDiagnostics.value[connectionId]) return;
     delete lastConnectionHealthCheckAt.value[connectionId];
+    delete lastConnectionHealth.value[connectionId];
+    delete runtimeConnectionDiagnostics.value[connectionId];
   }
 
   function hasRecentConnectionHealthCheck(connectionId: string) {
@@ -2131,11 +2145,13 @@ export const useConnectionStore = defineStore("connection", () => {
       try {
         await withConnectionHealthTimeout(connectionId, api.checkConnectionHealth(connectionId));
         markConnectionHealthChecked(connectionId);
+        recordConnectionHealthResult(connectionId, true);
         return;
-      } catch {
+      } catch (error) {
         // Backend pool is dead — remove from connectedIds and reconnect
         connectedIds.value.delete(connectionId);
         clearConnectionHealthCheck(connectionId);
+        recordConnectionHealthResult(connectionId, false, error);
         if (activeConnectionId.value === connectionId) activeConnectionId.value = null;
       }
     }
@@ -2234,13 +2250,31 @@ export const useConnectionStore = defineStore("connection", () => {
 
   function getConnectionLifecycleDiagnostics(connectionId: string) {
     const config = getConfig(connectionId);
+    const runtime = runtimeConnectionDiagnostics.value[connectionId];
     return connectionLifecycleDiagnostics({
       connectionId,
       dbType: config?.db_type,
       connected: connectedIds.value.has(connectionId),
       connecting: connectingIds.value.has(connectionId),
       lastError: connectionErrors.value[connectionId],
+      activeQueryCount: runtime?.activeQueryCount,
+      poolKeys: runtime?.poolKeys,
+      lastHealth: lastConnectionHealth.value[connectionId],
     });
+  }
+
+  async function loadConnectionLifecycleDiagnostics(connectionId: string) {
+    try {
+      runtimeConnectionDiagnostics.value[connectionId] = await api.connectionRuntimeDiagnostics(connectionId);
+    } catch (error) {
+      // Diagnostics are best-effort: a failed snapshot must not hide the
+      // existing connection error or prevent users from copying local state.
+      // Never report an older runtime snapshot as if it described the current
+      // pool after this fresh read failed.
+      delete runtimeConnectionDiagnostics.value[connectionId];
+      console.debug("[DBX][connection:diagnostics-unavailable]", { connectionId, error });
+    }
+    return getConnectionLifecycleDiagnostics(connectionId);
   }
 
   function setBeforeConnectHandler(handler: BeforeConnectHandler | null) {
@@ -2830,7 +2864,7 @@ export const useConnectionStore = defineStore("connection", () => {
             }
           }
 
-          const schemas = sortSidebarSchemaInfos(await api.listSchemaInfos(connectionId, database));
+          const schemas = sortSidebarSchemaInfos(await withMetadataLoadTimeout(connectionId, api.listSchemaInfos(connectionId, database), "schemas"));
           const visibleSchemaNames = new Set(
             filterSchemaNamesForConnection(
               schemas.map((schema) => schema.name),
@@ -2889,7 +2923,7 @@ export const useConnectionStore = defineStore("connection", () => {
       }
 
       const config = getConfig(connectionId);
-      const schemas = filterSchemaNamesForConnection(await api.listSchemas(connectionId, database), config, database);
+      const schemas = filterSchemaNamesForConnection(await withMetadataLoadTimeout(connectionId, api.listSchemas(connectionId, database), "schemas"), config, database);
       const children = buildSqlServerDatabaseTreeNodes(connectionId, database, schemas);
       if (isSidebarSearchQueryChanged(options)) return;
       setChildren(node, children);
@@ -2912,7 +2946,7 @@ export const useConnectionStore = defineStore("connection", () => {
       if (useCachedChildren(node, options)) return;
       const config = getConfig(connectionId);
       const database = sqlServerLinkedRuntimeDatabase(config);
-      const linkedServers = await api.listSqlServerLinkedServers(connectionId);
+      const linkedServers = await withMetadataLoadTimeout(connectionId, api.listSqlServerLinkedServers(connectionId), "linked servers");
       setChildren(
         node,
         linkedServers.map((server) => ({
@@ -2944,7 +2978,7 @@ export const useConnectionStore = defineStore("connection", () => {
     try {
       await ensureConnected(connectionId);
       if (useCachedChildren(node, options)) return;
-      const catalogs = await api.listSqlServerLinkedServerCatalogs(connectionId, server);
+      const catalogs = await withMetadataLoadTimeout(connectionId, api.listSqlServerLinkedServerCatalogs(connectionId, server), "linked server catalogs");
       const database = node.database || sqlServerLinkedRuntimeDatabase(getConfig(connectionId));
       setChildren(
         node,
@@ -2977,7 +3011,7 @@ export const useConnectionStore = defineStore("connection", () => {
     try {
       await ensureConnected(node.connectionId);
       if (useCachedChildren(node, options)) return;
-      const schemas = await api.listSqlServerLinkedServerSchemas(node.connectionId, node.linkedServer, node.linkedCatalog);
+      const schemas = await withMetadataLoadTimeout(node.connectionId, api.listSqlServerLinkedServerSchemas(node.connectionId, node.linkedServer, node.linkedCatalog), "linked server schemas");
       const database = node.database || sqlServerLinkedRuntimeDatabase(getConfig(node.connectionId));
       setChildren(
         node,
@@ -3749,7 +3783,7 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
-      const columns = await api.getColumns(connectionId, database, querySchema, table, catalog);
+      const columns = await withMetadataLoadTimeout(connectionId, api.getColumns(connectionId, database, querySchema, table, catalog), "columns");
       setChildren(
         node,
         columns.map((col) => ({
@@ -3786,7 +3820,7 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
-      const indexes = await api.listIndexes(connectionId, database, querySchema, table, catalog);
+      const indexes = await withMetadataLoadTimeout(connectionId, api.listIndexes(connectionId, database, querySchema, table, catalog), "indexes");
       setChildren(
         node,
         indexes.map((idx) => ({
@@ -3823,7 +3857,7 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
-      const fkeys = await api.listForeignKeys(connectionId, database, querySchema, table, catalog);
+      const fkeys = await withMetadataLoadTimeout(connectionId, api.listForeignKeys(connectionId, database, querySchema, table, catalog), "foreign keys");
       const cacheKey = `${connectionId}:${database}:${schema || ""}:${table}`;
       completionForeignKeysCache.value[cacheKey] = fkeys;
       evictOldestCacheEntries(completionForeignKeysCache.value, COMPLETION_CACHE_MAX);
@@ -3864,7 +3898,7 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
-      const triggers = await api.listTriggers(connectionId, database, querySchema, table, catalog);
+      const triggers = await withMetadataLoadTimeout(connectionId, api.listTriggers(connectionId, database, querySchema, table, catalog), "triggers");
       setChildren(
         node,
         triggers.map((tr) => ({
@@ -5404,6 +5438,7 @@ export const useConnectionStore = defineStore("connection", () => {
     ensureConnected,
     forceClearPoolsAndReconnect,
     getConnectionLifecycleDiagnostics,
+    loadConnectionLifecycleDiagnostics,
     isTreeNodeChildrenLoaded,
     releaseCollapsedTreeNodeChildren,
     setBeforeConnectHandler,

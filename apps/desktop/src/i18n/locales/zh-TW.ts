@@ -390,6 +390,8 @@ export default withEnglishFallback({
     queryTimeout: "查詢逾時（秒）",
     idleTimeout: "閒置逾時（秒）",
     keepaliveInterval: "保持連線間隔（秒）",
+    keepaliveDisabledHint: "已關閉保持連線。VPN、NAT、防火牆或裝置休眠可能會靜默中斷閒置連線。",
+    copyDiagnostics: "複製診斷資訊",
     readOnly: "唯讀模式",
     readOnlyHint: "阻止所有寫入操作（INSERT、UPDATE、DELETE 等）",
     readOnlyBadge: "唯讀",

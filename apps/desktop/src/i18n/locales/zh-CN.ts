@@ -439,6 +439,8 @@ export default withEnglishFallback({
     queryTimeout: "查询超时（秒）",
     idleTimeout: "空闲超时（秒）",
     keepaliveInterval: "保持连接间隔（秒）",
+    keepaliveDisabledHint: "已关闭保持连接。VPN、NAT、防火墙或设备休眠可能会静默断开空闲连接。",
+    copyDiagnostics: "复制诊断信息",
     readOnly: "只读模式",
     readOnlyHint: "阻止所有写操作（INSERT、UPDATE、DELETE 等）",
     readOnlyBadge: "只读",

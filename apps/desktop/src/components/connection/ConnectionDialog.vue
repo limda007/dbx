@@ -5577,6 +5577,10 @@ function openExternalUrl(url: string) {
                     <Switch v-model="keepaliveEnabled" />
                     <Input v-model.number="form.keepalive_interval_secs" type="number" min="1" max="3600" step="1" class="flex-1" :disabled="!keepaliveEnabled" />
                   </div>
+                  <div v-if="!keepaliveEnabled" class="col-span-3 col-start-2 -mt-2 flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-300">
+                    <ShieldAlert class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>{{ t("connection.keepaliveDisabledHint") }}</span>
+                  </div>
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.readOnly") }}</Label>

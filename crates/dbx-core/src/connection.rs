@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use mysql_async::prelude::Queryable;
 use mysql_async::Row as MysqlRow;
+use serde::Serialize;
 
 use crate::agent_connection::{
     agent_connect_params, h2_file_path_from_jdbc_url, is_h2_file_connection, mongo_legacy_error_with_auth_hint,
@@ -226,6 +227,18 @@ struct PoolActivity {
 struct ConnectionAttemptState {
     server_attempt: u64,
     client_attempt: Option<u64>,
+}
+
+/// A privacy-safe runtime snapshot for one configured connection.
+///
+/// This intentionally excludes SQL text, credentials, and execution IDs. It is
+/// used only when a user requests diagnostics from the connection error UI.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionRuntimeDiagnostics {
+    pub connection_id: String,
+    pub active_query_count: usize,
+    pub pool_keys: Vec<String>,
 }
 
 impl PoolActivity {
@@ -846,6 +859,29 @@ impl AppState {
     /// Whether a pool key is currently registered (no `PoolKind` exposure).
     pub async fn has_pool(&self, pool_key: &str) -> bool {
         self.connections.read().await.contains_key(pool_key)
+    }
+
+    /// Return a point-in-time, privacy-safe diagnostic snapshot for one connection.
+    ///
+    /// Pool keys are resolved through [`config_for_pool_key`] instead of a string
+    /// prefix check so connection IDs that share a prefix (or contain `:`) remain
+    /// correctly isolated.
+    pub async fn connection_runtime_diagnostics(&self, connection_id: &str) -> ConnectionRuntimeDiagnostics {
+        let pool_keys = {
+            let connections = self.connections.read().await;
+            connections.keys().cloned().collect::<Vec<_>>()
+        };
+        let configs = self.configs.read().await;
+        let mut pool_keys = pool_keys
+            .into_iter()
+            .filter(|pool_key| config_for_pool_key(pool_key, &configs).is_some_and(|config| config.id == connection_id))
+            .collect::<Vec<_>>();
+        pool_keys.sort();
+
+        let active_query_count =
+            self.running_queries.diagnostics().active_by_connection.get(connection_id).copied().unwrap_or_default();
+
+        ConnectionRuntimeDiagnostics { connection_id: connection_id.to_string(), active_query_count, pool_keys }
     }
 
     /// Register a Message Queue admin marker pool (tests / fixtures).
@@ -3589,6 +3625,7 @@ mod tests {
         DatabaseType, HttpTunnelConfig, ProxyTunnelConfig, ProxyType, SshTunnelConfig, TransportLayerConfig,
     };
     use crate::query;
+    use crate::query_cancel::RunningTaskMetadata;
     use crate::schema;
     use crate::storage::Storage;
     use std::time::{Duration, Instant};
@@ -4026,6 +4063,42 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
         (AppState::new(storage), dir)
+    }
+
+    #[tokio::test]
+    async fn runtime_diagnostics_scope_pool_keys_and_active_queries_to_one_connection() {
+        let (state, dir) = test_app_state().await;
+        let config = mysql_config(Some("main"));
+        let mut colliding_config = mysql_config(Some("main"));
+        colliding_config.id = "conn:other".to_string();
+
+        {
+            let mut configs = state.configs.write().await;
+            configs.insert(config.id.clone(), config);
+            configs.insert(colliding_config.id.clone(), colliding_config);
+        }
+        {
+            let mut pools = state.connections.write().await;
+            pools.insert("conn".to_string(), PoolKind::MessageQueue);
+            pools.insert("conn:main".to_string(), PoolKind::MessageQueue);
+            pools.insert("conn:other".to_string(), PoolKind::MessageQueue);
+            pools.insert("conn:other:main".to_string(), PoolKind::MessageQueue);
+            pools.insert("unconfigured".to_string(), PoolKind::MessageQueue);
+        }
+        let _running = state
+            .running_queries
+            .register_task("exec-1".to_string(), RunningTaskMetadata::query("conn", "main", Some("tab-1".to_string())));
+
+        let diagnostics = state.connection_runtime_diagnostics("conn").await;
+
+        assert_eq!(diagnostics.connection_id, "conn");
+        assert_eq!(diagnostics.active_query_count, 1);
+        assert_eq!(diagnostics.pool_keys, vec!["conn", "conn:main"]);
+        let json = serde_json::to_string(&diagnostics).unwrap();
+        assert!(!json.contains("exec-1"));
+        assert!(!json.contains("tab-1"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn touch_executable(path: &std::path::Path) {

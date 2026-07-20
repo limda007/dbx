@@ -31,9 +31,11 @@ All lifecycle stages emit through `connection_lifecycle::log_stage`:
 | --- | --- |
 | `ensureConnected` | Backend `connect` / register base pool |
 | `pool.checkout` | Waiting for a free pool handle (PG + MySQL hot paths) |
+| `pool.recycle` | Reserved for an explicit pool-recycle hook. It is not emitted for a generic `pool.get()` because that operation also includes wait/create work. |
 | `ping` | Budgeted health probe (`SELECT 1` / MySQL ping) |
 | `schema.set` | PostgreSQL `SET search_path` (and related) |
 | `query.execute` | SQL execution wrapper around `do_execute` |
+| `result.fetch` | Agent or external-driver cursor-page fetch (`result_session_id`); this is distinct from the initial query execution. |
 | `cancel` | User cancel / kill path (`RunningQueries::cancel`, PG cancel packet, MySQL `KILL QUERY`) |
 | `cleanup` | Pool close under cleanup budget |
 
@@ -90,3 +92,5 @@ Do **not** treat the first `cancel:accepted` as “server cancel succeeded”.
 ## Frontend notes
 
 UI timeouts (ensureConnected health 5s, cancel 10s, connect attempt budget) live in `apps/desktop/src/lib/connection/lifecycleClient.ts`. They complement backend stage logs: if the UI already cleared `isExecuting` but backend still logs `query.execute:start`, the backend task may still be winding down under cancel/cleanup budgets.
+
+When a connection error popover is visible, **Copy diagnostics** fetches a point-in-time backend snapshot and combines it with local state. The copied text includes active-query count and pool keys, but intentionally excludes SQL, execution IDs, credentials, and connection configuration.

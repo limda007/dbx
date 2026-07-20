@@ -7,6 +7,7 @@ import {
   connectionAttemptTimeoutMs,
   connectionHealthCheckTimeoutMs,
   connectionHealthTimeoutMessage,
+  formatConnectionLifecycleDiagnostics,
   connectionLifecycleDiagnostics,
   withCancelQueryTimeout,
   withEnsureConnectedHealthTimeout,
@@ -77,5 +78,46 @@ describe("lifecycleClient timeout policy", () => {
       connecting: true,
       lastError: "connection refused",
     });
+  });
+
+  it("formats a copyable diagnostics snapshot without query text", () => {
+    const diagnostics = connectionLifecycleDiagnostics({
+      connectionId: "pg-1",
+      dbType: "postgres",
+      connected: false,
+      lastError: "connection refused",
+      activeQueryCount: 2,
+      poolKeys: ["pg-1:app", "pg-1:app:session:tab-1"],
+      lastHealth: {
+        checkedAt: Date.UTC(2026, 6, 16, 8, 30, 0),
+        healthy: false,
+        error: "connection timed out",
+      },
+    });
+
+    expect(formatConnectionLifecycleDiagnostics(diagnostics)).toBe(
+      ["connectionId: pg-1", "dbType: postgres", "state: disconnected", "activeQueryCount: 2", "poolKeys: pg-1:app, pg-1:app:session:tab-1", "lastHealth: failed at 2026-07-16T08:30:00.000Z", "lastHealthError: timed out", "lastError: connection refused"].join("\n"),
+    );
+  });
+
+  it("redacts driver errors from copied diagnostics", () => {
+    const text = formatConnectionLifecycleDiagnostics(
+      connectionLifecycleDiagnostics({
+        connectionId: "pg-1",
+        connected: false,
+        lastError: "query failed: SELECT * FROM customers WHERE api_token = 'sensitive-token'",
+        lastHealth: {
+          checkedAt: Date.UTC(2026, 6, 16, 8, 30, 0),
+          healthy: false,
+          error: "jdbc:postgresql://alice:super-secret@db.example/app?password=super-secret",
+        },
+      }),
+    );
+
+    expect(text).toContain("lastHealthError: authentication failed");
+    expect(text).toContain("lastError: connection error");
+    expect(text).not.toContain("SELECT");
+    expect(text).not.toContain("sensitive-token");
+    expect(text).not.toContain("super-secret");
   });
 });

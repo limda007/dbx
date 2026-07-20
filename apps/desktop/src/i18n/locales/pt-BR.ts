@@ -390,6 +390,8 @@ export default withEnglishFallback({
     queryTimeout: "Timeout de Consulta (segundos)",
     idleTimeout: "Timeout de Inatividade (segundos)",
     keepaliveInterval: "Intervalo de keepalive (segundos)",
+    keepaliveDisabledHint: "O keepalive está desativado. VPNs, NATs, firewalls ou dispositivos em suspensão podem encerrar conexões ociosas silenciosamente.",
+    copyDiagnostics: "Copiar diagnóstico",
     readOnly: "Somente leitura",
     readOnlyHint: "Bloquear todas as operações de escrita (INSERT, UPDATE, DELETE, etc.)",
     readOnlyBadge: "Somente leitura",

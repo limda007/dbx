@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::Json;
-use dbx_core::connection::AppState;
+use dbx_core::connection::ConnectionRuntimeDiagnostics;
 use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo};
 use serde::Deserialize;
 
@@ -22,6 +22,12 @@ pub struct ConnectRequest {
 pub struct DisconnectRequest {
     pub connection_id: String,
     pub client_attempt: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionRuntimeDiagnosticsRequest {
+    pub connection_id: String,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +157,13 @@ pub async fn check_connection_health(
 ) -> Result<Json<()>, AppError> {
     state.app.check_connection_health(&body.connection_id).await.map_err(AppError)?;
     Ok(Json(()))
+}
+
+pub async fn connection_runtime_diagnostics(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ConnectionRuntimeDiagnosticsRequest>,
+) -> Result<Json<ConnectionRuntimeDiagnostics>, AppError> {
+    Ok(Json(state.app.connection_runtime_diagnostics(&body.connection_id).await))
 }
 
 pub async fn connection_identifier_quote(

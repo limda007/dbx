@@ -1,5 +1,6 @@
 import type {
   ConnectionConfig,
+  ConnectionRuntimeDiagnostics,
   ConnectionTestResult,
   DatabaseConnectionInfo,
   DatabaseInfo,
@@ -248,6 +249,10 @@ export async function disconnectDb(connectionId: string, clientAttempt?: number)
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return post("/api/connection/check-health", { connectionId });
+}
+
+export async function connectionRuntimeDiagnostics(connectionId: string): Promise<ConnectionRuntimeDiagnostics> {
+  return post("/api/connection/runtime-diagnostics", { connectionId });
 }
 
 export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {

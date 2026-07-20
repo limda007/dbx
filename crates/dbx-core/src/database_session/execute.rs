@@ -38,6 +38,59 @@ pub(crate) enum ExecuteSqlError {
     Unlogged(String),
 }
 
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{result_fetch_stage_log, result_fetch_terminal_outcome};
+    use crate::connection_lifecycle::{format_stage_log, StageLogContext, StageOutcome};
+    use crate::query::QUERY_CANCELED;
+
+    #[test]
+    fn result_fetch_stage_logs_keep_timeout_context_and_terminal_outcome() {
+        let context = StageLogContext::for_pool(Some("conn:app"), Some("exec-1"), Some("postgres"));
+
+        let start = format_stage_log(&result_fetch_stage_log(
+            StageOutcome::Start,
+            0,
+            Some(Duration::from_secs(8)),
+            context,
+            None,
+        ));
+        let done = format_stage_log(&result_fetch_stage_log(
+            StageOutcome::Done,
+            12,
+            Some(Duration::from_secs(8)),
+            context,
+            None,
+        ));
+        let cancelled = format_stage_log(&result_fetch_stage_log(StageOutcome::Cancelled, 13, None, context, None));
+        let error = format_stage_log(&result_fetch_stage_log(
+            StageOutcome::Error,
+            14,
+            Some(Duration::from_secs(8)),
+            context,
+            Some("driver request failed"),
+        ));
+
+        assert_eq!(start, "[db:result.fetch:start] elapsed_ms=0 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app db_type=postgres");
+        assert_eq!(done, "[db:result.fetch:done] elapsed_ms=12 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app db_type=postgres");
+        assert_eq!(cancelled, "[db:result.fetch:cancelled] elapsed_ms=13 trace_id=exec-1 connection_id=conn pool_key=conn:app db_type=postgres");
+        assert_eq!(error, "[db:result.fetch:error] elapsed_ms=14 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app db_type=postgres error=driver request failed");
+    }
+
+    #[test]
+    fn result_fetch_terminal_outcome_matches_the_executed_fetch_result() {
+        assert_eq!(result_fetch_terminal_outcome(&Ok::<(), String>(())), (StageOutcome::Done, None));
+
+        let cancelled: Result<(), String> = Err(QUERY_CANCELED.to_string());
+        assert_eq!(result_fetch_terminal_outcome(&cancelled), (StageOutcome::Cancelled, None));
+
+        let failed: Result<(), String> = Err("driver request failed".to_string());
+        assert_eq!(result_fetch_terminal_outcome(&failed), (StageOutcome::Error, Some("driver request failed")));
+    }
+}
+
 impl From<String> for ExecuteSqlError {
     fn from(value: String) -> Self {
         Self::Unlogged(value)
@@ -60,6 +113,49 @@ impl ExecuteSqlError {
             Self::AlreadyLogged(m) | Self::Unlogged(m) => m,
         }
     }
+}
+
+fn result_fetch_stage_log<'a>(
+    outcome: connection_lifecycle::StageOutcome,
+    elapsed_ms: u128,
+    timeout: Option<Duration>,
+    context: connection_lifecycle::StageLogContext<'a>,
+    error: Option<&'a str>,
+) -> connection_lifecycle::StageLog<'a> {
+    let mut log =
+        connection_lifecycle::StageLog::new(connection_lifecycle::LifecycleStage::ResultFetch, outcome, elapsed_ms)
+            .with_context(context);
+    if let Some(timeout) = timeout {
+        log = log.with_timeout(timeout);
+    }
+    if let Some(error) = error {
+        log = log.with_error(error);
+    }
+    log
+}
+
+fn result_fetch_terminal_outcome<T>(result: &Result<T, String>) -> (connection_lifecycle::StageOutcome, Option<&str>) {
+    match result {
+        Ok(_) => (connection_lifecycle::StageOutcome::Done, None),
+        Err(error) if error == QUERY_CANCELED => (connection_lifecycle::StageOutcome::Cancelled, None),
+        Err(error) => (connection_lifecycle::StageOutcome::Error, Some(error.as_str())),
+    }
+}
+
+fn log_result_fetch_terminal(
+    result: &Result<db::QueryResult, String>,
+    started: Instant,
+    timeout: Option<Duration>,
+    context: connection_lifecycle::StageLogContext<'_>,
+) {
+    let (outcome, error) = result_fetch_terminal_outcome(result);
+    connection_lifecycle::log_stage(result_fetch_stage_log(
+        outcome,
+        started.elapsed().as_millis(),
+        timeout,
+        context,
+        error,
+    ));
 }
 
 /// Run SQL against the pool registered at `pool_key`.
@@ -469,6 +565,17 @@ pub(crate) async fn execute_sql(
                 );
                 return Err(ExecuteSqlError::AlreadyLogged(canceled_error()));
             }
+            let is_result_fetch = options.result_session_id.is_some();
+            let result_fetch_started = Instant::now();
+            if is_result_fetch {
+                connection_lifecycle::log_stage(result_fetch_stage_log(
+                    connection_lifecycle::StageOutcome::Start,
+                    0,
+                    rpc_timeout,
+                    execute_log_context,
+                    None,
+                ));
+            }
             let cancel_for_agent = cancel_token.clone();
             let options = options.clone();
             let result = async move {
@@ -499,6 +606,9 @@ pub(crate) async fn execute_sql(
             }
             .await
             .map(|result| truncate_result_with_max_rows(result, max_rows));
+            if is_result_fetch {
+                log_result_fetch_terminal(&result, result_fetch_started, rpc_timeout, execute_log_context);
+            }
             if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED) {
                 state.remove_pool_by_key(pool_key).await;
             }
@@ -543,9 +653,20 @@ pub(crate) async fn execute_sql(
             let database = database.unwrap_or_else(|| config.effective_database().unwrap_or("")).to_string();
             let max_rows = options.max_rows;
             let plugin_timeout = query_timeout;
+            let is_result_fetch = options.result_session_id.is_some();
+            let result_fetch_started = Instant::now();
             let options = options.clone();
             drop(connections);
-            wait_for_query_opt(cancel_token, query_timeout, async move {
+            if is_result_fetch {
+                connection_lifecycle::log_stage(result_fetch_stage_log(
+                    connection_lifecycle::StageOutcome::Start,
+                    0,
+                    plugin_timeout,
+                    execute_log_context,
+                    None,
+                ));
+            }
+            let result = wait_for_query_opt(cancel_token, query_timeout, async move {
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = external_driver_fetch_query_page_params(
                         config.as_ref(),
@@ -564,7 +685,11 @@ pub(crate) async fn execute_sql(
                 }
             })
             .await
-            .map(|result| truncate_result_with_max_rows(result, max_rows))
+            .map(|result| truncate_result_with_max_rows(result, max_rows));
+            if is_result_fetch {
+                log_result_fetch_terminal(&result, result_fetch_started, plugin_timeout, execute_log_context);
+            }
+            result
         }
     };
 

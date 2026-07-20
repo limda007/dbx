@@ -188,6 +188,12 @@ export interface ConnectionTestResult {
   databaseInfo?: DatabaseConnectionInfo;
 }
 
+export interface ConnectionRuntimeDiagnostics {
+  connectionId: string;
+  activeQueryCount: number;
+  poolKeys: string[];
+}
+
 export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig);
 
 /**
