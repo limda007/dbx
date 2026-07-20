@@ -17,7 +17,7 @@ use crate::query::{
     apply_oceanbase_mysql_session_timeout, canceled_error, external_driver_fetch_query_page_params,
     external_driver_query_params, invoke_external_driver_query_page, is_canceled, schema_for_execution_context,
     should_discard_pool_after_error, sql_for_execution_context, truncate_result_with_max_rows, wait_for_query_opt,
-    QueryExecutionOptions, MAX_ROWS, QUERY_CANCELED,
+    QueryExecutionMode, QueryExecutionOptions, MAX_ROWS, QUERY_CANCELED,
 };
 
 #[cfg(feature = "duckdb-bundled")]
@@ -462,6 +462,7 @@ pub(crate) async fn execute_sql(
         PoolKind::SqlServer(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
+            let execution_mode = options.execution_mode;
             drop(connections);
             let mut client = match cancel_token.as_ref() {
                 Some(token) => tokio::select! {
@@ -481,13 +482,18 @@ pub(crate) async fn execute_sql(
                 },
                 None => client.lock().await,
             };
-            let result = wait_for_query_opt(
-                cancel_token,
-                query_timeout,
-                db::sqlserver::execute_query_with_max_rows(&mut client, sql, max_rows),
-            )
-            .await
-            .map(|result| truncate_result_with_max_rows(result, max_rows));
+            let execution = async {
+                if execution_mode == QueryExecutionMode::Simple {
+                    let mut results =
+                        db::sqlserver::execute_simple_batch_with_max_rows(&mut client, sql, max_rows).await?;
+                    Ok(results.remove(0))
+                } else {
+                    db::sqlserver::execute_query_with_max_rows(&mut client, sql, max_rows).await
+                }
+            };
+            let result = wait_for_query_opt(cancel_token, query_timeout, execution)
+                .await
+                .map(|result| truncate_result_with_max_rows(result, max_rows));
             drop(client);
             if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
                 state.remove_pool_by_key(pool_key).await;
@@ -526,7 +532,7 @@ pub(crate) async fn execute_sql(
             result
         }
         PoolKind::Redis(_) => Err("Use Redis-specific commands".to_string()),
-        PoolKind::MongoDb(_) => Err("Use MongoDB-specific commands".to_string()),
+        PoolKind::MongoDb(_) => Err(crate::query::MONGO_SHELL_COMMAND_HINT.to_string()),
         PoolKind::MessageQueue => Err("Use Message Queue-specific commands".to_string()),
         PoolKind::Nacos => Err("Use Nacos-specific commands".to_string()),
         PoolKind::InfluxDb(client) => {

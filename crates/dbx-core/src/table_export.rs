@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{task_client_session_id, AppState, PoolKind};
-use crate::csv_export::{escape_csv, format_csv, format_tsv, format_tsv_rows, value_to_csv_text};
+use crate::connection::{config_for_pool_key, task_client_session_id, AppState, MysqlMode, PoolKind};
+use crate::csv_export::{escape_csv, format_csv, format_tsv, format_tsv_rows, push_csv_text_value, value_to_csv_text};
 pub use crate::database_export::ExportStatus;
 use crate::database_export::{
     build_export_insert_statements, is_export_cancelled, is_internal_export_column, BuildExportInsertStatementsOptions,
@@ -74,10 +74,21 @@ pub struct TableExportProgress {
 /// Format rows as CSV text without a header row.
 /// Used for streaming subsequent pagination batches.
 fn format_csv_rows(rows: &[Vec<Value>]) -> String {
-    rows.iter()
-        .map(|row| row.iter().map(|cell| escape_csv(&value_to_csv_text(cell))).collect::<Vec<_>>().join(","))
-        .collect::<Vec<_>>()
-        .join("\n")
+    // 注意：该无表头批次路径的 Null 输出为 ""（带引号空串），与查询结果导出
+    // 及首批 format_csv 的裸空单元格语义不同，直写化必须保留该差异
+    let mut out = String::with_capacity(crate::csv_export::estimated_rows_capacity(rows));
+    for (row_index, row) in rows.iter().enumerate() {
+        if row_index > 0 {
+            out.push('\n');
+        }
+        for (cell_index, cell) in row.iter().enumerate() {
+            if cell_index > 0 {
+                out.push(',');
+            }
+            push_csv_text_value(&mut out, cell);
+        }
+    }
+    out
 }
 
 fn export_column_types(request: &TableExportRequest) -> Vec<String> {
@@ -285,6 +296,15 @@ async fn fetch_table_export_batch(
         *table_read_attempted = true;
         let sql = table_cursor_sql(request, db_type, col_names, primary_keys);
         let max_rows = request.row_limit.unwrap_or(i32::MAX as usize);
+        let timeout_secs = {
+            let configs = state.configs.read().await;
+            let query_timeout = config_for_pool_key(pool_key, &configs).map(|c| c.query_timeout_secs).unwrap_or(0);
+            if query_timeout == 0 {
+                None
+            } else {
+                Some(query_timeout)
+            }
+        };
         let params = AgentTableReadStartParams {
             sql,
             database: Some(request.database.clone()),
@@ -292,6 +312,7 @@ async fn fetch_table_export_batch(
             page_size: active_batch_size,
             max_rows,
             fetch_size: Some(active_batch_size),
+            timeout_secs,
         };
         let connections = state.connections.read().await;
         let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {

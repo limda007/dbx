@@ -132,6 +132,32 @@ pub fn duckdb_list_schemas_with_attached(
     Ok(schemas)
 }
 
+#[cfg(feature = "duckdb-bundled")]
+pub fn duckdb_object_source_with_attached(
+    con: &duckdb::Connection,
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: &db::ObjectSourceKind,
+    attached_names: &[String],
+) -> Result<String, String> {
+    if !matches!(object_type, db::ObjectSourceKind::View) {
+        return Err("DuckDB object source only supports views".to_string());
+    }
+
+    let database = duckdb_catalog_name(con, database, attached_names)?;
+    let mut stmt = con
+        .prepare("SELECT sql FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ?")
+        .map_err(|e| e.to_string())?;
+    let mut rows =
+        stmt.query_map((database.as_str(), schema, name), |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+
+    match rows.next() {
+        Some(row) => row.map_err(|e| e.to_string()),
+        None => Err(format!("DuckDB view source not found: {database}.{schema}.{name}")),
+    }
+}
+
 /// Identifies quack catalogs by the storage-extension `type` that
 /// `duckdb_databases()` reports, rather than by the attach aliases parsed from
 /// the init script: `ATTACH 'quack:host:port'` without an `AS` alias gets a
@@ -2108,6 +2134,7 @@ async fn external_driver_presto_like_objects(
             name: table.name,
             object_type: table.table_type,
             schema: Some(schema.to_string()),
+            valid: None,
             signature: None,
             comment: table.comment,
             created_at: None,
@@ -2318,7 +2345,7 @@ mod tests {
     #[cfg(feature = "duckdb-bundled")]
     use super::{
         duckdb_attach_database, duckdb_completion_assistant_search, duckdb_list_databases,
-        duckdb_query_tables_in_database,
+        duckdb_object_source_with_attached, duckdb_query_tables_in_database,
     };
     use crate::models::connection::{ConnectionConfig, DatabaseType};
     use std::collections::HashMap;
@@ -2490,6 +2517,7 @@ mod tests {
             name: name.to_string(),
             object_type: object_type.to_string(),
             schema: Some("app".to_string()),
+            valid: None,
             signature: None,
             comment: None,
             created_at: None,
@@ -2840,6 +2868,83 @@ mod tests {
         let name = columns.iter().find(|column| column.name == "name").unwrap();
 
         assert_eq!(name.comment.as_deref(), Some("Display name"));
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[test]
+    fn duckdb_object_source_filters_by_schema_and_view_name() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "CREATE SCHEMA reporting; \
+             CREATE VIEW main.active_orders AS SELECT 'main' AS origin; \
+             CREATE VIEW reporting.active_orders AS SELECT 'reporting' AS origin;",
+        )
+        .unwrap();
+
+        let main_source =
+            duckdb_object_source_with_attached(&con, "main", "main", "active_orders", &db::ObjectSourceKind::View, &[])
+                .unwrap();
+        let reporting_source = duckdb_object_source_with_attached(
+            &con,
+            "main",
+            "reporting",
+            "active_orders",
+            &db::ObjectSourceKind::View,
+            &[],
+        )
+        .unwrap();
+
+        assert!(main_source.contains("'main'"));
+        assert!(reporting_source.contains("'reporting'"));
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[test]
+    fn duckdb_object_source_rejects_unsupported_or_missing_objects() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+
+        let unsupported = duckdb_object_source_with_attached(
+            &con,
+            "main",
+            "main",
+            "calculate_total",
+            &db::ObjectSourceKind::Function,
+            &[],
+        )
+        .unwrap_err();
+        let missing =
+            duckdb_object_source_with_attached(&con, "main", "main", "missing_view", &db::ObjectSourceKind::View, &[])
+                .unwrap_err();
+
+        assert_eq!(unsupported, "DuckDB object source only supports views");
+        assert!(missing.contains("DuckDB view source not found"));
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[test]
+    fn duckdb_catalog_view_source_can_replace_existing_view() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        con.execute_batch("CREATE VIEW active_orders AS SELECT 1 AS value;").unwrap();
+        let source =
+            duckdb_object_source_with_attached(&con, "main", "main", "active_orders", &db::ObjectSourceKind::View, &[])
+                .unwrap();
+        let edited_source = source.replace("SELECT 1", "SELECT 2");
+        assert_ne!(edited_source, source);
+
+        let statements = crate::object_source_sql::build_executable_object_source_statements(
+            crate::object_source_sql::EditableObjectSourceSqlInput {
+                database_type: DatabaseType::DuckDb,
+                object_type: db::ObjectSourceKind::View,
+                schema: Some("main".to_string()),
+                name: "active_orders".to_string(),
+                source: edited_source,
+            },
+        )
+        .unwrap();
+        con.execute_batch(&statements.join("\n")).unwrap();
+
+        let value = con.query_row("SELECT value FROM active_orders", [], |row| row.get::<_, i32>(0)).unwrap();
+        assert_eq!(value, 2);
     }
 
     #[cfg(feature = "duckdb-bundled")]
@@ -3207,6 +3312,7 @@ mod tests {
                 name: "ORDERS".to_string(),
                 object_type: "TABLE".to_string(),
                 schema: Some("DBX_TEST".to_string()),
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -3218,6 +3324,7 @@ mod tests {
                 name: "ORDERS_VIEW".to_string(),
                 object_type: "VIEW".to_string(),
                 schema: Some("DBX_TEST".to_string()),
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -3229,6 +3336,7 @@ mod tests {
                 name: "REFRESH_ORDERS".to_string(),
                 object_type: "PROCEDURE".to_string(),
                 schema: Some("DBX_TEST".to_string()),
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -3638,6 +3746,7 @@ async fn list_objects_once(
                         name: table.name,
                         object_type: table.table_type,
                         schema: None,
+                        valid: None,
                         signature: None,
                         comment: table.comment,
                         created_at: None,
@@ -4180,6 +4289,22 @@ pub async fn get_columns_core(
     .await
 }
 
+pub async fn get_sqlserver_column_metadata_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<db::sqlserver::SqlServerColumnMetadata>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        try_sqlserver!(connections, &pool_key, get_column_metadata, schema, table);
+        Err("SQL Server column metadata requires a native SQL Server connection".to_string())
+    })
+    .await
+}
+
 pub(crate) fn deduplicate_column_infos(columns: Vec<db::ColumnInfo>) -> Vec<db::ColumnInfo> {
     let mut result: Vec<db::ColumnInfo> = Vec::with_capacity(columns.len());
     for column in columns {
@@ -4631,9 +4756,12 @@ fn sqlite_object_type(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => "view",
         db::ObjectSourceKind::Procedure
         | db::ObjectSourceKind::Function
+        | db::ObjectSourceKind::Trigger
         | db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Package
-        | db::ObjectSourceKind::PackageBody => "routine",
+        | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody => "routine",
     }
 }
 
@@ -4642,9 +4770,12 @@ fn sqlserver_object_type_filter(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::View => "'V'",
         db::ObjectSourceKind::Procedure => "'P'",
         db::ObjectSourceKind::Function => "'FN','IF','TF','FS','FT'",
+        db::ObjectSourceKind::Trigger => "'TR'",
         db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody
         | db::ObjectSourceKind::MaterializedView => "''",
     }
 }
@@ -4766,7 +4897,11 @@ fn postgres_object_source_sql_inner(
                 sql_string(name)
             )
         }
-        db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => "SELECT NULL WHERE FALSE".to_string(),
+        db::ObjectSourceKind::Trigger
+        | db::ObjectSourceKind::Package
+        | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody => "SELECT NULL WHERE FALSE".to_string(),
     }
 }
 
@@ -4776,9 +4911,12 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
         db::ObjectSourceKind::MaterializedView => "MATERIALIZED_VIEW",
         db::ObjectSourceKind::Procedure => "PROCEDURE",
         db::ObjectSourceKind::Function => "FUNCTION",
+        db::ObjectSourceKind::Trigger => "TRIGGER",
         db::ObjectSourceKind::Sequence => "SEQUENCE",
         db::ObjectSourceKind::Package => "PACKAGE",
         db::ObjectSourceKind::PackageBody => "PACKAGE_BODY",
+        db::ObjectSourceKind::Type => "TYPE",
+        db::ObjectSourceKind::TypeBody => "TYPE_BODY",
     };
     if schema.trim().is_empty() {
         format!("SELECT DBMS_METADATA.GET_DDL({}, {}) FROM DUAL", sql_string(object_type), sql_string(name))
@@ -4792,9 +4930,10 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
     }
 }
 
-pub fn sqlite_object_source_sql(name: &str, kind: &db::ObjectSourceKind) -> String {
+pub fn sqlite_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
     format!(
-        "SELECT sql FROM sqlite_master WHERE type = {} AND name = {}",
+        "SELECT sql FROM {}.sqlite_master WHERE type = {} AND name = {}",
+        db::sqlite::sqlite_quote_schema_ident(schema),
         sql_string(sqlite_object_type(kind)),
         sql_string(name)
     )
@@ -4806,9 +4945,12 @@ pub fn mysql_object_source_sql(database: &str, name: &str, kind: &db::ObjectSour
         db::ObjectSourceKind::View => format!("SHOW CREATE VIEW {qualified_name}"),
         db::ObjectSourceKind::Procedure => format!("SHOW CREATE PROCEDURE {qualified_name}"),
         db::ObjectSourceKind::Function => format!("SHOW CREATE FUNCTION {qualified_name}"),
-        db::ObjectSourceKind::Sequence
+        db::ObjectSourceKind::Trigger
+        | db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody
         | db::ObjectSourceKind::MaterializedView => String::new(),
     }
 }
@@ -4882,6 +5024,8 @@ async fn get_object_source_once(
 ) -> Result<db::ObjectSource, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
+    #[cfg(feature = "duckdb-bundled")]
+    let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
     let source = {
         let connections = state.connections.read().await;
         if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
@@ -4948,8 +5092,30 @@ async fn get_object_source_once(
                 }
                 PoolKind::Postgres(pool) => postgres_object_source(pool, schema, name, &object_type, signature).await?,
                 PoolKind::Sqlite(pool) => first_string_cell(
-                    db::sqlite::execute_query(pool, &sqlite_object_source_sql(name, &object_type)).await?,
+                    db::sqlite::execute_query(pool, &sqlite_object_source_sql(schema, name, &object_type)).await?,
                 )?,
+                #[cfg(feature = "duckdb-bundled")]
+                PoolKind::DuckDb(con) => {
+                    let con = con.lock().map_err(|e| e.to_string())?;
+                    duckdb_object_source_with_attached(
+                        &con,
+                        database,
+                        schema,
+                        name,
+                        &object_type,
+                        &duckdb_attached_names,
+                    )?
+                }
+                #[cfg(feature = "duckdb-bundled")]
+                PoolKind::DuckDbWorker(client) => {
+                    let client = client.clone();
+                    let database = database.to_string();
+                    let schema = schema.to_string();
+                    let name = name.to_string();
+                    let object_type = object_type.clone();
+                    drop(connections);
+                    client.get_object_source(database, schema, name, object_type).await?
+                }
                 PoolKind::Rqlite(client) => {
                     return db::rqlite_driver::object_source(client, name, &object_type).await;
                 }
@@ -5024,6 +5190,7 @@ async fn oracle_agent_list_objects(
                 name,
                 object_type,
                 schema,
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -5753,15 +5920,14 @@ fn ensure_display_ddl_terminated(sql: String) -> String {
     }
 }
 
-pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, table: &str) -> Result<String, String> {
+pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, schema: &str, table: &str) -> Result<String, String> {
     let pool = pool.clone();
+    let schema = db::sqlite::sqlite_quote_schema_ident(schema);
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
-            conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [table], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| e.to_string())
+            let sql = format!("SELECT sql FROM {}.sqlite_master WHERE type='table' AND name=?1", schema);
+            conn.query_row(&sql, [table], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())
         })
     })
     .await

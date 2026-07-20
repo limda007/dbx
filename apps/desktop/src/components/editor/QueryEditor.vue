@@ -1,20 +1,23 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
-import { CaseLower, CaseUpper, Code2, FileCode, Pencil, PencilRuler, Play, Copy, Sparkles, Table2, TextSelect } from "@lucide/vue";
+import { CaseLower, CaseUpper, Code2, FileCode, Pencil, PencilRuler, Play, Copy, List, Search, Sparkles, Table2, TextSelect, Trash2 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { CompletionContext } from "@codemirror/autocomplete";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { search as cmSearch } from "@codemirror/search";
 import EditorSearchPanel from "./EditorSearchPanel.vue";
 import SqlExecutionTargetPicker from "./SqlExecutionTargetPicker.vue";
+import DelimitedListDialog from "./DelimitedListDialog.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { copyToClipboard, readTextFromClipboard } from "@/lib/common/clipboard";
 import { resolveExecutableSql, type SqlExecutionSnapshot, type SqlExecutionOverride, type SqlExecutionCandidate } from "@/lib/sql/sqlExecutionTarget";
 import { buildExecutionCandidates, hasMultipleExecutionTargets, supportsExecutionTargetPicker, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
 import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, executableStatementRangeStartingAt as executableStatementRangeStartingAtLine, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
 import { currentStatementFrameRangeTo, visualSqlColumnsWithInlineHints } from "@/lib/sql/currentStatementFrame";
-import { parseInsertValueHints } from "@/lib/sql/insertValueHints";
+import { expandToSqlStatementWindow, parseInsertValueHints } from "@/lib/sql/insertValueHints";
+import { insertValueHintColumnNames } from "@/lib/sql/insertValueHintColumns";
 import { formatSqlText, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
+import { blankLineDeletionChanges, replaceSelectedEditorText } from "@/lib/editor/queryEditorTextEdits";
 import { buildSqlInConditionFromPasteSource, insertTextForSqlInCondition } from "@/lib/sql/sqlInListPaste";
 import { resolveSqlSingleQuoteKeyAction } from "@/lib/sql/sqlQuoteCaret";
 import { formatMongoShellText } from "@/lib/mongo/mongoFormatter";
@@ -38,8 +41,8 @@ import { sqlCompletionContextFromSemantic } from "@/lib/sql/semantic/completion"
 import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
 import { mergeSqlSemanticReferenceAnalysis, resolveSqlSemanticNavigationTarget } from "@/lib/sql/semantic/references";
 import { buildElasticsearchCompletionItemsFromContext, getElasticsearchCompletionContext, getElasticsearchCompletionResultValidFor, shouldAutoOpenElasticsearchCompletion, type ElasticsearchCompletionItem } from "@/lib/elasticsearch/elasticsearchCompletion";
-import { buildMongoCompletionItemsFromContext, getMongoCompletionContext, getMongoCompletionResultValidFor, shouldAutoOpenMongoCompletion, type MongoCompletionItem } from "@/lib/mongo/mongoCompletion";
-import { resolveSqlCompletionTableLookupTarget } from "@/lib/sql/sqlCompletionLookupTarget";
+import { buildMongoCompletionItemsFromContext, getMongoCompletionContext, getMongoCompletionResultValidFor, mongoCompletionNeedsCollections, mongoCompletionNeedsFields, shouldAutoOpenMongoCompletion, type MongoCompletionItem } from "@/lib/mongo/mongoCompletion";
+import { resolveSqlCompletionRoutineLookupTarget, resolveSqlCompletionTableLookupTarget } from "@/lib/sql/sqlCompletionLookupTarget";
 import { extractIdentifierDetailsAt, isSqlKeyword, matchTable, mergeSqlObjectNavigationType, splitQualifiedIdentifier, sqlObjectHoverDetail, sqlObjectNavigationTarget, type SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { lineColumnToOffset, parseSqlErrorLocation } from "@/lib/sql/sqlDiagnostics";
 import {
@@ -53,7 +56,7 @@ import {
   type QueryEditorTableReferenceDropDetail,
   type QueryEditorTableReferencePayload,
 } from "@/lib/editor/queryEditorTableDrop";
-import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, createRunStatementButtonDom, loadEditorTheme, editorFontTheme, sqlCompletionTheme } from "@/lib/editor/editorThemes";
+import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, createRunStatementButtonDom, loadEditorTheme, editorFontTheme, sqlCompletionTheme, sqlSemanticHighlightTheme } from "@/lib/editor/editorThemes";
 import { clampEditorFontSize, createEditorZoomCommitScheduler, fontSizeFromGestureScale, fontSizeFromWheelDelta } from "@/lib/editor/editorZoom";
 import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
 import { trimmedSelectionLayer } from "@/lib/editor/codemirrorTrimmedSelectionLayer";
@@ -61,9 +64,11 @@ import { selectionMatchOccurrences } from "@/lib/editor/codemirrorSelectionMatch
 import { createInsertValueHintsExtension, requestInsertValueHintsRefresh } from "@/lib/editor/codemirrorInsertValueHints";
 import { focusEditorView } from "@/lib/editor/queryEditorFocus";
 import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect";
+import { sqlSemanticTableNameSpansForSyntaxTree } from "@/lib/editor/codemirrorSqlSemanticHighlight";
 import { startsQueryEditorRectangularSelection } from "@/lib/editor/queryEditorPointerSelection";
 import type { StatementExecutionMarker } from "@/lib/tabs/tabPresentation";
 import { isSchemaAware, isSingleDatabase, supportsSqlInListPaste } from "@/lib/database/databaseFeatureSupport";
+import { metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { usesLocalOnlyEditorCompletionMetadata, usesOnDemandOnlyEditorColumnMetadata } from "@/lib/metadata/completionMetadataPolicy";
 import { queryContextObjectActions, queryContextObjectRoute, queryTableCandidateAtSqlPosition, resolveQueryContextCandidateDatabase, resolveQueryContextObjectTarget, type QueryContextObjectAction } from "@/lib/sql/queryCursorTableTarget";
 import * as api from "@/lib/backend/api";
@@ -71,7 +76,7 @@ import { areSqlSemanticDiagnosticsEqual, buildSqlParserErrorDiagnostic, buildSql
 import { buildRedisSyntaxDiagnostics, shouldRunRedisDiagnostics } from "@/lib/redis/redisSyntaxDiagnostics";
 import { buildRedisCompletionItemsFromContext, getRedisCompletionContext, getRedisCompletionResultValidFor, shouldAutoOpenRedisCompletion, takesKeyArgument, type RedisCompletionItem } from "@/lib/redis/redisCompletion";
 import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject, SqlCompletionReferencedTable, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
-import type { DatabaseType, SqlReferenceAnalysis, SqlTableReference, SqlTextSpan } from "@/types/database";
+import type { CompletionAssistantObjectKind, DatabaseType, SqlReferenceAnalysis, SqlTableReference, SqlTextSpan } from "@/types/database";
 
 const props = defineProps<{
   modelValue: string;
@@ -80,6 +85,7 @@ const props = defineProps<{
   schema?: string;
   databaseType?: DatabaseType;
   dialect?: "mysql" | "postgres" | "sqlserver";
+  syntaxDialect?: "mysql" | "postgres" | "sqlserver";
   formatDialect?: SqlFormatDialect;
   formatRequestId?: number;
   executionError?: string;
@@ -201,6 +207,28 @@ const pickerCandidates = ref<SqlExecutionCandidate[]>([]);
 const pickerActiveIndex = ref(0);
 const pickerAnchor = ref<{ left: number; top: number }>();
 
+// Delimited list dialog state
+const delimitedListOpen = ref(false);
+const delimitedListSelectedText = ref("");
+
+function openDelimitedListDialog() {
+  if (props.readOnly) return;
+  if (!selectedSql.value.trim()) {
+    toast(t("editor.delimitedList.selectFirst"), 3000);
+    return;
+  }
+  delimitedListSelectedText.value = selectedSql.value;
+  delimitedListOpen.value = true;
+  focusEditor();
+}
+
+function applyDelimitedListResult(result: string) {
+  const currentView = view.value;
+  if (!currentView || props.readOnly) return;
+  if (!replaceSelectedEditorText(currentView, result)) return;
+  focusEditor();
+}
+
 const executeContextMenuLabel = computed(() => t(hasSelectedSql.value ? "editor.contextMenu.executeSelection" : "editor.contextMenu.executeCurrent"));
 
 interface EditorGestureEvent extends Event {
@@ -216,6 +244,8 @@ let wordWrapComp: import("@codemirror/state").Compartment | null = null;
 let vimModeComp: import("@codemirror/state").Compartment | null = null;
 let closeBracketsComp: import("@codemirror/state").Compartment | null = null;
 let sqlLanguageComp: import("@codemirror/state").Compartment | null = null;
+let sqlSemanticHighlightComp: import("@codemirror/state").Compartment | null = null;
+let sqlSignatureComp: import("@codemirror/state").Compartment | null = null;
 let codeMirrorCloseBrackets: typeof import("@codemirror/autocomplete").closeBrackets | null = null;
 let codeMirrorCloseBracketsKeymap: readonly import("@codemirror/view").KeyBinding[] | null = null;
 let readOnlyComp: import("@codemirror/state").Compartment | null = null;
@@ -233,6 +263,7 @@ let buildSqlDiagnosticExtension: (() => import("@codemirror/state").Extension) |
 let buildSqlSignatureExtension: (() => import("@codemirror/state").Extension) | null = null;
 let buildSqlCompletionExtension: (() => import("@codemirror/state").Extension) | null = null;
 let buildSqlLanguageExtension: (() => import("@codemirror/state").Extension) | null = null;
+let buildSqlSemanticHighlightExtension: (() => import("@codemirror/state").Extension) | null = null;
 let codeMirrorSnippetCompletion: typeof import("@codemirror/autocomplete").snippetCompletion;
 let codeMirrorCompletionStatus: typeof import("@codemirror/autocomplete").completionStatus | null = null;
 let codeMirrorAcceptCompletion: typeof import("@codemirror/autocomplete").acceptCompletion | null = null;
@@ -252,8 +283,18 @@ let codeMirrorSelectAll: typeof import("@codemirror/commands").selectAll | null 
 let codeMirrorInsertNewlineKeepIndent: typeof import("@codemirror/commands").insertNewlineKeepIndent | null = null;
 let codeMirrorToggleLineComment: typeof import("@codemirror/commands").toggleLineComment | null = null;
 let setSqlDiagnosticsEffect: import("@codemirror/state").StateEffectType<SqlSemanticDiagnostic[]> | null = null;
-let setPreviewRangeEffect: import("@codemirror/state").StateEffectType<{ from: number; to: number } | null> | null = null;
-let setResultSourceRangeEffect: import("@codemirror/state").StateEffectType<{ from: number; to: number } | null> | null = null;
+let setPreviewRangeEffect:
+  | import("@codemirror/state").StateEffectType<{
+      from: number;
+      to: number;
+    } | null>
+  | null = null;
+let setResultSourceRangeEffect:
+  | import("@codemirror/state").StateEffectType<{
+      from: number;
+      to: number;
+    } | null>
+  | null = null;
 let setStatementExecutionMarkersEffect: import("@codemirror/state").StateEffectType<StatementExecutionMarker[]> | null = null;
 let previewRangeComp: import("@codemirror/state").Compartment | null = null;
 let buildPreviewRangeExtension: (() => import("@codemirror/state").Extension) | null = null;
@@ -290,6 +331,7 @@ let cachedTables: SqlCompletionTable[] = [];
 let cachedCompletionObjects: SqlCompletionObject[] = [];
 // Persistent column cache keyed by "schema.table" or "table"
 const cachedColumnsByTable = new Map<string, SqlCompletionColumn[]>();
+const cachedInsertValueHintColumnsByTable = new Map<string, string[]>();
 const cachedForeignKeysByTable = new Map<string, SqlCompletionForeignKey[]>();
 const loadedColumnsByTable = new Set<string>();
 
@@ -400,12 +442,15 @@ function handleTab(view: EditorViewType): boolean {
   const line = state.doc.lineAt(sel.from);
   const before = line.text.slice(0, sel.from - line.from);
   if (/^\s*$/.test(before)) return codeMirrorIndentMore?.(view) ?? false;
-  dispatch(state.update(state.replaceSelection(editorIndentUnit()), { userEvent: "input.type" }));
+  dispatch(
+    state.update(state.replaceSelection(editorIndentUnit()), {
+      userEvent: "input.type",
+    }),
+  );
   return true;
 }
 
 interface RequestExecuteOptions {
-  forceCurrent?: boolean;
   ignoreSelection?: boolean;
 }
 
@@ -430,11 +475,6 @@ function requestExecuteFromView(currentView: EditorViewType, cursorPos: number, 
   const doc = currentView.state.doc.toString();
   const candidates = buildExecutionCandidates(doc, cursorPos, props.databaseType);
   if (candidates.length === 0) return false;
-  if (options.forceCurrent) {
-    const candidate = candidates.find((item) => item.kind === "cursor") ?? candidates[0];
-    emit("execute", candidate.sql);
-    return true;
-  }
   if (!settingsStore.editorSettings.showExecutionTargetPicker || !hasMultipleExecutionTargets(doc, props.databaseType)) {
     const preferredKind = settingsStore.editorSettings.executeMode === "current" ? "cursor" : "all";
     const candidate = candidates.find((item) => item.kind === preferredKind) ?? candidates[0];
@@ -562,12 +602,32 @@ function syncContextMenuStateAtEvent(currentView: EditorViewType, event: MouseEv
 
   const sql = currentView.state.doc.toString();
   if (!props.connectionId || props.database == null) {
-    const candidate = queryTableCandidateAtSqlPosition({ connectionId: "", database: props.database ?? "", schema: props.schema, databaseType: props.databaseType, sql, position: pos });
-    contextObjectTarget.value = candidate ? { name: candidate.tableName, database: candidate.database, schema: candidate.schema } : null;
+    const candidate = queryTableCandidateAtSqlPosition({
+      connectionId: "",
+      database: props.database ?? "",
+      schema: props.schema,
+      databaseType: props.databaseType,
+      sql,
+      position: pos,
+    });
+    contextObjectTarget.value = candidate
+      ? {
+          name: candidate.tableName,
+          database: candidate.database,
+          schema: candidate.schema,
+        }
+      : null;
     return;
   }
 
-  const parsedCandidate = queryTableCandidateAtSqlPosition({ connectionId: props.connectionId, database: props.database, schema: props.schema, databaseType: props.databaseType, sql, position: pos });
+  const parsedCandidate = queryTableCandidateAtSqlPosition({
+    connectionId: props.connectionId,
+    database: props.database,
+    schema: props.schema,
+    databaseType: props.databaseType,
+    sql,
+    position: pos,
+  });
   if (!parsedCandidate) {
     contextObjectTarget.value = null;
     return;
@@ -644,7 +704,11 @@ function selectedRangeAtPointer(currentView: EditorViewType, event: MouseEvent) 
   if (range.empty) return null;
   const pos = currentView.posAtCoords({ x: event.clientX, y: event.clientY }, false);
   if (pos == null || pos < range.from || pos > range.to) return null;
-  return { from: range.from, to: range.to, text: currentView.state.sliceDoc(range.from, range.to) };
+  return {
+    from: range.from,
+    to: range.to,
+    text: currentView.state.sliceDoc(range.from, range.to),
+  };
 }
 
 function moveOrCopySelectionToPointer(currentView: EditorViewType, selection: { from: number; to: number; text: string }, event: MouseEvent) {
@@ -750,9 +814,15 @@ function startEditorSelectionDrag(currentView: EditorViewType, event: MouseEvent
       moveOrCopySelectionToPointer(currentView, selection, upEvent);
       return;
     }
-    const pos = currentView.posAtCoords({ x: upEvent.clientX, y: upEvent.clientY });
+    const pos = currentView.posAtCoords({
+      x: upEvent.clientX,
+      y: upEvent.clientY,
+    });
     if (pos != null) {
-      currentView.dispatch({ selection: { anchor: pos }, userEvent: "select.pointer" });
+      currentView.dispatch({
+        selection: { anchor: pos },
+        userEvent: "select.pointer",
+      });
       currentView.focus();
     }
   };
@@ -820,7 +890,11 @@ function convertSelectedSqlCase(mode: SelectionCaseMode): boolean {
   });
 
   if (!transaction.changes.empty) {
-    currentView.dispatch({ ...transaction, scrollIntoView: true, userEvent: "input" });
+    currentView.dispatch({
+      ...transaction,
+      scrollIntoView: true,
+      userEvent: "input",
+    });
     focusEditor();
     return true;
   }
@@ -840,7 +914,12 @@ async function pasteClipboardAsSqlInCondition(): Promise<boolean> {
     try {
       source = await readTextFromClipboard();
     } catch (e: any) {
-      toast(t("editor.exPasteClipboardReadFailed", { message: e?.message || String(e) }), 5000);
+      toast(
+        t("editor.exPasteClipboardReadFailed", {
+          message: e?.message || String(e),
+        }),
+        5000,
+      );
       focusEditor();
       return false;
     }
@@ -871,6 +950,26 @@ async function pasteClipboardAsSqlInCondition(): Promise<boolean> {
   return true;
 }
 
+function deleteEmptyLines() {
+  const currentView = view.value;
+  if (!currentView || props.readOnly) return;
+
+  const state = currentView.state;
+  const selection = state.selection.main;
+  const changes = blankLineDeletionChanges(state.doc, selection);
+  if (changes.length === 0) return;
+
+  currentView.dispatch({
+    changes,
+    scrollIntoView: true,
+  });
+  focusEditor();
+}
+
+function openFindReplaceFromContextMenu() {
+  openSearch();
+}
+
 function emitContextObjectAction(action: QueryContextObjectAction) {
   if (!contextObjectTarget.value) return;
   const route = queryContextObjectRoute(action, contextObjectTarget.value);
@@ -895,15 +994,40 @@ function contextObjectMenuItem(action: QueryContextObjectAction): ContextMenuIte
   const disabled = !contextObjectTarget.value;
   switch (action) {
     case "view-data":
-      return { label: t("contextMenu.viewData"), action: () => emitContextObjectAction(action), disabled, icon: Table2 };
+      return {
+        label: t("contextMenu.viewData"),
+        action: () => emitContextObjectAction(action),
+        disabled,
+        icon: Table2,
+      };
     case "edit-table-structure":
-      return { label: t("contextMenu.editStructure"), action: () => emitContextObjectAction(action), disabled, icon: PencilRuler };
+      return {
+        label: t("contextMenu.editStructure"),
+        action: () => emitContextObjectAction(action),
+        disabled,
+        icon: PencilRuler,
+      };
     case "edit-view":
-      return { label: t("contextMenu.editView"), action: () => emitContextObjectAction(action), disabled, icon: Pencil };
+      return {
+        label: t("contextMenu.editView"),
+        action: () => emitContextObjectAction(action),
+        disabled,
+        icon: Pencil,
+      };
     case "view-source":
-      return { label: t("contextMenu.viewSource"), action: () => emitContextObjectAction(action), disabled, icon: Code2 };
+      return {
+        label: t("contextMenu.viewSource"),
+        action: () => emitContextObjectAction(action),
+        disabled,
+        icon: Code2,
+      };
     case "view-ddl":
-      return { label: t("contextMenu.viewDdl"), action: () => emitContextObjectAction(action), disabled, icon: FileCode };
+      return {
+        label: t("contextMenu.viewDdl"),
+        action: () => emitContextObjectAction(action),
+        disabled,
+        icon: FileCode,
+      };
   }
 }
 
@@ -989,7 +1113,32 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
       icon: CaseLower,
       shortcut: shortcuts.lowercaseSelection,
     },
-    { label: t("editor.contextMenu.selectAll"), action: selectAllSqlFromContextMenu, icon: TextSelect, shortcut: shortcuts.selectAll },
+    {
+      label: t("editor.contextMenu.delimitedList"),
+      action: openDelimitedListDialog,
+      disabled: props.readOnly || !canCopySelectedSql.value,
+      icon: List,
+    },
+    { label: "", separator: true },
+    {
+      label: t("editor.contextMenu.findReplace"),
+      action: openFindReplaceFromContextMenu,
+      icon: Search,
+      shortcut: shortcuts.find,
+    },
+    {
+      label: t("editor.contextMenu.deleteEmptyLines"),
+      action: deleteEmptyLines,
+      disabled: props.readOnly,
+      icon: Trash2,
+    },
+    { label: "", separator: true },
+    {
+      label: t("editor.contextMenu.selectAll"),
+      action: selectAllSqlFromContextMenu,
+      icon: TextSelect,
+      shortcut: shortcuts.selectAll,
+    },
   ];
 });
 
@@ -997,7 +1146,8 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
   const shortcuts = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
   const Prec = codeMirrorPrec;
   const binding = (shortcut: string, run: (view: EditorViewType) => boolean) => (shortcut ? [{ key: shortcutToCodeMirrorKey(shortcut), preventDefault: true, run }] : []);
-  const executeBindings = props.hideExecutionControls ? [] : binding(shortcuts.executeSql, () => requestExecute({ forceCurrent: true }));
+  // Keep the shortcut on the shared path so selection, picker, and execute-mode behavior stay aligned with other execution entry points.
+  const executeBindings = props.hideExecutionControls ? [] : binding(shortcuts.executeSql, () => requestExecute());
   return [
     Prec?.high(
       codeMirrorKeymap.of([
@@ -1185,6 +1335,7 @@ function insertHintMetadataTarget(table: { name: string; schema?: string | null;
 
 function getInsertValueHintTableColumns(table: string, schema?: string, database?: string): string[] | undefined {
   const cacheKey = insertHintCacheKey({ name: table, schema, database });
+  if (props.databaseType === "sqlserver") return cachedInsertValueHintColumnsByTable.get(cacheKey);
   const cached = cachedColumnsByTable.get(cacheKey);
   if (!cached) return undefined;
   return cached.map((column) => column.name);
@@ -1194,14 +1345,25 @@ function requestInsertValueHintTableColumns(table: string, schema?: string, data
   if (!props.connectionId || props.database == null) return;
   if (props.databaseType === "redis" || props.databaseType === "mongodb" || props.databaseType === "elasticsearch") return;
   const cacheKey = insertHintCacheKey({ name: table, schema, database });
-  if (cachedColumnsByTable.has(cacheKey) || pendingInsertValueHintColumnLoads.has(cacheKey)) return;
+  const hasCachedColumns = props.databaseType === "sqlserver" ? cachedInsertValueHintColumnsByTable.has(cacheKey) : cachedColumnsByTable.has(cacheKey);
+  if (hasCachedColumns || pendingInsertValueHintColumnLoads.has(cacheKey)) return;
   const target = insertHintMetadataTarget({ name: table, schema, database });
   if (!target) return;
   pendingInsertValueHintColumnLoads.add(cacheKey);
-  void connectionStore
-    .listCompletionColumns(props.connectionId, target.database, table, target.schema)
-    .then((columns) => {
-      cachedColumnsByTable.set(cacheKey, columns);
+  const connectionId = props.connectionId;
+  const databaseType = props.databaseType;
+  const loadColumns = async () => {
+    if (databaseType === "sqlserver") {
+      const querySchema = metadataSchemaForConnection(connectionStore.getConfig(connectionId), target.database, target.schema);
+      const columns = await api.getSqlServerColumnMetadata(connectionId, target.database, querySchema, table);
+      cachedInsertValueHintColumnsByTable.set(cacheKey, insertValueHintColumnNames(databaseType, columns));
+      return;
+    }
+    const columns = await connectionStore.listCompletionColumns(connectionId, target.database, table, target.schema);
+    cachedColumnsByTable.set(cacheKey, columns);
+  };
+  void loadColumns()
+    .then(() => {
       loadedColumnsByTable.add(cacheKey.toLowerCase());
       if (view.value) requestInsertValueHintsRefresh(view.value);
     })
@@ -1380,7 +1542,12 @@ async function resolveSqlHoverTooltip(currentView: EditorViewType, pos: number) 
   const parts = splitQualifiedIdentifier(identifier);
   const name = parts[parts.length - 1] ?? identifier;
   const qualifier = parts.length > 1 ? parts[parts.length - 2] : undefined;
-  const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED ? buildSqlSemanticModel(sql, pos, { databaseType: props.databaseType, dialect: props.dialect }) : null;
+  const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED
+    ? buildSqlSemanticModel(sql, pos, {
+        databaseType: props.databaseType,
+        dialect: props.syntaxDialect ?? props.dialect,
+      })
+    : null;
   const semanticTarget = semanticModel ? resolveSqlSemanticNavigationTarget(semanticModel, parts) : null;
   const semanticQualifierIsRowSource = !!qualifier && !!semanticTarget && (semanticTarget.alias?.toLowerCase() === qualifier.toLowerCase() || semanticTarget.source.name.toLowerCase() === qualifier.toLowerCase());
   const tableLookupName = semanticTarget && !semanticQualifierIsRowSource ? semanticTarget.name : name;
@@ -1459,7 +1626,10 @@ function sqlErrorDecorationRange(currentState: import("@codemirror/state").Edito
 
 function sqlTextSpanToRange(sql: string, span: SqlTextSpan): { from: number; to: number } | null {
   if (!span.start_line || !span.start_column) return null;
-  const from = lineColumnToOffset(sql, { line: span.start_line - 1, column: span.start_column - 1 });
+  const from = lineColumnToOffset(sql, {
+    line: span.start_line - 1,
+    column: span.start_column - 1,
+  });
   const to = lineColumnToOffset(sql, {
     line: Math.max(span.end_line - 1, span.start_line - 1),
     column: Math.max(span.end_column, span.start_column),
@@ -1473,9 +1643,24 @@ function sqlSemanticDecorationRanges(currentState: import("@codemirror/state").E
   return semanticDiagnostics
     .map((diagnostic) => {
       const range = sqlTextSpanToRange(sql, diagnostic.span);
-      return range ? { ...range, message: diagnostic.message, severity: diagnostic.severity } : null;
+      return range
+        ? {
+            ...range,
+            message: diagnostic.message,
+            severity: diagnostic.severity,
+          }
+        : null;
     })
-    .filter((range): range is { from: number; to: number; message: string; severity: "error" | "warning" } => !!range);
+    .filter(
+      (
+        range,
+      ): range is {
+        from: number;
+        to: number;
+        message: string;
+        severity: "error" | "warning";
+      } => !!range,
+    );
 }
 
 function reconfigureDiagnostics() {
@@ -1589,7 +1774,9 @@ async function ensureColumnsForSemanticDiagnostics(tables: SqlTableReference[]):
   const targets: SqlTableReference[] = [];
   for (const table of tables) {
     if (isStatementLocalSemanticTable(table)) continue;
-    const tableWithInlineColumns = table as SqlTableReference & { columns?: string[] };
+    const tableWithInlineColumns = table as SqlTableReference & {
+      columns?: string[];
+    };
     if (tableWithInlineColumns.columns && tableWithInlineColumns.columns.length > 0) continue;
     const cacheKey = completionCacheKey(table);
     if (cachedColumnsByTable.has(cacheKey)) continue;
@@ -1638,7 +1825,9 @@ async function refreshSemanticDiagnostics(options: { preserveOutsideRanges?: boo
   if (props.databaseType === "redis") {
     // Redis has no SQL semantics; run command-name / arity / quote / danger checks instead.
     if (!shouldRunRedisDiagnostics(sql, currentView.state.selection.main.head)) {
-      scheduleSemanticDiagnostics(900, { preserveOutsideRanges: options.preserveOutsideRanges });
+      scheduleSemanticDiagnostics(900, {
+        preserveOutsideRanges: options.preserveOutsideRanges,
+      });
       return;
     }
     setSemanticDiagnostics(buildRedisSyntaxDiagnostics(sql));
@@ -1649,11 +1838,15 @@ async function refreshSemanticDiagnostics(options: { preserveOutsideRanges?: boo
     return;
   }
   if (!shouldRunSqlSemanticDiagnostics(sql, currentView.state.selection.main.head, { databaseType: props.databaseType })) {
-    scheduleSemanticDiagnostics(1200, { preserveOutsideRanges: options.preserveOutsideRanges });
+    scheduleSemanticDiagnostics(1200, {
+      preserveOutsideRanges: options.preserveOutsideRanges,
+    });
     return;
   }
   if (codeMirrorCompletionStatus?.(currentView.state) && isSqlSemanticDiagnosticInputContext(sql, currentView.state.selection.main.head, { databaseType: props.databaseType })) {
-    scheduleSemanticDiagnostics(900, { preserveOutsideRanges: options.preserveOutsideRanges });
+    scheduleSemanticDiagnostics(900, {
+      preserveOutsideRanges: options.preserveOutsideRanges,
+    });
     return;
   }
 
@@ -1671,14 +1864,22 @@ async function refreshSemanticDiagnostics(options: { preserveOutsideRanges?: boo
       if (runId !== semanticDiagnosticRunId) return;
 
       const semanticCursor = Math.max(0, Math.min(currentView.state.selection.main.head - range.from, range.sql.length));
-      const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED ? buildSqlSemanticModel(range.sql, semanticCursor, { databaseType: props.databaseType, dialect: props.dialect }) : null;
+      const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED
+        ? buildSqlSemanticModel(range.sql, semanticCursor, {
+            databaseType: props.databaseType,
+            dialect: props.syntaxDialect ?? props.dialect,
+          })
+        : null;
       const semanticAnalysis = semanticModel ? mergeSqlSemanticReferenceAnalysis(analysis, semanticModel) : analysis;
       const { tables, missingTables } = await enrichSemanticDiagnosticTables(semanticAnalysis.tables);
       const columnMetadataMissingTables = await ensureColumnsForSemanticDiagnostics(tables);
       for (const tableKey of columnMetadataMissingTables) missingTables.add(tableKey);
       if (runId !== semanticDiagnosticRunId) return;
 
-      const enrichedAnalysis: SqlReferenceAnalysis = { ...semanticAnalysis, tables };
+      const enrichedAnalysis: SqlReferenceAnalysis = {
+        ...semanticAnalysis,
+        tables,
+      };
       nextDiagnostics.push(
         ...offsetSqlSemanticDiagnostics(
           buildSqlSemanticDiagnostics(enrichedAnalysis, {
@@ -1782,7 +1983,10 @@ function insertDroppedTableReference(currentView: EditorViewType, event: DragEve
 
   event.preventDefault();
   event.stopPropagation();
-  return insertTableReferencePayload(currentView, payload, { clientX: event.clientX, clientY: event.clientY });
+  return insertTableReferencePayload(currentView, payload, {
+    clientX: event.clientX,
+    clientY: event.clientY,
+  });
 }
 
 function onTableReferenceDropEvent(event: Event) {
@@ -1956,7 +2160,9 @@ async function provideRedisCompletions(currentState: import("@codemirror/state")
   }
   if (epoch !== completionEpoch) return null;
 
-  const items = buildRedisCompletionItemsFromContext(completionContext, { keys });
+  const items = buildRedisCompletionItemsFromContext(completionContext, {
+    keys,
+  });
   if (items.length === 0) return null;
   // Use the built-in filter (the default) so typing narrows the list and moves
   // the selection synchronously. `filter: false` + `validFor` are mutually
@@ -1979,7 +2185,7 @@ async function provideMongoCompletions(currentState: import("@codemirror/state")
   let collections: string[] = [];
   let fields: Awaited<ReturnType<typeof connectionStore.listMongoCompletionFields>> = [];
 
-  if (props.database && completionContext.mode === "collection") {
+  if (props.database && mongoCompletionNeedsCollections(completionContext.mode)) {
     try {
       collections = await connectionStore.listMongoCompletionCollections(props.connectionId, props.database);
     } catch {
@@ -1987,7 +2193,7 @@ async function provideMongoCompletions(currentState: import("@codemirror/state")
     }
   }
 
-  if (props.database && completionContext.mode === "field" && completionContext.collection) {
+  if (props.database && mongoCompletionNeedsFields(completionContext.mode) && completionContext.collection) {
     try {
       fields = await connectionStore.listMongoCompletionFields(props.connectionId, props.database, completionContext.collection);
     } catch {
@@ -1997,7 +2203,10 @@ async function provideMongoCompletions(currentState: import("@codemirror/state")
 
   if (epoch !== completionEpoch) return null;
 
-  const items = buildMongoCompletionItemsFromContext(completionContext, { collections, fields });
+  const items = buildMongoCompletionItemsFromContext(completionContext, {
+    collections,
+    fields,
+  });
   if (items.length === 0) return null;
   return {
     from: completionContext.from,
@@ -2034,7 +2243,12 @@ async function provideSqlCompletions(context: CompletionContext) {
     if (!explicit && !shouldAutoOpenSqlCompletion(fullDoc, position)) return null;
 
     const legacyCompletionContext = getSqlCompletionContext(fullDoc, position);
-    const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED ? buildSqlSemanticModel(fullDoc, position, { databaseType: props.databaseType, dialect: props.dialect }) : null;
+    const semanticModel = SEMANTIC_SQL_COMPLETION_ENABLED
+      ? buildSqlSemanticModel(fullDoc, position, {
+          databaseType: props.databaseType,
+          dialect: props.syntaxDialect ?? props.dialect,
+        })
+      : null;
     const completionContext = semanticModel ? sqlCompletionContextFromSemantic(semanticModel, legacyCompletionContext) : legacyCompletionContext;
 
     if (!hasDatabase) {
@@ -2079,12 +2293,12 @@ async function provideSqlCompletions(context: CompletionContext) {
     const shouldResolveAsyncCompletion = tableNameCompletion || shouldResolveColumnCompletion;
     const localResult = buildLocalSqlCompletionResult(completionContext, fullDoc, position);
     if (localResult) {
-      scheduleCompletionMetadataRefresh(completionContext);
+      scheduleCompletionMetadataRefresh(completionContext, fullDoc, position);
       const hasLocalColumnResult = localResult.options.some((option) => option.type === "column");
       if ((!explicit || typedActivation) && (!shouldResolveColumnCompletion || hasLocalColumnResult)) return localResult;
     }
     if ((!explicit || typedActivation) && !shouldResolveAsyncCompletion) {
-      scheduleCompletionMetadataRefresh(completionContext);
+      scheduleCompletionMetadataRefresh(completionContext, fullDoc, position);
       return null;
     }
 
@@ -2219,7 +2433,11 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
     if (cteDef) {
       columnsByTable.set(
         refTable.name,
-        cteDef.columns.map((name) => ({ name, table: refTable.name, dataType: undefined })),
+        cteDef.columns.map((name) => ({
+          name,
+          table: refTable.name,
+          dataType: undefined,
+        })),
       );
       continue;
     }
@@ -2262,7 +2480,7 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
   return buildCompletionResult(items, position - completionContext.prefix.length, getSqlCompletionResultValidFor(fullDoc, position));
 }
 
-function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof getSqlCompletionContext>) {
+function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof getSqlCompletionContext>, fullDoc: string, position: number) {
   if (!props.connectionId || props.database == null) return;
   const localOnlyMetadata = usesLocalOnlyCompletionMetadata();
   const onDemandOnlyColumns = usesOnDemandOnlyCompletionColumns();
@@ -2291,7 +2509,10 @@ function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof 
   if (!localOnlyMetadata && shouldLoadCompletionObjects(completionContext)) {
     void listCompletionObjectsForContext(completionContext)
       .then((objects) => {
-        cachedCompletionObjects = mergeCompletionObjects(cachedCompletionObjects, objects);
+        const merged = mergeCompletionObjects(cachedCompletionObjects, objects);
+        const changed = completionObjectsDiffer(cachedCompletionObjects, merged);
+        cachedCompletionObjects = merged;
+        if (changed) refreshActiveSqlCompletion(fullDoc, position, completionContext);
       })
       .catch(() => {});
   }
@@ -2357,7 +2578,11 @@ function mergeCompletionTables(existing: SqlCompletionTable[], incoming: SqlComp
     } else {
       const existing = merged[index];
       // Preserve the more specific tree type if an older metadata endpoint reports a materialized view as VIEW.
-      merged[index] = { ...existing, ...table, type: mergeSqlObjectNavigationType(existing.type, table.type) };
+      merged[index] = {
+        ...existing,
+        ...table,
+        type: mergeSqlObjectNavigationType(existing.type, table.type),
+      };
     }
   }
   return merged;
@@ -2402,16 +2627,27 @@ function lookupLocalCompletionObjectsForContext(completionContext: ReturnType<ty
   if (props.databaseType === "oracle") {
     return connectionStore.lookupLocalCompletionObjects(props.connectionId, props.database, completionContext.prefix, MAX_COMPLETION_TABLES);
   }
-  return connectionStore.lookupLocalCompletionObjects(props.connectionId, props.database, completionContext.qualifier || completionContext.prefix, MAX_COMPLETION_TABLES, completionContext.qualifier && !completionContext.exclusiveColumnSuggestions ? completionContext.qualifier : props.schema);
+  const target = resolveSqlCompletionRoutineLookupTarget({ currentSchema: props.schema, completionContext });
+  return connectionStore.lookupLocalCompletionObjects(props.connectionId, props.database, target.mask, MAX_COMPLETION_TABLES, target.schema);
 }
 
 async function listCompletionObjectsForContext(completionContext: ReturnType<typeof getSqlCompletionContext>): Promise<SqlCompletionObject[]> {
   if (!props.connectionId || props.database == null) return [];
+  const objectKinds = completionObjectKindsForContext(completionContext);
   if (props.databaseType !== "oracle") {
-    return connectionStore.listCompletionObjects(props.connectionId, props.database, completionContext.qualifier || completionContext.prefix, MAX_COMPLETION_TABLES, props.schema);
+    const target = resolveSqlCompletionRoutineLookupTarget({ currentSchema: props.schema, completionContext });
+    return connectionStore.listCompletionObjects(props.connectionId, props.database, target.mask, MAX_COMPLETION_TABLES, target.schema, undefined, false, props.schema, objectKinds);
   }
-  const groups = await Promise.all(oracleRoutineCompletionTargets(completionContext).map((target) => connectionStore.listCompletionObjects(props.connectionId!, props.database!, completionContext.prefix, MAX_COMPLETION_TABLES, target.schema, target.parentName, target.globalSearch, props.schema)));
+  const groups = await Promise.all(
+    oracleRoutineCompletionTargets(completionContext).map((target) => connectionStore.listCompletionObjects(props.connectionId!, props.database!, completionContext.prefix, MAX_COMPLETION_TABLES, target.schema, target.parentName, target.globalSearch, props.schema, objectKinds)),
+  );
   return groups.reduce((objects, group) => mergeCompletionObjects(objects, group), [] as SqlCompletionObject[]);
+}
+
+function completionObjectKindsForContext(completionContext: ReturnType<typeof getSqlCompletionContext>): CompletionAssistantObjectKind[] {
+  if (completionContext.contextKind === "exec") return ["procedure"];
+  if (completionContext.suggestColumns && completionContext.referencedTables.length > 0 && !completionContext.qualifier) return ["function"];
+  return ["routine"];
 }
 
 async function performAsyncCompletionWithResult(epoch: number, completionContext: ReturnType<typeof getSqlCompletionContext>, fullDoc: string, position: number) {
@@ -2669,10 +2905,40 @@ function mergeCompletionObjects(existing: SqlCompletionObject[], incoming: SqlCo
   return merged;
 }
 
+function completionObjectsDiffer(existing: SqlCompletionObject[], incoming: SqlCompletionObject[]): boolean {
+  if (existing.length !== incoming.length) return true;
+  return existing.some((object, index) => {
+    const other = incoming[index];
+    return (
+      !other ||
+      object.name !== other.name ||
+      object.schema !== other.schema ||
+      object.type !== other.type ||
+      object.parentSchema !== other.parentSchema ||
+      object.parentName !== other.parentName ||
+      object.dataType !== other.dataType ||
+      object.signature !== other.signature ||
+      object.comment !== other.comment ||
+      object.applyName !== other.applyName ||
+      object.boost !== other.boost
+    );
+  });
+}
+
+function refreshActiveSqlCompletion(fullDoc: string, position: number, completionContext: ReturnType<typeof getSqlCompletionContext>) {
+  const currentView = view.value;
+  if (!currentView || codeMirrorCompletionStatus?.(currentView.state) !== "active") return;
+  if (currentView.state.doc.toString() !== fullDoc || currentView.state.selection.main.head !== position) return;
+  const currentContext = getSqlCompletionContext(fullDoc, position);
+  if (currentContext.prefix !== completionContext.prefix || currentContext.contextKind !== completionContext.contextKind) return;
+  scheduleSqlCompletionStart(currentView);
+}
+
 function refreshCompletionCache() {
   cachedTables = [];
   cachedCompletionObjects = [];
   cachedColumnsByTable.clear();
+  cachedInsertValueHintColumnsByTable.clear();
   loadedColumnsByTable.clear();
   cachedForeignKeysByTable.clear();
 }
@@ -2686,10 +2952,14 @@ onMounted(async () => {
     langSql,
     { autocompletion, startCompletion, acceptCompletion, closeBrackets, closeBracketsKeymap, snippetCompletion, completionStatus, completionKeymap, insertCompletionText, nextSnippetField },
     { copyLineDown, copyLineUp, deleteLine, indentLess, indentMore, insertNewlineKeepIndent, moveLineDown, moveLineUp, redo, selectAll, undo, toggleLineComment, history, defaultKeymap, historyKeymap },
-    { bracketMatching, foldGutter, indentOnInput, indentUnit, syntaxHighlighting, defaultHighlightStyle, foldKeymap },
+    { bracketMatching, foldGutter, indentOnInput, indentUnit, syntaxHighlighting, defaultHighlightStyle, foldKeymap, ensureSyntaxTree },
     { searchKeymap },
   ] = await Promise.all([import("@codemirror/view"), import("@codemirror/state"), import("@codemirror/lang-sql"), import("@codemirror/autocomplete"), import("@codemirror/commands"), import("@codemirror/language"), import("@codemirror/search")]);
-  editorViewModule = { EditorView, keymap, rectangularSelection } as typeof import("@codemirror/view");
+  editorViewModule = {
+    EditorView,
+    keymap,
+    rectangularSelection,
+  } as typeof import("@codemirror/view");
   codeMirrorPrec = Prec;
   codeMirrorEditorSelection = EditorSelection;
   codeMirrorSnippetCompletion = snippetCompletion;
@@ -2699,6 +2969,8 @@ onMounted(async () => {
   vimModeComp = new Compartment();
   closeBracketsComp = new Compartment();
   sqlLanguageComp = new Compartment();
+  sqlSemanticHighlightComp = new Compartment();
+  sqlSignatureComp = new Compartment();
   codeMirrorCloseBrackets = closeBrackets;
   codeMirrorCloseBracketsKeymap = closeBracketsKeymap;
   readOnlyComp = new Compartment();
@@ -2774,7 +3046,10 @@ onMounted(async () => {
     return [field, diagnosticTheme];
   };
 
-  setPreviewRangeEffect = StateEffect.define<{ from: number; to: number } | null>();
+  setPreviewRangeEffect = StateEffect.define<{
+    from: number;
+    to: number;
+  } | null>();
   buildPreviewRangeExtension = () => {
     const effectType = setPreviewRangeEffect!;
     const field = StateField.define({
@@ -2802,7 +3077,10 @@ onMounted(async () => {
   }
 
   const resultSourceLineNumberMarker = new ResultSourceLineNumberMarker();
-  setResultSourceRangeEffect = StateEffect.define<{ from: number; to: number } | null>();
+  setResultSourceRangeEffect = StateEffect.define<{
+    from: number;
+    to: number;
+  } | null>();
   buildResultSourceRangeExtension = () => {
     const effectType = setResultSourceRangeEffect!;
     const markersForRange = (state: import("@codemirror/state").EditorState, range: { from: number; to: number }) => {
@@ -2913,7 +3191,7 @@ onMounted(async () => {
 
   buildSqlSignatureExtension = () =>
     showTooltip.compute(["doc", "selection"], (currentState) => {
-      const signature = getSqlFunctionSignatureHelp(currentState.doc.toString(), currentState.selection.main.head);
+      const signature = getSqlFunctionSignatureHelp(currentState.doc.toString(), currentState.selection.main.head, props.databaseType);
       if (!signature) return null;
       return {
         pos: currentState.selection.main.head,
@@ -2929,7 +3207,54 @@ onMounted(async () => {
       override: [async (context: CompletionContext) => provideSqlCompletions(context)],
     });
 
-  buildSqlLanguageExtension = () => langSql.sql({ dialect: createDbxCodeMirrorSqlDialect(langSql, props.dialect, props.databaseType) });
+  buildSqlLanguageExtension = () =>
+    langSql.sql({
+      dialect: createDbxCodeMirrorSqlDialect(langSql, props.syntaxDialect ?? props.dialect, props.databaseType),
+    });
+  buildSqlSemanticHighlightExtension = () => [
+    ViewPlugin.fromClass(
+      class {
+        decorations: import("@codemirror/view").DecorationSet;
+        constructor(currentView: import("@codemirror/view").EditorView) {
+          this.decorations = this.buildDecorations(currentView);
+        }
+        update(update: import("@codemirror/view").ViewUpdate) {
+          if (update.docChanged || update.viewportChanged) this.decorations = this.buildDecorations(update.view);
+        }
+        buildDecorations(currentView: import("@codemirror/view").EditorView) {
+          const sql = currentView.state.doc.toString();
+          const windows: Array<{ from: number; to: number }> = [];
+          for (const visibleRange of currentView.visibleRanges) {
+            const next = expandToSqlStatementWindow(sql, visibleRange.from, visibleRange.to);
+            const previous = windows[windows.length - 1];
+            if (previous && next.from <= previous.to) previous.to = Math.max(previous.to, next.to);
+            else windows.push(next);
+          }
+          const tree = ensureSyntaxTree(currentView.state, windows[windows.length - 1]?.to ?? 0, 25);
+          if (!tree) return Decoration.set([]);
+          const ranges = windows.flatMap((window) =>
+            sqlSemanticTableNameSpansForSyntaxTree(sql, window, tree, {
+              databaseType: props.databaseType,
+              dialect: props.syntaxDialect ?? props.dialect,
+            }),
+          );
+          return Decoration.set(
+            ranges.map((range) =>
+              Decoration.mark({
+                class: "cm-sql-table-name",
+                attributes: {
+                  "data-sql-token": "table",
+                },
+              }).range(range.start, range.end),
+            ),
+            true,
+          );
+        }
+      },
+      { decorations: (value) => value.decorations },
+    ),
+    sqlSemanticHighlightTheme(EditorView),
+  ];
 
   const initialSettings = settingsStore.editorSettings;
   const theme = await loadEditorTheme(initialSettings.theme, editorThemeAppearance(), getCurrentCustomThemeColors(), themePalette.value);
@@ -3000,7 +3325,14 @@ onMounted(async () => {
           const classes = ["cm-db-current-statement-line"];
           if (lineNumber === startLine.number) classes.push("cm-db-current-statement-line--first");
           if (lineNumber === endLine.number) classes.push("cm-db-current-statement-line--last");
-          deco.push(Decoration.line({ class: classes.join(" "), attributes: { style: `--dbx-current-statement-frame-width: ${frameWidth};` } }).range(line.from));
+          deco.push(
+            Decoration.line({
+              class: classes.join(" "),
+              attributes: {
+                style: `--dbx-current-statement-frame-width: ${frameWidth};`,
+              },
+            }).range(line.from),
+          );
         }
         return Decoration.set(deco);
       }
@@ -3086,14 +3418,35 @@ onMounted(async () => {
       vimModeComp.of(vimModeExtension(initialSettings.vimModeEnabled)),
       keymap.of([...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, ...completionKeymap]),
       sqlLanguageComp.of(buildSqlLanguageExtension()),
+      sqlSemanticHighlightComp.of(buildSqlSemanticHighlightExtension()),
       tooltips({ parent: document.body }),
       completionComp.of(buildSqlCompletionExtension()),
       sqlCompletionTheme(EditorView),
       codeMirrorTheme.of(theme),
       closeBracketsComp.of(closeBracketsExtension(initialSettings.autoCloseBrackets)),
       bracketMatching(),
+      // Fix: intercept quote characters to prevent closeBrackets from
+      // producing triple quotes ('''). When the cursor is immediately
+      // before an auto-inserted closing quote, just skip past it.
+      Prec.highest(
+        EditorView.inputHandler.of((view: EditorViewType, _from: number, _to: number, text: string) => {
+          if (text !== "'" && text !== '"' && text !== "`") return false;
+          const pos = view.state.selection.main.head;
+          const nextChar = view.state.doc.sliceString(pos, pos + 1);
+          if (nextChar !== text) return false;
+          // Only skip when the character ahead matches and it was auto-inserted
+          // (i.e. the doc has a matching pair at this position).
+          const prevChar = pos > 0 ? view.state.doc.sliceString(pos - 1, pos) : "";
+          if (prevChar === text) return false; // already inside a quoted region
+          view.dispatch({
+            selection: { anchor: pos + 1 },
+            scrollIntoView: true,
+          });
+          return true;
+        }),
+      ),
       hoverTooltip((currentView, pos) => resolveSqlHoverTooltip(currentView, pos)),
-      buildSqlSignatureExtension(),
+      sqlSignatureComp.of(buildSqlSignatureExtension()),
       diagnosticComp.of(buildSqlDiagnosticExtension()),
       createInsertValueHintsExtension({
         isEnabled: () => settingsStore.editorSettings.showInsertValueHints && props.databaseType !== "redis" && props.databaseType !== "mongodb" && props.databaseType !== "elasticsearch",
@@ -3121,7 +3474,9 @@ onMounted(async () => {
       indentComp.of(indentExtension()),
       // Alt+drag belongs exclusively to rectangular selection. Registering the
       // same gesture as an added cursor preserves the previous cursor.
-      rectangularSelection({ eventFilter: startsQueryEditorRectangularSelection }),
+      rectangularSelection({
+        eventFilter: startsQueryEditorRectangularSelection,
+      }),
       EditorView.updateListener.of((update) => {
         if (update.docChanged) {
           searchPanelRef.value?.scheduleDocumentSearchUpdate();
@@ -3299,7 +3654,11 @@ onMounted(async () => {
                 return;
               }
 
-              const matchedCols: Array<{ name: string; table: string; schema?: string }> = [];
+              const matchedCols: Array<{
+                name: string;
+                table: string;
+                schema?: string;
+              }> = [];
 
               for (const refTable of tablesToCheck) {
                 const cacheKey = refTable.schema ? `${refTable.schema}.${refTable.name}` : refTable.name;
@@ -3340,7 +3699,9 @@ onMounted(async () => {
 
   view.value = new EditorView({ state, parent: editorRef.value });
   registerEditorScrollbarPointerGuard(view.value);
-  view.value.scrollDOM.addEventListener("scroll", scheduleEditorViewportEmit, { passive: true });
+  view.value.scrollDOM.addEventListener("scroll", scheduleEditorViewportEmit, {
+    passive: true,
+  });
   restoreEditorViewport();
   syncContextMenuState(view.value);
   syncEditorFontCssVars(liveFontSize.value, initialSettings.fontFamily);
@@ -3402,7 +3763,9 @@ watch(
   () => props.statementExecutionMarkers ?? [],
   (markers) => {
     if (!view.value || !setStatementExecutionMarkersEffect) return;
-    view.value.dispatch({ effects: setStatementExecutionMarkersEffect.of(markers) });
+    view.value.dispatch({
+      effects: setStatementExecutionMarkersEffect.of(markers),
+    });
   },
   { deep: true },
 );
@@ -3434,10 +3797,13 @@ watch(
   },
 );
 
-watch([() => props.databaseType, () => props.dialect], () => {
+watch([() => props.databaseType, () => props.dialect, () => props.syntaxDialect], () => {
   executableStatementRangeCache = null;
-  if (!view.value || !sqlLanguageComp || !buildSqlLanguageExtension) return;
-  view.value.dispatch({ effects: sqlLanguageComp.reconfigure(buildSqlLanguageExtension()) });
+  if (!view.value || !sqlLanguageComp || !buildSqlLanguageExtension || !sqlSemanticHighlightComp || !buildSqlSemanticHighlightExtension || !sqlSignatureComp || !buildSqlSignatureExtension) return;
+  // Signature tooltips depend on the external dialect, so refresh them even when the document and selection stay unchanged.
+  view.value.dispatch({
+    effects: [sqlLanguageComp.reconfigure(buildSqlLanguageExtension()), sqlSemanticHighlightComp.reconfigure(buildSqlSemanticHighlightExtension()), sqlSignatureComp.reconfigure(buildSqlSignatureExtension())],
+  });
 });
 
 watch(
@@ -3698,7 +4064,15 @@ function scrollCursorIntoView() {
   });
 }
 
-defineExpose({ openSearch, openReplace, scrollCursorIntoView, requestExecute, pasteClipboardAsSqlInCondition, previewStatementRange, refreshCompletionCache });
+defineExpose({
+  openSearch,
+  openReplace,
+  scrollCursorIntoView,
+  requestExecute,
+  pasteClipboardAsSqlInCondition,
+  previewStatementRange,
+  refreshCompletionCache,
+});
 </script>
 
 <template>
@@ -3718,6 +4092,7 @@ defineExpose({ openSearch, openReplace, scrollCursorIntoView, requestExecute, pa
     </CustomContextMenu>
     <EditorSearchPanel ref="searchPanelRef" :view="view" />
     <SqlExecutionTargetPicker v-if="pickerVisible" :candidates="pickerCandidates" :active-index="pickerActiveIndex" :anchor="pickerAnchor" @update:active-index="onPickerActiveIndexChange" @confirm="onPickerConfirm" @cancel="closePicker" />
+    <DelimitedListDialog v-model:open="delimitedListOpen" :selected-text="delimitedListSelectedText" @confirm="applyDelimitedListResult" />
   </div>
 </template>
 
