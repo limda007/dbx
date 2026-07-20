@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{config_for_pool_key, task_client_session_id, AppState, MysqlMode, PoolKind};
-use crate::csv_export::{escape_csv, format_csv, format_tsv, format_tsv_rows, push_csv_text_value, value_to_csv_text};
+use crate::connection::{config_for_pool_key, task_client_session_id, AppState, PoolKind};
+use crate::csv_export::{format_csv, format_tsv, format_tsv_rows, push_csv_text_value};
 pub use crate::database_export::ExportStatus;
 use crate::database_export::{
     build_export_insert_statements, is_export_cancelled, is_internal_export_column, BuildExportInsertStatementsOptions,

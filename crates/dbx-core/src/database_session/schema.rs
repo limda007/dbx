@@ -517,7 +517,7 @@ pub(crate) async fn get_table_ddl(
             }
         }
         PoolKind::Postgres(p) => crate::schema::pg_ddl(p, schema, table).await,
-        PoolKind::Sqlite(p) => crate::schema::sqlite_ddl(p, table).await,
+        PoolKind::Sqlite(p) => crate::schema::sqlite_ddl(p, schema, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::table_ddl(client, table).await,
         PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::table_ddl(client, table).await,
         _ => Err("DDL not supported for this database type".to_string()),

@@ -3913,6 +3913,7 @@ async fn list_objects_once(
                     name: table.name,
                     object_type: table.table_type,
                     schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
+                    valid: None,
                     signature: None,
                     comment: table.comment,
                     created_at: None,
