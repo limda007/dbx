@@ -3,7 +3,8 @@ use std::sync::Arc;
 use tauri::State;
 
 pub use dbx_core::connection::{metadata_connection_config, AppState, ConnectionRuntimeDiagnostics};
-use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseType};
+use dbx_core::db;
+use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType};
 
 #[cfg(test)]
 mod tests {
