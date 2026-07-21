@@ -1,7 +1,7 @@
 use crate::connection::{connection_url_for_endpoint, database_connection_config, AppState, MysqlMode, PoolKind};
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
-use crate::query::{agent_execute_query_params, should_discard_pool_after_error, QueryExecutionOptions};
+use crate::query::{agent_execute_query_params, QueryExecutionOptions};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -629,7 +629,7 @@ fn clickhouse_metadata_database<'a>(database: &'a str, schema: &'a str) -> &'a s
     }
 }
 
-fn agent_metadata_timeout(config: Option<&ConnectionConfig>) -> Option<Duration> {
+pub(crate) fn agent_metadata_timeout(config: Option<&ConnectionConfig>) -> Option<Duration> {
     let Some(config) = config else {
         return Some(Duration::from_secs(60));
     };
@@ -4756,7 +4756,7 @@ fn oracle_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn mysql_ident(value: &str) -> String {
+pub(crate) fn mysql_ident(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
 
@@ -4983,7 +4983,7 @@ pub fn postgres_view_source_fallback_sql(schema: &str, name: &str) -> String {
     )
 }
 
-fn first_string_cell(result: db::QueryResult) -> Result<String, String> {
+pub(crate) fn first_string_cell(result: db::QueryResult) -> Result<String, String> {
     result
         .rows
         .first()
@@ -4992,7 +4992,7 @@ fn first_string_cell(result: db::QueryResult) -> Result<String, String> {
         .ok_or_else(|| "Object source not found".to_string())
 }
 
-async fn mysql_object_source(
+pub(crate) async fn mysql_object_source(
     pool: &db::mysql::MySqlPool,
     database: &str,
     name: &str,
@@ -5043,123 +5043,20 @@ async fn get_object_source_once(
     let db_config = connection_config(state, connection_id).await;
     #[cfg(feature = "duckdb-bundled")]
     let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
-    let source = {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-            let config = config.clone();
-            let session = session.clone();
-            drop(connections);
-            let result: db::ObjectSource = session
-                .invoke_with_timeout(
-                    "getObjectSource",
-                    serde_json::json!({
-                        "connection": config.as_ref(),
-                        "database": database,
-                        "schema": schema,
-                        "name": name,
-                        "object_type": &object_type,
-                    }),
-                    agent_metadata_timeout(Some(config.as_ref())),
-                )
-                .await?;
-            return Ok(result);
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-            drop(connections);
-            let mut client = client.lock().await;
-            let result =
-                db::sqlserver::execute_query(&mut client, &sqlserver_object_source_sql(schema, name, &object_type))
-                    .await;
-            drop(client);
-            if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(Some(DatabaseType::SqlServer), err))
-            {
-                state.remove_pool_by_key(&pool_key).await;
-            }
-            first_string_cell(result?)?
-        } else if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
-            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle)
-                && matches!(object_type, db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody)
-            {
-                oracle_agent_object_source(
-                    client,
-                    database,
-                    schema,
-                    name,
-                    &object_type,
-                    agent_metadata_timeout(db_config.as_ref()),
-                )
-                .await?
-            } else {
-                let mut client = client.lock().await;
-                let result: db::ObjectSource = client
-                    .get_object_source(database, schema, name, &object_type, agent_metadata_timeout(db_config.as_ref()))
-                    .await?;
-                return Ok(result);
-            }
-        } else {
-            match connections.get(&pool_key).ok_or("Pool not found")? {
-                PoolKind::Mysql(pool, _) => {
-                    mysql_object_source(pool, mysql_table_metadata_catalog(database, schema), name, &object_type)
-                        .await?
-                }
-                PoolKind::Postgres(pool) if db_config.as_ref().is_some_and(is_questdb_config) => {
-                    // only view
-                    db::questdb::questdb_object_source(pool, name).await?
-                }
-                PoolKind::Postgres(pool) => postgres_object_source(pool, schema, name, &object_type, signature).await?,
-                PoolKind::Sqlite(pool) => first_string_cell(
-                    db::sqlite::execute_query(pool, &sqlite_object_source_sql(schema, name, &object_type)).await?,
-                )?,
-                #[cfg(feature = "duckdb-bundled")]
-                PoolKind::DuckDb(con) => {
-                    let con = con.lock().map_err(|e| e.to_string())?;
-                    duckdb_object_source_with_attached(
-                        &con,
-                        database,
-                        schema,
-                        name,
-                        &object_type,
-                        &duckdb_attached_names,
-                    )?
-                }
-                #[cfg(feature = "duckdb-bundled")]
-                PoolKind::DuckDbWorker(client) => {
-                    let client = client.clone();
-                    let database = database.to_string();
-                    let schema = schema.to_string();
-                    let name = name.to_string();
-                    let object_type = object_type.clone();
-                    drop(connections);
-                    client.get_object_source(database, schema, name, object_type).await?
-                }
-                PoolKind::Rqlite(client) => {
-                    return db::rqlite_driver::object_source(client, name, &object_type).await;
-                }
-                PoolKind::ClickHouse(client) if matches!(object_type, db::ObjectSourceKind::View) => {
-                    let result = db::clickhouse_driver::execute_query(
-                        client,
-                        database,
-                        &format!("SHOW CREATE TABLE {}", mysql_ident(name)),
-                    )
-                    .await?;
-                    first_string_cell(result)?
-                }
-                PoolKind::CloudflareD1(client) => {
-                    return db::cloudflare_d1_driver::object_source(client, name, &object_type).await;
-                }
-                _ => return Err("Object source is not supported for this database type".to_string()),
-            }
-        }
-    };
-
-    Ok(db::ObjectSource {
-        name: name.to_string(),
+    #[cfg(not(feature = "duckdb-bundled"))]
+    let duckdb_attached_names: Vec<String> = Vec::new();
+    crate::database_session::get_object_source(
+        state,
+        &pool_key,
+        db_config.as_ref(),
+        database,
+        schema,
+        name,
         object_type,
-        schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
-        source,
-        editable: None,
-    })
+        signature,
+        &duckdb_attached_names,
+    )
+    .await
 }
 
 fn oracle_owner_filter(schema: &str) -> String {
@@ -5221,7 +5118,7 @@ async fn oracle_agent_list_objects(
     Ok(objects)
 }
 
-async fn oracle_agent_object_source(
+pub(crate) async fn oracle_agent_object_source(
     client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
     database: &str,
     schema: &str,
@@ -5455,7 +5352,7 @@ async fn db2_column_comments(
     comments
 }
 
-async fn postgres_object_source(
+pub(crate) async fn postgres_object_source(
     pool: &deadpool_postgres::Pool,
     schema: &str,
     name: &str,

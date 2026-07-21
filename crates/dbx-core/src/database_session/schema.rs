@@ -523,3 +523,168 @@ pub(crate) async fn get_table_ddl(
         _ => Err("DDL not supported for this database type".to_string()),
     }
 }
+
+/// Dispatch for object source (view/function/procedure body text).
+///
+/// Owns ExternalDriver / Agent / SqlServer / native `PoolKind` matches so
+/// `schema::get_object_source_once` stays orchestration-only (pool key + retry).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn get_object_source(
+    state: &AppState,
+    pool_key: &str,
+    db_config: Option<&ConnectionConfig>,
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: db::ObjectSourceKind,
+    signature: Option<&str>,
+    #[cfg_attr(not(feature = "duckdb-bundled"), allow(unused_variables))] duckdb_attached_names: &[String],
+) -> Result<db::ObjectSource, String> {
+    use crate::models::connection::DatabaseType;
+    use crate::query::should_discard_pool_after_error;
+
+    let source = {
+        let connections = state.connections.read().await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(pool_key) {
+            let config = config.clone();
+            let session = session.clone();
+            drop(connections);
+            let result: db::ObjectSource = session
+                .invoke_with_timeout(
+                    "getObjectSource",
+                    serde_json::json!({
+                        "connection": config.as_ref(),
+                        "database": database,
+                        "schema": schema,
+                        "name": name,
+                        "object_type": &object_type,
+                    }),
+                    crate::schema::agent_metadata_timeout(Some(config.as_ref())),
+                )
+                .await?;
+            return Ok(result);
+        }
+        if let Some(client) = connections.get(pool_key).and_then(|pool| match pool {
+            PoolKind::SqlServer(client) => Some(client.clone()),
+            _ => None,
+        }) {
+            drop(connections);
+            let mut client = client.lock().await;
+            let result = db::sqlserver::execute_query(
+                &mut client,
+                &crate::schema::sqlserver_object_source_sql(schema, name, &object_type),
+            )
+            .await;
+            drop(client);
+            if matches!(
+                result.as_ref(),
+                Err(err) if should_discard_pool_after_error(Some(DatabaseType::SqlServer), err)
+            ) {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            crate::schema::first_string_cell(result?)?
+        } else if let Some(client) = connections.get(pool_key).and_then(|pool| match pool {
+            PoolKind::Agent(client) => Some(client.clone()),
+            _ => None,
+        }) {
+            drop(connections);
+            if db_config.is_some_and(|config| config.db_type == DatabaseType::Oracle)
+                && matches!(object_type, db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody)
+            {
+                crate::schema::oracle_agent_object_source(
+                    client,
+                    database,
+                    schema,
+                    name,
+                    &object_type,
+                    crate::schema::agent_metadata_timeout(db_config),
+                )
+                .await?
+            } else {
+                let mut client = client.lock().await;
+                let result: db::ObjectSource = client
+                    .get_object_source(
+                        database,
+                        schema,
+                        name,
+                        &object_type,
+                        crate::schema::agent_metadata_timeout(db_config),
+                    )
+                    .await?;
+                return Ok(result);
+            }
+        } else {
+            match connections.get(pool_key).ok_or("Pool not found")? {
+                PoolKind::Mysql(pool, _) => {
+                    crate::schema::mysql_object_source(
+                        pool,
+                        crate::schema::mysql_table_metadata_catalog(database, schema),
+                        name,
+                        &object_type,
+                    )
+                    .await?
+                }
+                PoolKind::Postgres(pool) if db_config.is_some_and(crate::schema::is_questdb_config) => {
+                    // only view
+                    db::questdb::questdb_object_source(pool, name).await?
+                }
+                PoolKind::Postgres(pool) => {
+                    crate::schema::postgres_object_source(pool, schema, name, &object_type, signature).await?
+                }
+                PoolKind::Sqlite(pool) => crate::schema::first_string_cell(
+                    db::sqlite::execute_query(
+                        pool,
+                        &crate::schema::sqlite_object_source_sql(schema, name, &object_type),
+                    )
+                    .await?,
+                )?,
+                #[cfg(feature = "duckdb-bundled")]
+                PoolKind::DuckDb(con) => {
+                    let con = con.lock().map_err(|e| e.to_string())?;
+                    crate::schema::duckdb_object_source_with_attached(
+                        &con,
+                        database,
+                        schema,
+                        name,
+                        &object_type,
+                        duckdb_attached_names,
+                    )?
+                }
+                #[cfg(feature = "duckdb-bundled")]
+                PoolKind::DuckDbWorker(client) => {
+                    let client = client.clone();
+                    let database = database.to_string();
+                    let schema = schema.to_string();
+                    let name = name.to_string();
+                    let object_type = object_type.clone();
+                    drop(connections);
+                    client.get_object_source(database, schema, name, object_type).await?
+                }
+                PoolKind::Rqlite(client) => {
+                    return db::rqlite_driver::object_source(client, name, &object_type).await;
+                }
+                PoolKind::ClickHouse(client) if matches!(object_type, db::ObjectSourceKind::View) => {
+                    let result = db::clickhouse_driver::execute_query(
+                        client,
+                        database,
+                        &format!("SHOW CREATE TABLE {}", crate::schema::mysql_ident(name)),
+                    )
+                    .await?;
+                    crate::schema::first_string_cell(result)?
+                }
+                PoolKind::CloudflareD1(client) => {
+                    return db::cloudflare_d1_driver::object_source(client, name, &object_type).await;
+                }
+                _ => return Err("Object source is not supported for this database type".to_string()),
+            }
+        }
+    };
+
+    Ok(db::ObjectSource {
+        name: name.to_string(),
+        object_type,
+        schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
+        source,
+        editable: None,
+    })
+}

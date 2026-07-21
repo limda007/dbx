@@ -241,10 +241,12 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 ## Residual (out of Phase B)
 
-- `schema.rs` agent/external/SqlServer early paths still peek `PoolKind` before calling session
+- `schema.rs` agent/external early paths for list_* / completion / Doris / vector still peek `PoolKind`
 - `query.rs` txn / agent helpers / drop-database reconnect
 - orphan uncompiled `schema/providers/native.rs` (cleanup later)
 
 ## Immediate next step
 
-Domain-ops + export stream dispatch landed (2026-07-21). Remaining: schema/query residual peeks.
+Domain-ops + export streams (2026-07-21). **S5 `get_object_source` dispatch moved into
+`database_session::get_object_source`** (ExternalDriver / Agent / SqlServer / native arms).
+Next candidates: Doris/vector resolve helpers; completion_assistant waterfall.
