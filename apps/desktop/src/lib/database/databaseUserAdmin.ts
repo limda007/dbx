@@ -26,6 +26,18 @@ export interface PrivilegeChangeInput {
   role?: string;
 }
 
+export interface PrivilegeSelectionInput {
+  grants: readonly string[];
+  database: string;
+  table?: string;
+  availablePrivileges: readonly string[];
+}
+
+export interface PrivilegeSelection {
+  privileges: string[];
+  grantOption: boolean;
+}
+
 export interface DatabaseUserAdminProvider {
   dialect: UserAdminDialect;
   defaultScope: PrivilegeScope;
@@ -45,6 +57,7 @@ export interface DatabaseUserAdminProvider {
   detail(user: DatabaseUserIdentity): string | undefined;
   privilegesForScope?(scope: PrivilegeScope): readonly string[];
   defaultPrivilegesForScope?(scope: PrivilegeScope): string[];
+  privilegeSelectionFromGrants?(input: PrivilegeSelectionInput): PrivilegeSelection;
 }
 
 export const MYSQL_USER_ADMIN_TYPES = new Set<DatabaseType>(["mysql", "goldendb"]);
@@ -179,6 +192,35 @@ export function normalizePrivileges(privileges: string[], fallback = "SELECT"): 
 }
 
 export const normalizeMySqlPrivileges = normalizePrivileges;
+
+export function mysqlPrivilegeSelectionFromGrants(input: PrivilegeSelectionInput): PrivilegeSelection {
+  const database = normalizeMySqlScopeIdentifier(input.database || "*");
+  const table = normalizeMySqlScopeIdentifier(input.table || "*");
+  const availableByName = new Map(input.availablePrivileges.map((privilege) => [normalizePrivilegeName(privilege), privilege]));
+  const selected = new Set<string>();
+  let grantOption = false;
+
+  for (const grantSql of input.grants) {
+    const grant = parseMySqlGrant(grantSql);
+    if (!grant || grant.objectType === "FUNCTION" || grant.objectType === "PROCEDURE") continue;
+    if (normalizeMySqlScopeIdentifier(grant.database) !== database || normalizeMySqlScopeIdentifier(grant.table) !== table) continue;
+
+    grantOption ||= grant.grantOption;
+    if (grant.allPrivileges) {
+      input.availablePrivileges.forEach((privilege) => selected.add(privilege));
+      continue;
+    }
+    grant.privileges.forEach((privilege) => {
+      const available = availableByName.get(normalizePrivilegeName(privilege));
+      if (available) selected.add(available);
+    });
+  }
+
+  return {
+    privileges: input.availablePrivileges.filter((privilege) => selected.has(privilege)),
+    grantOption,
+  };
+}
 
 export function usersFromMySqlUserResult(result: QueryResult): DatabaseUserIdentity[] {
   const userIndex = columnIndex(result, "user", "User");
@@ -437,6 +479,47 @@ function parseMySqlGrantee(value: string): DatabaseUserIdentity | null {
   };
 }
 
+interface ParsedMySqlGrant {
+  privileges: string[];
+  database: string;
+  table: string;
+  objectType?: "TABLE" | "FUNCTION" | "PROCEDURE";
+  allPrivileges: boolean;
+  grantOption: boolean;
+}
+
+function parseMySqlGrant(sql: string): ParsedMySqlGrant | null {
+  const identifier = String.raw`(?:\x60(?:\x60\x60|[^\x60])*\x60|\*|[^\s.]+)`;
+  const match = new RegExp(String.raw`^\s*GRANT\s+(.+?)\s+ON\s+(?:(TABLE|FUNCTION|PROCEDURE)\s+)?(${identifier})\s*\.\s*(${identifier})\s+TO\s+`, "i").exec(sql);
+  if (!match) return null;
+
+  const privileges = match[1].split(",").map(normalizePrivilegeName).filter(Boolean);
+  return {
+    privileges,
+    database: unquoteMySqlIdentifier(match[3]),
+    table: unquoteMySqlIdentifier(match[4]),
+    objectType: match[2]?.toUpperCase() as ParsedMySqlGrant["objectType"],
+    allPrivileges: privileges.some((privilege) => privilege === "ALL" || privilege === "ALL PRIVILEGES"),
+    grantOption: /\s+WITH\s+GRANT\s+OPTION\s*;?\s*$/i.test(sql),
+  };
+}
+
+function normalizePrivilegeName(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toUpperCase();
+}
+
+function normalizeMySqlScopeIdentifier(value: string): string {
+  return unquoteMySqlIdentifier(value.trim()).toLocaleLowerCase("en-US");
+}
+
+function unquoteMySqlIdentifier(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith("`") && trimmed.endsWith("`")) {
+    return trimmed.slice(1, -1).replace(/``/g, "`");
+  }
+  return trimmed;
+}
+
 function postgresDefaultPrivilege(scope: PrivilegeScope | undefined): string {
   if (scope === "schema") return "USAGE";
   if (scope === "database") return "CONNECT";
@@ -472,6 +555,7 @@ export const mysqlUserAdminProvider: DatabaseUserAdminProvider = {
   detail: (user) => user.plugin,
   privilegesForScope: () => MYSQL_COMMON_PRIVILEGES,
   defaultPrivilegesForScope: () => ["SELECT"],
+  privilegeSelectionFromGrants: mysqlPrivilegeSelectionFromGrants,
 };
 
 export const postgresUserAdminProvider: DatabaseUserAdminProvider = {
