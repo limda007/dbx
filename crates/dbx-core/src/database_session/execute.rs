@@ -287,34 +287,6 @@ pub(crate) async fn execute_sql(
             drop(connections);
             client.execute(database, sql, max_rows, cancel_token, query_timeout).await
         }
-        #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::DuckDb(_) => {
-            let error = "DuckDB support is not compiled in this build".to_string();
-            connection_lifecycle::log_stage(
-                connection_lifecycle::StageLog::new(
-                    connection_lifecycle::LifecycleStage::QueryExecute,
-                    connection_lifecycle::StageOutcome::Error,
-                    execute_started.elapsed().as_millis(),
-                )
-                .with_context(execute_log_context)
-                .with_error(&error),
-            );
-            return Err(ExecuteSqlError::AlreadyLogged(error));
-        }
-        #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::DuckDbWorker(_) => {
-            let error = "DuckDB worker support is not compiled in this build".to_string();
-            connection_lifecycle::log_stage(
-                connection_lifecycle::StageLog::new(
-                    connection_lifecycle::LifecycleStage::QueryExecute,
-                    connection_lifecycle::StageOutcome::Error,
-                    execute_started.elapsed().as_millis(),
-                )
-                .with_context(execute_log_context)
-                .with_error(&error),
-            );
-            return Err(ExecuteSqlError::AlreadyLogged(error));
-        }
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
             let bare = *mode == crate::connection::MysqlMode::Bare;
@@ -673,10 +645,6 @@ pub(crate) async fn execute_sql(
                 duckdb_execute_with_max_rows(&con, &sql, max_rows)
             });
             wait_for_duckdb_task_with_interrupt(cancel_token, query_timeout, interrupt_handle, task).await
-        }
-        #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::ExternalTabular(_) => {
-            Err("External data sources require DuckDB support. Rebuild with default features.".to_string())
         }
         PoolKind::ExternalDriver { config, session, .. } => {
             let config = config.clone();

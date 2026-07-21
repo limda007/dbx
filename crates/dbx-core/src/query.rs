@@ -2143,26 +2143,14 @@ pub async fn execute_statements_in_transaction(
             | PoolKind::SqlServer(_)
             | PoolKind::Agent(_) => TxPath::Explicit,
             PoolKind::MessageQueue | PoolKind::Nacos => TxPath::None,
+            PoolKind::Redis(_)
+            | PoolKind::MongoDb(_)
+            | PoolKind::Elasticsearch(_)
+            | PoolKind::VectorDb(_)
+            | PoolKind::InfluxDb(_)
+            | PoolKind::ExternalDriver { .. } => TxPath::None,
             #[cfg(feature = "duckdb-bundled")]
-            PoolKind::DuckDb(_)
-            | PoolKind::DuckDbWorker(_)
-            | PoolKind::Redis(_)
-            | PoolKind::MongoDb(_)
-            | PoolKind::Elasticsearch(_)
-            | PoolKind::VectorDb(_)
-            | PoolKind::InfluxDb(_)
-            | PoolKind::ExternalTabular(_)
-            | PoolKind::ExternalDriver { .. } => TxPath::None,
-            #[cfg(not(feature = "duckdb-bundled"))]
-            PoolKind::DuckDb(_)
-            | PoolKind::DuckDbWorker(_)
-            | PoolKind::Redis(_)
-            | PoolKind::MongoDb(_)
-            | PoolKind::Elasticsearch(_)
-            | PoolKind::VectorDb(_)
-            | PoolKind::InfluxDb(_)
-            | PoolKind::ExternalTabular(_)
-            | PoolKind::ExternalDriver { .. } => TxPath::None,
+            PoolKind::DuckDb(_) | PoolKind::DuckDbWorker(_) | PoolKind::ExternalTabular(_) => TxPath::None,
         })
     };
 

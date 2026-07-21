@@ -49,13 +49,8 @@ mod duckdb_types {
     pub type DuckDbWorkerHandle = Arc<crate::db::duckdb_worker_process::DuckDbWorkerClient>;
     pub type ExternalTabularHandle = Arc<crate::external::ExternalPool>;
 }
-#[cfg(not(feature = "duckdb-bundled"))]
-mod duckdb_types {
-    pub type DuckDbHandle = ();
-    pub type DuckDbWorkerHandle = ();
-    pub type ExternalTabularHandle = ();
-}
 
+#[cfg(feature = "duckdb-bundled")]
 use duckdb_types::{DuckDbHandle, DuckDbWorkerHandle, ExternalTabularHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,7 +89,9 @@ pub(crate) enum PoolKind {
     Turso(db::turso_driver::TursoClient),
     CloudflareD1(db::cloudflare_d1_driver::CloudflareD1Client),
     Redis(db::redis_driver::RedisConnection),
+    #[cfg(feature = "duckdb-bundled")]
     DuckDb(DuckDbHandle),
+    #[cfg(feature = "duckdb-bundled")]
     DuckDbWorker(DuckDbWorkerHandle),
     MongoDb(mongodb::Client),
     ClickHouse(db::clickhouse_driver::ChClient),
@@ -103,6 +100,7 @@ pub(crate) enum PoolKind {
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
     Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
+    #[cfg(feature = "duckdb-bundled")]
     ExternalTabular(ExternalTabularHandle),
     ExternalDriver {
         driver_id: String,
@@ -2408,13 +2406,11 @@ impl AppState {
                         }
                     }
                 }
-                PoolKind::Sqlite(_)
-                | PoolKind::DuckDb(_)
-                | PoolKind::DuckDbWorker(_)
-                | PoolKind::ExternalTabular(_)
-                | PoolKind::ExternalDriver { .. }
-                | PoolKind::MessageQueue
-                | PoolKind::Nacos => false,
+                PoolKind::Sqlite(_) | PoolKind::ExternalDriver { .. } | PoolKind::MessageQueue | PoolKind::Nacos => {
+                    false
+                }
+                #[cfg(feature = "duckdb-bundled")]
+                PoolKind::DuckDb(_) | PoolKind::DuckDbWorker(_) | PoolKind::ExternalTabular(_) => false,
             }
         };
 
@@ -3127,13 +3123,11 @@ impl AppState {
                         }
                     }
                 }
-                PoolKind::Sqlite(_)
-                | PoolKind::DuckDb(_)
-                | PoolKind::DuckDbWorker(_)
-                | PoolKind::ExternalTabular(_)
-                | PoolKind::ExternalDriver { .. }
-                | PoolKind::MessageQueue
-                | PoolKind::Nacos => true,
+                PoolKind::Sqlite(_) | PoolKind::ExternalDriver { .. } | PoolKind::MessageQueue | PoolKind::Nacos => {
+                    true
+                }
+                #[cfg(feature = "duckdb-bundled")]
+                PoolKind::DuckDb(_) | PoolKind::DuckDbWorker(_) | PoolKind::ExternalTabular(_) => true,
                 PoolKind::Redis(_) => unreachable!("Redis handled separately"),
             };
             if !healthy {
@@ -3551,10 +3545,6 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         PoolKind::DuckDb(con) => PoolKind::DuckDb(con.clone()),
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDbWorker(client) => PoolKind::DuckDbWorker(client.clone()),
-        #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::DuckDb(_) => PoolKind::DuckDb(()),
-        #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::DuckDbWorker(_) => PoolKind::DuckDbWorker(()),
         PoolKind::MongoDb(client) => PoolKind::MongoDb(client.clone()),
         PoolKind::ClickHouse(client) => PoolKind::ClickHouse(client.clone()),
         PoolKind::SqlServer(client) => PoolKind::SqlServer(client.clone()),
@@ -3564,8 +3554,6 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         PoolKind::Agent(client) => PoolKind::Agent(client.clone()),
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::ExternalTabular(ext) => PoolKind::ExternalTabular(ext.clone()),
-        #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::ExternalTabular(_) => PoolKind::ExternalTabular(()),
         PoolKind::ExternalDriver { driver_id, config, session } => {
             PoolKind::ExternalDriver { driver_id: driver_id.clone(), config: config.clone(), session: session.clone() }
         }
@@ -3596,10 +3584,6 @@ pub(crate) async fn close_pool_kind(pool: PoolKind) {
         PoolKind::DuckDbWorker(client) => {
             client.shutdown().await;
         }
-        #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::DuckDb(_) => {}
-        #[cfg(not(feature = "duckdb-bundled"))]
-        PoolKind::DuckDbWorker(_) => {}
         PoolKind::MongoDb(client) => {
             drop(client);
         }
@@ -3622,6 +3606,7 @@ pub(crate) async fn close_pool_kind(pool: PoolKind) {
             let mut client = client.lock().await;
             let _ = client.disconnect().await;
         }
+        #[cfg(feature = "duckdb-bundled")]
         PoolKind::ExternalTabular(_) => {}
         PoolKind::ExternalDriver { session, .. } => {
             session.shutdown().await;
