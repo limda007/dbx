@@ -13,6 +13,8 @@ use crate::connection::{AppState, PoolKind};
 use crate::db::agent_driver::AgentDriverClient;
 use crate::db::elasticsearch_driver::EsClient;
 use crate::db::vector_driver::VectorClient;
+use crate::models::connection::ConnectionConfig;
+use crate::plugins::PluginDriverSession;
 
 /// Mongo-only pool handle (native driver or legacy agent).
 #[derive(Clone)]
@@ -131,6 +133,41 @@ pub(crate) async fn resolve_vector_client(state: &AppState, pool_key: &str) -> R
     let connections = state.connections.read().await;
     Ok(match connections.get(pool_key) {
         Some(PoolKind::VectorDb(client)) => Some(client.clone()),
+        Some(_) => None,
+        None => return Err("Connection not found".to_string()),
+    })
+}
+
+/// External (plugin) driver session handle for schema early paths.
+#[derive(Clone)]
+pub(crate) struct ExternalDriverHandle {
+    pub config: Arc<ConnectionConfig>,
+    pub session: Arc<PluginDriverSession>,
+}
+
+/// Resolve a plugin external-driver session, if the pool is that kind.
+pub(crate) async fn resolve_external_driver(
+    state: &AppState,
+    pool_key: &str,
+) -> Result<Option<ExternalDriverHandle>, String> {
+    let connections = state.connections.read().await;
+    Ok(match connections.get(pool_key) {
+        Some(PoolKind::ExternalDriver { config, session, .. }) => {
+            Some(ExternalDriverHandle { config: config.clone(), session: session.clone() })
+        }
+        Some(_) => None,
+        None => return Err("Connection not found".to_string()),
+    })
+}
+
+/// Resolve a legacy agent driver client, if the pool is that kind.
+pub(crate) async fn resolve_agent_client(
+    state: &AppState,
+    pool_key: &str,
+) -> Result<Option<Arc<Mutex<AgentDriverClient>>>, String> {
+    let connections = state.connections.read().await;
+    Ok(match connections.get(pool_key) {
+        Some(PoolKind::Agent(client)) => Some(client.clone()),
         Some(_) => None,
         None => return Err("Connection not found".to_string()),
     })

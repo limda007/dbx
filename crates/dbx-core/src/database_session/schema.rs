@@ -524,6 +524,139 @@ pub(crate) async fn get_table_ddl(
     }
 }
 
+/// Table comment lookup for native MySQL/Postgres (and related exclusions).
+///
+/// SqlServer / Oracle-agent special cases stay in `schema.rs` orchestration
+/// (linked-server guard, agent SQL). Returns `Err` when the pool type is
+/// unsupported so callers can surface the product error string.
+pub(crate) async fn get_table_comment(
+    state: &AppState,
+    pool_key: &str,
+    db_config: Option<&ConnectionConfig>,
+    schema: &str,
+    table: &str,
+) -> Result<Option<String>, String> {
+    let connections = state.connections.read().await;
+    let pool = connections.get(pool_key).ok_or("Pool not found")?;
+    match pool {
+        PoolKind::Mysql(p, mode)
+            if *mode != MysqlMode::OceanBaseOracle
+                && !db_config.is_some_and(crate::schema::is_doris_family_config)
+                && !db_config.is_some_and(crate::schema::is_manticoresearch_config) =>
+        {
+            db::mysql::get_table_comment(p, schema, table).await
+        }
+        PoolKind::Postgres(p) if !db_config.is_some_and(crate::schema::is_questdb_config) => {
+            db::postgres::get_table_comment(p, schema, table).await
+        }
+        _ => Err("Table comment lookup is not supported for this connection".to_string()),
+    }
+}
+
+/// Driver waterfall for completion-assistant catalog search.
+///
+/// Returns `Ok(Some(response))` when a pool/driver handled the request.
+/// Returns `Ok(None)` when no matching driver exists or the agent method is
+/// unsupported — callers should run `completion_assistant_fallback_core`.
+pub(crate) async fn try_completion_assistant_search(
+    state: &AppState,
+    pool_key: &str,
+    request: &db::CompletionAssistantRequest,
+    db_config: Option<&ConnectionConfig>,
+    #[cfg_attr(not(feature = "duckdb-bundled"), allow(unused_variables))] duckdb_attached_names: &[String],
+) -> Result<Option<db::CompletionAssistantResponse>, String> {
+    {
+        let connections = state.connections.read().await;
+        if let Some(client) = connections.get(pool_key).and_then(|pool| match pool {
+            PoolKind::SqlServer(client) => Some(client.clone()),
+            _ => None,
+        }) {
+            drop(connections);
+            let mut client = client.lock().await;
+            return Ok(Some(db::sqlserver::completion_assistant_search(&mut client, request).await?));
+        }
+    }
+
+    {
+        let connections = state.connections.read().await;
+        if let Some(pool) = connections.get(pool_key).and_then(|pool| match pool {
+            PoolKind::Sqlite(pool) => Some(pool.clone()),
+            _ => None,
+        }) {
+            drop(connections);
+            return Ok(Some(db::sqlite::completion_assistant_search(&pool, request).await?));
+        }
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    {
+        let connections = state.connections.read().await;
+        if let Some(con) = connections.get(pool_key).and_then(|pool| match pool {
+            PoolKind::DuckDb(con) => Some(con.clone()),
+            _ => None,
+        }) {
+            drop(connections);
+            let con = con.lock().map_err(|e| e.to_string())?;
+            return Ok(Some(crate::schema::duckdb_completion_assistant_search(&con, request, duckdb_attached_names)?));
+        }
+    }
+
+    {
+        let connections = state.connections.read().await;
+        if let Some(pool) = connections.get(pool_key).and_then(|pool| match pool {
+            PoolKind::Postgres(pool) => Some(pool.clone()),
+            _ => None,
+        }) {
+            drop(connections);
+            return Ok(Some(db::postgres::completion_assistant_search(&pool, request).await?));
+        }
+    }
+
+    {
+        let connections = state.connections.read().await;
+        if let Some(pool) = connections.get(pool_key).and_then(|pool| match pool {
+            PoolKind::Mysql(pool, mode) if *mode != MysqlMode::OceanBaseOracle => Some(pool.clone()),
+            _ => None,
+        }) {
+            drop(connections);
+            return Ok(Some(db::mysql::completion_assistant_search(&pool, request).await?));
+        }
+    }
+
+    {
+        let connections = state.connections.read().await;
+        if let Some(client) = connections.get(pool_key).and_then(|pool| match pool {
+            PoolKind::Agent(client) => Some(client.clone()),
+            _ => None,
+        }) {
+            drop(connections);
+            let mut client = client.lock().await;
+            match client
+                .completion_assistant_search::<db::CompletionAssistantResponse>(
+                    request,
+                    crate::schema::agent_metadata_timeout(db_config),
+                )
+                .await
+            {
+                Ok(mut response) => {
+                    response.fallback_used = false;
+                    return Ok(Some(response));
+                }
+                Err(error) if crate::schema::is_agent_completion_assistant_unsupported(&error) => {
+                    log::debug!(
+                        "[schema][completion_assistant:agent-fallback] connection_id={} reason={}",
+                        request.connection_id,
+                        error
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Dispatch for object source (view/function/procedure body text).
 ///
 /// Owns ExternalDriver / Agent / SqlServer / native `PoolKind` matches so

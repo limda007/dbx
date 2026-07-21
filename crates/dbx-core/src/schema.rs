@@ -1,4 +1,4 @@
-use crate::connection::{connection_url_for_endpoint, database_connection_config, AppState, MysqlMode, PoolKind};
+use crate::connection::{connection_url_for_endpoint, database_connection_config, AppState, PoolKind};
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query::{agent_execute_query_params, QueryExecutionOptions};
@@ -887,23 +887,31 @@ pub async fn resolve_external_doris_catalog(
 async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     log::info!("[list_databases] connection_id={connection_id}");
     let db_config = connection_config(state, connection_id).await;
+    if let Some(ext) = crate::database_session::resolve_external_driver(state, connection_id).await? {
+        return ext
+            .session
+            .invoke_with_timeout::<Vec<db::DatabaseInfo>>(
+                "listDatabases",
+                serde_json::json!({ "connection": ext.config.as_ref() }),
+                agent_metadata_timeout(Some(ext.config.as_ref())),
+            )
+            .await;
+    }
+    if let Some(client) = crate::database_session::resolve_agent_client(state, connection_id).await? {
+        let is_mongo =
+            state.configs.read().await.get(connection_id).is_some_and(|c| c.db_type == DatabaseType::MongoDb);
+        if is_mongo {
+            let dbs = crate::mongo_ops::mongo_list_databases_core(state, connection_id).await?;
+            return Ok(dbs.into_iter().map(|name| db::DatabaseInfo { name }).collect());
+        }
+        let mut client = client.lock().await;
+        return client.list_databases(agent_metadata_timeout(db_config.as_ref())).await;
+    }
     {
         let connections = state.connections.read().await;
         #[cfg(feature = "duckdb-bundled")]
         if extract_pool!(&connections, connection_id, ExternalTabular).is_some() {
             return Ok(vec![db::DatabaseInfo { name: "main".to_string() }]);
-        }
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(connection_id) {
-            let config = config.clone();
-            let session = session.clone();
-            drop(connections);
-            return session
-                .invoke_with_timeout::<Vec<db::DatabaseInfo>>(
-                    "listDatabases",
-                    serde_json::json!({ "connection": config.as_ref() }),
-                    agent_metadata_timeout(Some(config.as_ref())),
-                )
-                .await;
         }
         if let Some(client) = extract_pool!(&connections, connection_id, ClickHouse) {
             drop(connections);
@@ -914,18 +922,6 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
             return db::influxdb_driver::list_databases(&client).await;
         }
         try_sqlserver!(connections, connection_id, list_databases);
-        if let Some(client) = extract_pool!(&connections, connection_id, Agent) {
-            let is_mongo =
-                state.configs.read().await.get(connection_id).is_some_and(|c| c.db_type == DatabaseType::MongoDb);
-            if is_mongo {
-                drop(connections);
-                let dbs = crate::mongo_ops::mongo_list_databases_core(state, connection_id).await?;
-                return Ok(dbs.into_iter().map(|name| db::DatabaseInfo { name }).collect());
-            }
-            drop(connections);
-            let mut client = client.lock().await;
-            return client.list_databases(agent_metadata_timeout(db_config.as_ref())).await;
-        }
     }
 
     #[cfg(feature = "duckdb-bundled")]
@@ -969,11 +965,8 @@ async fn list_schema_infos_once(
     database: &str,
 ) -> Result<Vec<db::SchemaInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-    {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::Postgres(pool)) = connections.get(&pool_key) {
-            return db::postgres::list_schema_infos(pool).await;
-        }
+    if let Some(pool) = crate::database_session::resolve_postgres_pool(state, &pool_key).await? {
+        return db::postgres::list_schema_infos(&pool).await;
     }
 
     let schemas = list_schemas_once(state, connection_id, database, false).await?;
@@ -988,22 +981,18 @@ pub async fn list_data_types_core(
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
         let db_config = connection_config(state, connection_id).await;
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-            let config = config.clone();
-            let session = session.clone();
-            drop(connections);
-            return session
+        if let Some(ext) = crate::database_session::resolve_external_driver(state, &pool_key).await? {
+            return ext
+                .session
                 .invoke_with_timeout::<Vec<String>>(
                     "listDataTypes",
-                    serde_json::json!({ "connection": config.as_ref(), "database": database }),
-                    agent_metadata_timeout(Some(config.as_ref())),
+                    serde_json::json!({ "connection": ext.config.as_ref(), "database": database }),
+                    agent_metadata_timeout(Some(ext.config.as_ref())),
                 )
                 .await
                 .map(deduplicate_data_type_names);
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
+        if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
             let mut client = client.lock().await;
             return client
                 .list_data_types::<Vec<String>>(database, agent_metadata_timeout(db_config.as_ref()))
@@ -1041,78 +1030,69 @@ async fn list_schemas_once(
     let db_config = connection_config(state, connection_id).await;
     let visible_schema_filter = visible_schema_filter(db_config.as_ref(), database, apply_visible_filter);
 
-    {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-            let config = config.clone();
-            let session = session.clone();
-            drop(connections);
-            return session
-                .invoke_with_timeout::<Vec<String>>(
-                    "listSchemas",
-                    serde_json::json!({ "connection": config.as_ref(), "database": database }),
-                    agent_metadata_timeout(Some(config.as_ref())),
-                )
-                .await;
-        }
-        try_sqlserver!(connections, &pool_key, list_schemas);
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            let fallback_config = db_config.clone();
-            drop(connections);
-            let mut client = client.lock().await;
-            match client
-                .list_schemas_filtered::<Vec<String>>(
-                    database,
-                    visible_schema_filter.as_deref(),
-                    agent_metadata_timeout(db_config.as_ref()),
-                )
-                .await
-            {
-                Ok(schemas) if !schemas.is_empty() => {
-                    return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
-                }
-                Ok(schemas) => {
-                    if let Some(config) = fallback_config.as_ref() {
-                        match native_postgres_metadata_pool(state, connection_id, database, config).await {
-                            Ok(Some(pool)) => {
-                                return db::postgres::list_schemas(&pool).await.map(|schemas| {
-                                    filter_visible_schema_names(schemas, visible_schema_filter.as_deref())
-                                })
-                            }
-                            Ok(None) => {
-                                return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
-                            }
-                            Err(error) => {
-                                log::warn!(
-                                    "[schema][agent:list_schemas:fallback-failed] connection_id={} database={} error={}",
-                                    connection_id,
-                                    database,
-                                    error
-                                );
-                            }
-                        }
-                    }
-                    return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()));
-                }
-                Err(agent_error) => {
-                    if let Some(config) = fallback_config.as_ref() {
-                        if let Some(pool) =
-                            native_postgres_metadata_pool(state, connection_id, database, config).await?
-                        {
+    if let Some(ext) = crate::database_session::resolve_external_driver(state, &pool_key).await? {
+        return ext
+            .session
+            .invoke_with_timeout::<Vec<String>>(
+                "listSchemas",
+                serde_json::json!({ "connection": ext.config.as_ref(), "database": database }),
+                agent_metadata_timeout(Some(ext.config.as_ref())),
+            )
+            .await;
+    }
+    if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+        let fallback_config = db_config.clone();
+        let mut client = client.lock().await;
+        match client
+            .list_schemas_filtered::<Vec<String>>(
+                database,
+                visible_schema_filter.as_deref(),
+                agent_metadata_timeout(db_config.as_ref()),
+            )
+            .await
+        {
+            Ok(schemas) if !schemas.is_empty() => {
+                return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+            }
+            Ok(schemas) => {
+                if let Some(config) = fallback_config.as_ref() {
+                    match native_postgres_metadata_pool(state, connection_id, database, config).await {
+                        Ok(Some(pool)) => {
                             return db::postgres::list_schemas(&pool)
                                 .await
                                 .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
-                                .map_err(|fallback_error| {
-                                    format!(
-                                        "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
-                                    )
-                                });
+                        }
+                        Ok(None) => return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
+                        Err(error) => {
+                            log::warn!(
+                                "[schema][agent:list_schemas:fallback-failed] connection_id={} database={} error={}",
+                                connection_id,
+                                database,
+                                error
+                            );
                         }
                     }
-                    return Err(agent_error);
                 }
+                return Ok(filter_visible_schema_names(schemas, visible_schema_filter.as_deref()));
+            }
+            Err(agent_error) => {
+                if let Some(config) = fallback_config.as_ref() {
+                    if let Some(pool) = native_postgres_metadata_pool(state, connection_id, database, config).await? {
+                        return db::postgres::list_schemas(&pool)
+                            .await
+                            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+                            .map_err(|fallback_error| {
+                                format!("{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}")
+                            });
+                    }
+                }
+                return Err(agent_error);
             }
         }
+    }
+    {
+        let connections = state.connections.read().await;
+        try_sqlserver!(connections, &pool_key, list_schemas);
     }
 
     crate::database_session::list_schemas(state, &pool_key, database, connection_id)
@@ -1227,22 +1207,7 @@ pub async fn get_table_comment_core(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-
-        match pool {
-            PoolKind::Mysql(p, mode)
-                if *mode != MysqlMode::OceanBaseOracle
-                    && !db_config.as_ref().is_some_and(is_doris_family_config)
-                    && !db_config.as_ref().is_some_and(is_manticoresearch_config) =>
-            {
-                db::mysql::get_table_comment(p, schema, table).await
-            }
-            PoolKind::Postgres(p) if !db_config.as_ref().is_some_and(is_questdb_config) => {
-                db::postgres::get_table_comment(p, schema, table).await
-            }
-            _ => Err("Table comment lookup is not supported for this connection".to_string()),
-        }
+        crate::database_session::get_table_comment(state, &pool_key, db_config.as_ref(), schema, table).await
     })
     .await
 }
@@ -1730,6 +1695,39 @@ async fn list_tables_once(
     let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
     let db_config = connection_config(state, connection_id).await;
 
+    if let Some(ext) = crate::database_session::resolve_external_driver(state, &pool_key).await? {
+        let config = ext.config;
+        let session = ext.session;
+        if uses_presto_like_information_schema_tables(&config.db_type) {
+            return external_driver_presto_like_tables(
+                session,
+                config.as_ref(),
+                database,
+                schema,
+                filter,
+                limit,
+                offset,
+            )
+            .await
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+        }
+        let mut params = serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema });
+        if let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) {
+            params["filter"] = serde_json::json!(filter);
+        }
+        if let Some(object_types) = object_types {
+            params["object_types"] = serde_json::json!(object_types);
+        }
+        return session
+            .invoke_with_timeout::<Vec<db::TableInfo>>(
+                "listTables",
+                params,
+                agent_metadata_timeout(Some(config.as_ref())),
+            )
+            .await
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+    }
+
     {
         let connections = state.connections.read().await;
         #[cfg(feature = "duckdb-bundled")]
@@ -1743,40 +1741,6 @@ async fn list_tables_once(
             .await
             .map_err(|e| e.to_string())?
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
-        }
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-            let config = config.clone();
-            let session = session.clone();
-            drop(connections);
-            if uses_presto_like_information_schema_tables(&config.db_type) {
-                return external_driver_presto_like_tables(
-                    session,
-                    config.as_ref(),
-                    database,
-                    schema,
-                    filter,
-                    limit,
-                    offset,
-                )
-                .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
-            }
-            let mut params =
-                serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema });
-            if let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) {
-                params["filter"] = serde_json::json!(filter);
-            }
-            if let Some(object_types) = object_types {
-                params["object_types"] = serde_json::json!(object_types);
-            }
-            return session
-                .invoke_with_timeout::<Vec<db::TableInfo>>(
-                    "listTables",
-                    params,
-                    agent_metadata_timeout(Some(config.as_ref())),
-                )
-                .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
         }
         #[cfg(feature = "duckdb-bundled")]
         if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {
@@ -3451,82 +3415,22 @@ pub async fn completion_assistant_search_core(
     retry_metadata_connection(state, &request.connection_id, Some(&request.database), || async {
         let pool_key = state.get_or_create_pool(&request.connection_id, Some(&request.database)).await?;
         log::debug!("[schema][completion_assistant:start] {request_summary}");
-        {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, completion_assistant_search, &request);
-        }
-
-        {
-            let connections = state.connections.read().await;
-            if let Some(pool) = connections.get(&pool_key).and_then(|pool| match pool {
-                PoolKind::Sqlite(pool) => Some(pool.clone()),
-                _ => None,
-            }) {
-                drop(connections);
-                return db::sqlite::completion_assistant_search(&pool, &request).await;
-            }
-        }
-
+        let db_config = connection_config(state, &request.connection_id).await;
         #[cfg(feature = "duckdb-bundled")]
-        {
-            let duckdb_attached_names = duckdb_attached_database_names(state, &request.connection_id).await;
-            let connections = state.connections.read().await;
-            if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {
-                drop(connections);
-                let con = con.lock().map_err(|e| e.to_string())?;
-                return duckdb_completion_assistant_search(&con, &request, &duckdb_attached_names);
-            }
-        }
+        let duckdb_attached_names = duckdb_attached_database_names(state, &request.connection_id).await;
+        #[cfg(not(feature = "duckdb-bundled"))]
+        let duckdb_attached_names: Vec<String> = Vec::new();
 
+        if let Some(response) = crate::database_session::try_completion_assistant_search(
+            state,
+            &pool_key,
+            &request,
+            db_config.as_ref(),
+            &duckdb_attached_names,
+        )
+        .await?
         {
-            let connections = state.connections.read().await;
-            if let Some(pool) = connections.get(&pool_key).and_then(|pool| match pool {
-                PoolKind::Postgres(pool) => Some(pool.clone()),
-                _ => None,
-            }) {
-                drop(connections);
-                return db::postgres::completion_assistant_search(&pool, &request).await;
-            }
-        }
-
-        {
-            let connections = state.connections.read().await;
-            if let Some(pool) = connections.get(&pool_key).and_then(|pool| match pool {
-                PoolKind::Mysql(pool, mode) if *mode != MysqlMode::OceanBaseOracle => Some(pool.clone()),
-                _ => None,
-            }) {
-                drop(connections);
-                return db::mysql::completion_assistant_search(&pool, &request).await;
-            }
-        }
-
-        {
-            let connections = state.connections.read().await;
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                let db_config = connection_config(state, &request.connection_id).await;
-                drop(connections);
-                let mut client = client.lock().await;
-                match client
-                    .completion_assistant_search::<db::CompletionAssistantResponse>(
-                        &request,
-                        agent_metadata_timeout(db_config.as_ref()),
-                    )
-                    .await
-                {
-                    Ok(mut response) => {
-                        response.fallback_used = false;
-                        return Ok(response);
-                    }
-                    Err(error) if is_agent_completion_assistant_unsupported(&error) => {
-                        log::debug!(
-                            "[schema][completion_assistant:agent-fallback] {} reason={}",
-                            request_summary,
-                            error
-                        );
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            return Ok(response);
         }
 
         let response = completion_assistant_fallback_core(state, &request).await;
@@ -3544,7 +3448,7 @@ pub async fn completion_assistant_search_core(
     .await
 }
 
-fn is_agent_completion_assistant_unsupported(error: &str) -> bool {
+pub(crate) fn is_agent_completion_assistant_unsupported(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("unknown method: completion_assistant_search_v1")
         || error.contains("method not found: completion_assistant_search_v1")
@@ -3724,6 +3628,38 @@ async fn list_objects_once(
     let (mysql_limit, mysql_offset) =
         if filter.is_none_or(|value| value.trim().is_empty()) { (limit, offset) } else { (None, None) };
 
+    if let Some(ext) = crate::database_session::resolve_external_driver(state, &pool_key).await? {
+        let config = ext.config;
+        let session = ext.session;
+        if uses_presto_like_information_schema_tables(&config.db_type) {
+            return external_driver_presto_like_objects(
+                session,
+                config.as_ref(),
+                database,
+                schema,
+                filter,
+                object_types,
+            )
+            .await
+            .map(unpaged_object_list);
+        }
+        let mut params = serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema });
+        if let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) {
+            params["filter"] = serde_json::json!(filter);
+        }
+        if let Some(object_types) = object_types {
+            params["object_types"] = serde_json::json!(object_types);
+        }
+        return session
+            .invoke_with_timeout::<Vec<db::ObjectInfo>>(
+                "listObjects",
+                params,
+                agent_metadata_timeout(Some(config.as_ref())),
+            )
+            .await
+            .map(unpaged_object_list);
+    }
+
     {
         let connections = state.connections.read().await;
         #[cfg(feature = "duckdb-bundled")]
@@ -3751,39 +3687,6 @@ async fn list_objects_once(
             .await
             .map_err(|e| e.to_string())?;
             return objects.map(unpaged_object_list);
-        }
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-            let config = config.clone();
-            let session = session.clone();
-            drop(connections);
-            if uses_presto_like_information_schema_tables(&config.db_type) {
-                return external_driver_presto_like_objects(
-                    session,
-                    config.as_ref(),
-                    database,
-                    schema,
-                    filter,
-                    object_types,
-                )
-                .await
-                .map(unpaged_object_list);
-            }
-            let mut params =
-                serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema });
-            if let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) {
-                params["filter"] = serde_json::json!(filter);
-            }
-            if let Some(object_types) = object_types {
-                params["object_types"] = serde_json::json!(object_types);
-            }
-            return session
-                .invoke_with_timeout::<Vec<db::ObjectInfo>>(
-                    "listObjects",
-                    params,
-                    agent_metadata_timeout(Some(config.as_ref())),
-                )
-                .await
-                .map(unpaged_object_list);
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
             drop(connections);
@@ -3927,24 +3830,20 @@ async fn list_completion_objects_once(
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
 
-    let connections = state.connections.read().await;
-    if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-        let config = config.clone();
-        let session = session.clone();
-        drop(connections);
-        return session
+    if let Some(ext) = crate::database_session::resolve_external_driver(state, &pool_key).await? {
+        return ext
+            .session
             .invoke_with_timeout::<Vec<db::ObjectInfo>>(
                 "listObjects",
-                serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema }),
-                agent_metadata_timeout(Some(config.as_ref())),
+                serde_json::json!({ "connection": ext.config.as_ref(), "database": database, "schema": schema }),
+                agent_metadata_timeout(Some(ext.config.as_ref())),
             )
             .await
             .map(filter_completion_objects);
     }
-    if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+    if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
         let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
         let fallback_config = db_config.clone();
-        drop(connections);
         let objects = if is_oracle {
             oracle_agent_list_objects(client, database, schema, agent_metadata_timeout(db_config.as_ref())).await?
         } else {
@@ -3997,7 +3896,6 @@ async fn list_completion_objects_once(
         };
         return Ok(filter_completion_objects(objects));
     }
-    drop(connections);
 
     match crate::database_session::list_completion_objects(state, &pool_key, db_config.as_ref(), database, schema)
         .await?
@@ -4082,6 +3980,45 @@ pub async fn get_columns_core(
         let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
         let db_config = connection_config(state, connection_id).await;
 
+        if let Some(ext) = crate::database_session::resolve_external_driver(state, &pool_key).await? {
+            let config = ext.config;
+            let session = ext.session;
+            if uses_presto_like_information_schema_tables(&config.db_type) {
+                return external_driver_presto_like_columns(session, config.as_ref(), database, schema, table).await;
+            }
+            let columns = session
+                .invoke_with_timeout::<Vec<db::ColumnInfo>>(
+                    "getColumns",
+                    serde_json::json!({
+                        "connection": config.as_ref(),
+                        "database": database,
+                        "schema": schema,
+                        "table": table,
+                    }),
+                    agent_metadata_timeout(Some(config.as_ref())),
+                )
+                .await?;
+            if columns.is_empty() && config.db_type == DatabaseType::Oracle {
+                match external_driver_oracle_columns_via_sql(session.clone(), config.as_ref(), database, schema, table)
+                    .await
+                {
+                    Ok(fallback_columns) if !fallback_columns.is_empty() => return Ok(fallback_columns),
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!(
+                            "[schema][external-driver:get_columns:oracle-fallback-failed] connection_id={} database={} schema={} table={} error={}",
+                            connection_id,
+                            database,
+                            schema,
+                            table,
+                            error
+                        );
+                    }
+                }
+            }
+            return Ok(deduplicate_column_infos(columns));
+        }
+
         {
             let connections = state.connections.read().await;
             #[cfg(feature = "duckdb-bundled")]
@@ -4095,51 +4032,6 @@ pub async fn get_columns_core(
                 })
                 .await
                 .map_err(|e| e.to_string())?;
-            }
-            if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-                let config = config.clone();
-                let session = session.clone();
-                drop(connections);
-                if uses_presto_like_information_schema_tables(&config.db_type) {
-                    return external_driver_presto_like_columns(session, config.as_ref(), database, schema, table).await;
-                }
-                let columns = session
-                    .invoke_with_timeout::<Vec<db::ColumnInfo>>(
-                        "getColumns",
-                        serde_json::json!({
-                            "connection": config.as_ref(),
-                            "database": database,
-                            "schema": schema,
-                            "table": table,
-                        }),
-                        agent_metadata_timeout(Some(config.as_ref())),
-                    )
-                    .await?;
-                if columns.is_empty() && config.db_type == DatabaseType::Oracle {
-                    match external_driver_oracle_columns_via_sql(
-                        session.clone(),
-                        config.as_ref(),
-                        database,
-                        schema,
-                        table,
-                    )
-                    .await
-                    {
-                        Ok(fallback_columns) if !fallback_columns.is_empty() => return Ok(fallback_columns),
-                        Ok(_) => {}
-                        Err(error) => {
-                            log::warn!(
-                                "[schema][external-driver:get_columns:oracle-fallback-failed] connection_id={} database={} schema={} table={} error={}",
-                                connection_id,
-                                database,
-                                schema,
-                                table,
-                                error
-                            );
-                        }
-                    }
-                }
-                return Ok(deduplicate_column_infos(columns));
             }
             #[cfg(feature = "duckdb-bundled")]
             if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {

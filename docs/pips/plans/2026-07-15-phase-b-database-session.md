@@ -241,13 +241,20 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 ## Residual (out of Phase B)
 
-- `schema.rs` agent/external early paths for list_* / completion / Doris / vector still peek `PoolKind`
+- `schema.rs` still uses `extract_pool!` / `try_sqlserver!` for ClickHouse / Influx / DuckDb /
+  SqlServer / Agent peeks that need lock-held early returns (not always Clone-friendly)
 - `query.rs` txn / agent helpers / drop-database reconnect
 - orphan uncompiled `schema/providers/native.rs` (cleanup later)
 
 ## Immediate next step
 
-Domain-ops + export streams (2026-07-21). **S5 `get_object_source` dispatch moved into
-`database_session::get_object_source`** (ExternalDriver / Agent / SqlServer / native arms).
-**S2/S3:** Doris catalog APIs use `resolve_mysql_pool`; vector browser uses `resolve_vector_client`.
-Next candidates: completion_assistant waterfall (S4); list_* External/Agent early peeks (S1).
+Schema residual slices landed 2026-07-21:
+
+- **S5** `get_object_source` → session
+- **S2/S3** Doris `resolve_mysql_pool` + vector `resolve_vector_client`
+- **S4** completion assistant waterfall → `try_completion_assistant_search`
+- **S6** native table comment → `get_table_comment`
+- **S1** ExternalDriver / Agent / Postgres peeks → `resolve_external_driver` /
+  `resolve_agent_client` / `resolve_postgres_pool`
+
+Next: optional further `extract_pool!` collapse; `query.rs` residuals.
