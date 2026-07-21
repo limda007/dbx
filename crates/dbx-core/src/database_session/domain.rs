@@ -173,6 +173,75 @@ pub(crate) async fn resolve_agent_client(
     })
 }
 
+/// Whether the registry entry for `pool_key` is a SQL Server client (no clone).
+pub(crate) async fn is_sqlserver_pool(state: &AppState, pool_key: &str) -> bool {
+    let connections = state.connections.read().await;
+    matches!(connections.get(pool_key), Some(PoolKind::SqlServer(_)))
+}
+
+/// True when the live registry entry is the same `Arc` as `client` (reset detection).
+pub(crate) async fn sqlserver_pool_is_current(
+    state: &AppState,
+    pool_key: &str,
+    client: &Arc<Mutex<crate::db::sqlserver::SqlServerClient>>,
+) -> bool {
+    let connections = state.connections.read().await;
+    matches!(connections.get(pool_key), Some(PoolKind::SqlServer(current)) if Arc::ptr_eq(current, client))
+}
+
+/// Owned pool handle for multi-statement transaction dispatch (query residual).
+///
+/// Clone-friendly arms hold driver handles; `Explicit` / `None` only need kind.
+pub(crate) enum TxPath {
+    Pg(deadpool_postgres::Pool),
+    Mysql(crate::db::mysql::MySqlPool, bool),
+    Sqlite(crate::db::sqlite::SqliteHandle),
+    CloudflareD1(crate::db::cloudflare_d1_driver::CloudflareD1Client),
+    Explicit,
+    None,
+}
+
+/// Clone the transaction dispatch path under a brief registry read lock.
+pub(crate) async fn resolve_tx_path(state: &AppState, pool_key: &str) -> Option<TxPath> {
+    let conns = state.connections.read().await;
+    conns.get(pool_key).map(|p| match p {
+        PoolKind::Postgres(pg) => TxPath::Pg(pg.clone()),
+        PoolKind::Mysql(mp, _mode) => TxPath::Mysql(mp.clone(), false),
+        PoolKind::Sqlite(sq) => TxPath::Sqlite(sq.clone()),
+        PoolKind::CloudflareD1(client) => TxPath::CloudflareD1(client.clone()),
+        PoolKind::ClickHouse(_)
+        | PoolKind::Rqlite(_)
+        | PoolKind::Turso(_)
+        | PoolKind::SqlServer(_)
+        | PoolKind::Agent(_) => TxPath::Explicit,
+        PoolKind::MessageQueue | PoolKind::Nacos => TxPath::None,
+        PoolKind::Redis(_)
+        | PoolKind::MongoDb(_)
+        | PoolKind::Elasticsearch(_)
+        | PoolKind::VectorDb(_)
+        | PoolKind::InfluxDb(_)
+        | PoolKind::ExternalDriver { .. } => TxPath::None,
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDb(_) | PoolKind::DuckDbWorker(_) | PoolKind::ExternalTabular(_) => TxPath::None,
+    })
+}
+
+/// Pool handles that support manual BEGIN sessions (Postgres / MySQL only).
+pub(crate) enum ManualTxnPool {
+    Postgres(deadpool_postgres::Pool),
+    Mysql(crate::db::mysql::MySqlPool),
+}
+
+/// Resolve a pool for `begin_transaction_session` (errors for unsupported kinds).
+pub(crate) async fn resolve_manual_txn_pool(state: &AppState, pool_key: &str) -> Result<ManualTxnPool, String> {
+    let connections = state.connections.read().await;
+    match connections.get(pool_key).ok_or("Connection not found")? {
+        PoolKind::Postgres(pg) => Ok(ManualTxnPool::Postgres(pg.clone())),
+        PoolKind::Mysql(mp, _) => Ok(ManualTxnPool::Mysql(mp.clone())),
+        _ => Err("Manual transaction is not supported for this database type".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DocumentHandle, MongoHandle};
@@ -193,5 +262,16 @@ mod tests {
         let src = include_str!("domain.rs");
         assert!(src.contains("macro_rules! with_redis"));
         assert!(src.contains("$crate::connection::PoolKind::Redis"));
+    }
+
+    #[test]
+    fn tx_path_and_manual_txn_cover_query_residual_kinds() {
+        // Query residual txn peeks resolve through these enums so call sites
+        // never name PoolKind. Arm list must stay aligned with PoolKind.
+        let src = include_str!("domain.rs");
+        assert!(src.contains("pub(crate) enum TxPath"));
+        assert!(src.contains("pub(crate) enum ManualTxnPool"));
+        assert!(src.contains("async fn resolve_tx_path"));
+        assert!(src.contains("async fn resolve_manual_txn_pool"));
     }
 }

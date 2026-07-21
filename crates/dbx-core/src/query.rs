@@ -22,7 +22,9 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{AppState, PoolKind, TransactionSession, TxnConnection};
+#[cfg(test)]
+use crate::connection::PoolKind;
+use crate::connection::{AppState, TransactionSession, TxnConnection};
 use crate::connection_lifecycle::{self, resolve_query_timeout};
 use crate::database_capabilities;
 // Public re-export: callers may keep using `crate::query::DbOperationBudget`.
@@ -1097,15 +1099,6 @@ where
     }
 }
 
-async fn sqlserver_pool_is_current(
-    state: &AppState,
-    pool_key: &str,
-    client: &Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>,
-) -> bool {
-    let connections = state.connections.read().await;
-    matches!(connections.get(pool_key), Some(PoolKind::SqlServer(current)) if Arc::ptr_eq(current, client))
-}
-
 pub async fn operation_budget_for_pool_key(
     state: &AppState,
     pool_key: &str,
@@ -1458,14 +1451,9 @@ async fn execute_postgres_drop_database(
     }
 
     check_read_only_for_connection(state, &pool_key, sql).await?;
-    let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
-            Some(PoolKind::Postgres(pool)) => pool.clone(),
-            Some(_) => return Err("DROP DATABASE reconnect did not create a PostgreSQL connection".to_string()),
-            None => return Err("Connection not found".to_string()),
-        }
-    };
+    let pool = crate::database_session::resolve_postgres_pool(state, &pool_key)
+        .await?
+        .ok_or_else(|| "DROP DATABASE reconnect did not create a PostgreSQL connection".to_string())?;
 
     let query_timeout = resolve_query_timeout(options.timeout_secs);
     let max_rows = options.max_rows;
@@ -1521,27 +1509,19 @@ pub async fn close_query_session(
         state.get_or_create_pool_for_session(connection_id, Some(database), client_session_id).await?
     };
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Connection not found")?;
-    match pool {
-        PoolKind::Agent(client) => {
-            let client = client.clone();
-            drop(connections);
-            let mut client = client.lock().await;
-            client.close_query_session(session_id).await
-        }
-        PoolKind::ExternalDriver { config, session, .. } => {
-            let config = config.clone();
-            let session = session.clone();
-            drop(connections);
-            let params = external_driver_fetch_query_page_params(config.as_ref(), session_id, 1);
-            session
-                .invoke::<serde_json::Value>("closeQuerySession", params)
-                .await
-                .map(|value| value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false))
-        }
-        _ => Ok(false),
+    if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+        let mut client = client.lock().await;
+        return client.close_query_session(session_id).await;
     }
+    if let Some(ext) = crate::database_session::resolve_external_driver(state, &pool_key).await? {
+        let params = external_driver_fetch_query_page_params(ext.config.as_ref(), session_id, 1);
+        return ext
+            .session
+            .invoke::<serde_json::Value>("closeQuerySession", params)
+            .await
+            .map(|value| value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false));
+    }
+    Ok(false)
 }
 
 pub async fn execute_multi_core(
@@ -1610,12 +1590,7 @@ pub async fn execute_multi_core_with_options_for_client(
     state.touch_pool_activity(&pool_key).await;
     let _activity_touch = state.pool_activity_touch(pool_key.as_str());
 
-    let is_sqlserver = {
-        let connections = state.connections.read().await;
-        matches!(connections.get(&pool_key), Some(PoolKind::SqlServer(_)))
-    };
-
-    if is_sqlserver {
+    if crate::database_session::is_sqlserver_pool(state, &pool_key).await {
         return execute_multi_sqlserver(state, &pool_key, sql, cancel_token, options)
             .await
             .map(|results| results.into_iter().map(Into::into).collect());
@@ -1653,13 +1628,7 @@ pub async fn execute_multi_core_with_options_for_client(
         return Ok(vec![result.into()]);
     }
 
-    let mysql_pool = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
-            Some(PoolKind::Mysql(pool, mode)) => Some((pool.clone(), *mode)),
-            _ => None,
-        }
-    };
+    let mysql_pool = crate::database_session::resolve_mysql_pool(state, &pool_key).await?;
 
     if statements.len() <= 1 {
         let single_sql = statements.into_iter().next().unwrap_or_default();
@@ -1676,7 +1645,7 @@ pub async fn execute_multi_core_with_options_for_client(
         return Ok(vec![result.into()]);
     }
 
-    if let Some((pool, mode)) = mysql_pool {
+    if let Some((pool, bare)) = mysql_pool {
         // Read-only check for MySQL batch path
         check_read_only_for_connection_multi(state, &pool_key, &statements).await?;
         let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
@@ -1685,7 +1654,7 @@ pub async fn execute_multi_core_with_options_for_client(
             &pool_key,
             db_type,
             &pool,
-            mode,
+            bare,
             mysql_dialect,
             &statements,
             cancel_token,
@@ -1794,7 +1763,7 @@ async fn execute_multi_mysql(
     pool_key: &str,
     db_type: Option<DatabaseType>,
     pool: &db::mysql::MySqlPool,
-    mode: crate::connection::MysqlMode,
+    bare: bool,
     dialect: db::mysql::MySqlQueryDialect,
     statements: &[String],
     cancel_token: Option<CancellationToken>,
@@ -1802,7 +1771,6 @@ async fn execute_multi_mysql(
 ) -> Result<Vec<ExecuteMultiResult>, String> {
     let query_timeout = resolve_query_timeout(options.timeout_secs);
     let operation_budget = operation_budget_for_pool_key(state, pool_key, query_timeout).await;
-    let bare = mode == crate::connection::MysqlMode::Bare;
     let max_rows = options.max_rows;
     let mut conn = match db::mysql::get_conn_with_health_check_with_cancel(
         pool,
@@ -1904,13 +1872,9 @@ async fn execute_multi_sqlserver(
             break;
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(pool_key).ok_or("Connection not found")?;
-        let client = match pool {
-            PoolKind::SqlServer(c) => c.clone(),
-            _ => return Err("Expected SQL Server connection".to_string()),
-        };
-        drop(connections);
+        let client = crate::database_session::resolve_sqlserver_client(state, pool_key)
+            .await?
+            .ok_or_else(|| "Expected SQL Server connection".to_string())?;
 
         let mut client_guard = match wait_for_value_opt(cancel_token.clone(), query_timeout, client.lock()).await {
             Ok(guard) => guard,
@@ -1920,7 +1884,7 @@ async fn execute_multi_sqlserver(
             }
         };
 
-        if !sqlserver_pool_is_current(state, pool_key, &client).await {
+        if !crate::database_session::sqlserver_pool_is_current(state, pool_key, &client).await {
             all_results.push(error_query_result(
                 "SQL Server connection was reset while waiting for the query lock; please retry.".to_string(),
             ));
@@ -2001,13 +1965,7 @@ pub async fn execute_statements(
     let start = std::time::Instant::now();
     let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
 
-    let agent_client = {
-        let conns = state.connections.read().await;
-        match conns.get(&pool_key) {
-            Some(PoolKind::Agent(client)) => Some(client.clone()),
-            _ => None,
-        }
-    };
+    let agent_client = crate::database_session::resolve_agent_client(state, &pool_key).await?;
     if let Some(client) = agent_client {
         check_read_only_for_connection_multi(state, &pool_key, statements).await?;
         let db_type = connection_database_type_for_pool_key(state, &pool_key).await;
@@ -2130,32 +2088,10 @@ pub async fn execute_statements_in_transaction(
     let operation_budget = configured_operation_budget_for_pool_key(state, &pool_key).await;
 
     // Clone the pool handle within the lock, then drop it before any async work.
-    let path = {
-        let conns = state.connections.read().await;
-        conns.get(&pool_key).map(|p| match p {
-            PoolKind::Postgres(pg) => TxPath::Pg(pg.clone()),
-            PoolKind::Mysql(mp, _mode) => TxPath::Mysql(mp.clone(), false),
-            PoolKind::Sqlite(sq) => TxPath::Sqlite(sq.clone()),
-            PoolKind::CloudflareD1(client) => TxPath::CloudflareD1(client.clone()),
-            PoolKind::ClickHouse(_)
-            | PoolKind::Rqlite(_)
-            | PoolKind::Turso(_)
-            | PoolKind::SqlServer(_)
-            | PoolKind::Agent(_) => TxPath::Explicit,
-            PoolKind::MessageQueue | PoolKind::Nacos => TxPath::None,
-            PoolKind::Redis(_)
-            | PoolKind::MongoDb(_)
-            | PoolKind::Elasticsearch(_)
-            | PoolKind::VectorDb(_)
-            | PoolKind::InfluxDb(_)
-            | PoolKind::ExternalDriver { .. } => TxPath::None,
-            #[cfg(feature = "duckdb-bundled")]
-            PoolKind::DuckDb(_) | PoolKind::DuckDbWorker(_) | PoolKind::ExternalTabular(_) => TxPath::None,
-        })
-    };
+    let path = crate::database_session::resolve_tx_path(state, &pool_key).await;
 
     let result = match path {
-        Some(TxPath::Pg(pool)) => {
+        Some(crate::database_session::TxPath::Pg(pool)) => {
             let cancel_context = state.get_postgres_cancel_context(&pool_key).await;
             exec_tx_pg_inner(
                 pool,
@@ -2169,11 +2105,11 @@ pub async fn execute_statements_in_transaction(
             )
             .await
         }
-        Some(TxPath::Mysql(pool, _bare)) => {
+        Some(crate::database_session::TxPath::Mysql(pool, _bare)) => {
             exec_tx_mysql_inner(state, &pool_key, pool, statements, start, operation_budget.clone()).await
         }
-        Some(TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await,
-        Some(TxPath::CloudflareD1(client)) => {
+        Some(crate::database_session::TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await,
+        Some(crate::database_session::TxPath::CloudflareD1(client)) => {
             let sql = statements.join(";\n");
             wait_for_query_opt(
                 None,
@@ -2182,11 +2118,11 @@ pub async fn execute_statements_in_transaction(
             )
             .await
         }
-        Some(TxPath::Explicit) => {
+        Some(crate::database_session::TxPath::Explicit) => {
             let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
             exec_tx_explicit_inner(state, &pool_key, mysql_dialect, Some(database), statements, schema, start).await
         }
-        Some(TxPath::None) => {
+        Some(crate::database_session::TxPath::None) => {
             let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
             exec_tx_none_inner(state, &pool_key, mysql_dialect, Some(database), statements, schema, start).await
         }
@@ -2200,16 +2136,6 @@ pub async fn execute_statements_in_transaction(
     }
 
     result
-}
-
-/// Owned pool variants for safe dispatch across async boundaries.
-enum TxPath {
-    Pg(deadpool_postgres::Pool),
-    Mysql(mysql_async::Pool, bool),
-    Sqlite(db::sqlite::SqliteHandle),
-    CloudflareD1(db::cloudflare_d1_driver::CloudflareD1Client),
-    Explicit,
-    None,
 }
 
 // Each of these acquires a dedicated connection and runs all statements within
@@ -2459,8 +2385,7 @@ async fn exec_tx_explicit_inner(
     schema: Option<&str>,
     start: std::time::Instant,
 ) -> Result<db::QueryResult, String> {
-    let conns = state.connections.read().await;
-    if let Some(crate::connection::PoolKind::Agent(client)) = conns.get(pool_key) {
+    if let Some(client) = crate::database_session::resolve_agent_client(state, pool_key).await? {
         let db_type = connection_database_type_for_pool_key(state, pool_key).await;
         let execution_schema = schema_for_execution_context(db_type, schema);
         let rewritten_statements;
@@ -2475,7 +2400,6 @@ async fn exec_tx_explicit_inner(
         let result: db::QueryResult = client.execute_transaction(database, statements, execution_schema).await?;
         return Ok(db::QueryResult { execution_time_ms: start.elapsed().as_millis(), ..result });
     }
-    drop(conns);
 
     do_execute(
         state,
@@ -2640,23 +2564,12 @@ async fn begin_transaction_session(
 
     // Clone the pool handle under a brief read lock, then drop the lock before
     // any async I/O — same pattern as do_execute throughout this file.
-    enum TxnPoolHandle {
-        Postgres(deadpool_postgres::Pool),
-        Mysql(db::mysql::MySqlPool),
-    }
-    let pool_handle = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key).ok_or("Connection not found")? {
-            PoolKind::Postgres(pg) => TxnPoolHandle::Postgres(pg.clone()),
-            PoolKind::Mysql(mp, _) => TxnPoolHandle::Mysql(mp.clone()),
-            _ => return Err("Manual transaction is not supported for this database type".to_string()),
-        }
-    }; // connections lock released here
+    let pool_handle = crate::database_session::resolve_manual_txn_pool(state, &pool_key).await?;
 
     // Budgeted checkout: bare pool.get/get_conn can hang forever on a saturated pool (PR-A4).
     let budget = configured_operation_budget_for_pool_key(state, &pool_key).await;
     let txn_conn = match pool_handle {
-        TxnPoolHandle::Postgres(pg_pool) => {
+        crate::database_session::ManualTxnPool::Postgres(pg_pool) => {
             let conn = db::postgres::checkout_postgres_client(&pg_pool, None, budget.checkout_timeout)
                 .await
                 .map_err(|e| format!("Failed to get Postgres connection: {e}"))?;
@@ -2669,7 +2582,7 @@ async fn begin_transaction_session(
             }
             TxnConnection::Postgres(Box::new(conn))
         }
-        TxnPoolHandle::Mysql(mysql_pool) => {
+        crate::database_session::ManualTxnPool::Mysql(mysql_pool) => {
             let mut conn = db::mysql::get_conn_with_timeout(&mysql_pool, budget.checkout_timeout)
                 .await
                 .map_err(|e| format!("Failed to get MySQL connection: {e}"))?;

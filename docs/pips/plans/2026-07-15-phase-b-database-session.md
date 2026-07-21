@@ -243,7 +243,7 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 - `schema.rs` still uses `extract_pool!` / `try_sqlserver!` for ClickHouse / Influx / DuckDb /
   SqlServer / Agent peeks that need lock-held early returns (not always Clone-friendly)
-- `query.rs` txn / agent helpers / drop-database reconnect
+- `query.rs` tests still seed / assert `PoolKind` (DuckDb drain fixtures); product paths use session resolves
 - orphan uncompiled `schema/providers/native.rs` (cleanup later)
 
 ## Immediate next step
@@ -257,4 +257,9 @@ Schema residual slices landed 2026-07-21:
 - **S1** ExternalDriver / Agent / Postgres peeks → `resolve_external_driver` /
   `resolve_agent_client` / `resolve_postgres_pool`
 
-Next: optional further `extract_pool!` collapse; `query.rs` residuals.
+Query residual (product peeks) landed 2026-07-21:
+
+- close_query_session / drop-database / multi MySQL+SQL Server / agent batch+explicit txn /
+  TxPath / manual txn → `resolve_*` + `TxPath` / `ManualTxnPool` in `database_session/domain`
+
+Next: optional further `extract_pool!` collapse.
