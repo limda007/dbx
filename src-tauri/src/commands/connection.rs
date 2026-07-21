@@ -287,7 +287,7 @@ mod tests {
         let first = state.mq_registry.get_or_build(&initial).await.unwrap();
 
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
-        save_connection_configs(&state, &[updated.clone()]).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&updated)).await.unwrap();
 
         let cached_admin_url = state
             .configs
@@ -316,7 +316,7 @@ mod tests {
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
-        state.storage.save_connections(&[updated.clone()]).await.unwrap();
+        state.storage.save_connections(std::slice::from_ref(&updated)).await.unwrap();
         state.configs.write().await.insert(initial.id.clone(), initial.clone());
         state.insert_message_queue_pool_marker(&initial.id).await;
 
@@ -354,7 +354,7 @@ mod tests {
         }
         let stale = state.mq_registry.get_or_build(&removed).await.unwrap();
 
-        save_connection_configs(&state, &[kept.clone()]).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&kept)).await.unwrap();
 
         let configs = state.configs.read().await;
         assert!(configs.contains_key(&kept.id));
@@ -383,7 +383,7 @@ mod tests {
         }
         state.insert_message_queue_pool_marker(&removed.id).await;
 
-        save_connection_configs(&state, &[kept.clone()]).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&kept)).await.unwrap();
 
         assert!(!state.has_pool(&removed.id).await);
 

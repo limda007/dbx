@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
 
@@ -137,6 +138,7 @@ pub struct BuildCreateDatabaseSqlRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(feature = "duckdb-bundled")]
 pub struct BuildDuckDbAttachDatabaseSqlRequest {
     pub options: dbx_core::db_admin_sql::DuckDbAttachDatabaseSqlOptions,
 }
@@ -316,8 +318,10 @@ pub struct BuildDatabaseSqlExportRequest {
 
 pub async fn execute_query(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql).await?;
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let registered = state.app.running_queries.register_task(
@@ -357,8 +361,10 @@ pub async fn execute_query(
 
 pub async fn execute_multi(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<Vec<dbx_core::query::ExecuteMultiResult>>, AppError> {
+    super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql).await?;
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let registered = state.app.running_queries.register_task(
@@ -398,8 +404,12 @@ pub async fn execute_multi(
 
 pub async fn execute_batch(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(req): Json<ExecuteBatchRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    for statement in &req.statements {
+        super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, statement).await?;
+    }
     tracing::debug!(connection_id = %req.connection_id, "execute_batch");
     let result = dbx_core::query::execute_statements(
         &state.app,
@@ -599,6 +609,7 @@ pub async fn build_create_database_sql(
     dbx_core::db_admin_sql::build_create_database_sql(req.options).map(Json).map_err(AppError)
 }
 
+#[cfg(feature = "duckdb-bundled")]
 pub async fn build_duckdb_attach_database_sql(Json(req): Json<BuildDuckDbAttachDatabaseSqlRequest>) -> Json<String> {
     Json(dbx_core::db_admin_sql::build_duckdb_attach_database_sql(req.options))
 }

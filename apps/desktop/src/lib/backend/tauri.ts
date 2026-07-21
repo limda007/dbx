@@ -167,6 +167,13 @@ export interface DesktopSettings {
   sidebar_table_page_size?: number | null;
 }
 
+export interface McpGlobalPolicy {
+  readOnly: boolean;
+  allowDangerousSql: boolean;
+  allowedConnectionIds: string[] | null;
+  configured: boolean;
+}
+
 export interface SavedSqlSyncEntry {
   folderName?: string;
   fileName: string;
@@ -447,6 +454,14 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   return invoke("save_desktop_settings", { settings });
+}
+
+export async function loadMcpGlobalPolicy(): Promise<McpGlobalPolicy> {
+  return invoke("load_mcp_global_policy");
+}
+
+export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configured">): Promise<void> {
+  return invoke("save_mcp_global_policy", { policy });
 }
 
 export interface OpenTabsStatePayload {
@@ -1331,12 +1346,14 @@ export async function importAgentsFromZip(path: string | File): Promise<number> 
   return invoke("import_agents_from_zip", { path });
 }
 
-export async function importAgentJar(dbType: string, path: string | File): Promise<void> {
+export async function importAgentDriver(dbType: string, path: string | File): Promise<void> {
   if (typeof path !== "string") {
-    throw new Error("Desktop driver JAR import requires a local file path");
+    throw new Error("Desktop driver import requires a local file path");
   }
-  return invoke("import_agent_jar_cmd", { dbType, path });
+  return invoke("import_agent_driver_cmd", { dbType, path });
 }
+
+export const importAgentJar = importAgentDriver;
 
 export async function reinstallJre(jreKey?: string, source?: UpdateDownloadSource): Promise<void> {
   return invoke("reinstall_jre", { jreKey, source });
@@ -1463,8 +1480,12 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
 }
 
-export async function downloadAndInstallUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
-  return invoke("download_and_install_update", { source, latestVersion });
+export async function downloadUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
+  return invoke("download_update", { source, latestVersion });
+}
+
+export async function installDownloadedUpdate(): Promise<void> {
+  return invoke("install_downloaded_update");
 }
 
 export async function getAppVersion(): Promise<string> {

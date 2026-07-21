@@ -157,7 +157,7 @@ import { allNullColumnIndexes } from "@/lib/dataGrid/dataGridColumnVisibility";
 import { buildDataGridColumnLookupItems, filterDataGridColumnLookupItems } from "@/lib/dataGrid/dataGridColumnLookup";
 import { uniqueDataGridColumnOrderKeys } from "@/lib/dataGrid/dataGridColumnOrder";
 import { dataGridColumnLayoutScopeKey, TABLE_DATA_GRID_COLUMN_ORDER_CHANGED_EVENT, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
-import { parseClipboardTable, summarizeSelection } from "@/lib/dataGrid/gridSelection";
+import { summarizeSelection } from "@/lib/dataGrid/gridSelection";
 import {
   createDataGridCellContextMenuItems,
   createDataGridColumnContextMenuItems,
@@ -173,7 +173,7 @@ import {
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
 import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/common/clipboard";
-import { claimDataGridPaste, planDataGridPaste } from "@/lib/dataGrid/dataGridClipboard";
+import { claimDataGridPaste, clearDataGridClipboardCopy, parseDataGridClipboard, planDataGridPaste } from "@/lib/dataGrid/dataGridClipboard";
 import { DATA_GRID_ROW_NUM_WIDTH, useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
 import { createDataGridColumnStructureSignature } from "@/lib/dataGrid/dataGridColumnWidthState";
 import { useDataGridColumnLayout, useDataGridColumnLayoutState } from "@/composables/useDataGridColumnLayout";
@@ -2259,7 +2259,7 @@ watch(
 );
 
 // --- Pagination ---
-const pageSize = ref(normalizeResultPageSize(props.context === "table-data" ? (props.pageLimit ?? tableOpenPageLimit()) : settingsStore.editorSettings.pageSize));
+const pageSize = ref(normalizeResultPageSize(props.context === "table-data" ? (props.pageLimit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize)) : settingsStore.editorSettings.pageSize));
 const currentPage = ref(1);
 const pageSizeOptions = computed(() => resultPageSizeMenuOptions(pageSize.value));
 const customPageSizeInput = ref(String(pageSize.value));
@@ -2522,7 +2522,7 @@ function checkInfiniteScroll(scroller: HTMLElement) {
 function changePageSize(size: number) {
   const normalizedSize = normalizeResultPageSize(size);
   pageSize.value = normalizedSize;
-  settingsStore.updateEditorSettings({ pageSize: normalizedSize });
+  settingsStore.updateEditorSettings(props.context === "table-data" ? { tableOpenPageSize: normalizedSize } : { pageSize: normalizedSize });
   currentPage.value = 1;
   lastInfiniteScrollPage = 0;
   infiniteScrollAllLoaded = false;
@@ -3345,6 +3345,7 @@ const {
   isSelectingAll,
   selectedRange,
   selectedCells,
+  selectedCellMatrix,
   selectedCellCount,
   hasCellSelection,
   clearCellSelection,
@@ -4911,6 +4912,10 @@ function resumeCanvasGridWork() {
   });
 }
 
+function clearInternalClipboardCopy() {
+  clearDataGridClipboardCopy();
+}
+
 onMounted(resumeCanvasGridWork);
 onActivated(resumeCanvasGridWork);
 onMounted(() => {
@@ -4919,6 +4924,8 @@ onMounted(() => {
   window.visualViewport?.addEventListener("resize", scheduleCanvasPixelRatioRefresh);
   window.addEventListener("dbx:ui-scale-applied", scheduleCanvasPixelRatioRefresh);
   window.addEventListener(TABLE_DATA_GRID_COLUMN_ORDER_CHANGED_EVENT, onTableDataGridColumnOrderChanged);
+  window.addEventListener("blur", clearInternalClipboardCopy);
+  document.addEventListener("visibilitychange", clearInternalClipboardCopy);
 });
 onDeactivated(pauseCanvasGridWork);
 onUnmounted(() => {
@@ -4935,6 +4942,8 @@ onUnmounted(() => {
   window.visualViewport?.removeEventListener("resize", scheduleCanvasPixelRatioRefresh);
   window.removeEventListener("dbx:ui-scale-applied", scheduleCanvasPixelRatioRefresh);
   window.removeEventListener(TABLE_DATA_GRID_COLUMN_ORDER_CHANGED_EVENT, onTableDataGridColumnOrderChanged);
+  window.removeEventListener("blur", clearInternalClipboardCopy);
+  document.removeEventListener("visibilitychange", clearInternalClipboardCopy);
 });
 
 function setRowStatusFilter(value: string) {
@@ -4979,6 +4988,11 @@ const {
   copySelectionCsv,
   copySelectionJson,
   copySelectionSqlInList,
+  copySelectionAsInsert,
+  prefetchSelectionAsInsertStatement,
+  canCopyPreparedSelectionInsert,
+  canCopySelectionAsInsert,
+  selectionInsertRowCount,
   copySelectedRowsTsv,
   copySelectedRowsTsvWithHeaders,
   copyColumnNames,
@@ -5018,6 +5032,7 @@ const {
   exportBatchSize: computed(() => settingsStore.editorSettings.exportBatchSize),
   hasCellSelection,
   selectedCells,
+  selectedCellMatrix,
   selectedRange,
   contextCell: exportContextCell,
   getRowItem: (rowId: number) => visibleDisplayItems.value.find((item) => item.id === rowId),
@@ -5288,7 +5303,7 @@ async function pasteClipboardIntoSelection() {
 }
 
 function pasteTextIntoSelection(text: string): boolean {
-  const rows = parseClipboardTable(text);
+  const rows = parseDataGridClipboard(text);
   const allowDraftSelectionValue = selectedRangeTargetsOnlyDraftRow();
 
   if (rows.length === 1 && rows[0]?.length === 1 && fillSelectionWithValue(rows[0][0])) {
@@ -6356,6 +6371,7 @@ function onHeaderContext(col: string, columnIndex: number) {
   }
   contextHeaderColumn.value = col;
   contextHeaderColumnIndex.value = columnIndex;
+  void prefetchCopyStatements();
 }
 async function copyHeaderColumn() {
   if (!contextHeaderColumn.value) return;
@@ -6568,6 +6584,12 @@ function onRowContext(rowId: number, rowIndex: number) {
 }
 
 async function prefetchCopyStatements() {
+  if (canCopySelectionAsInsert.value) {
+    await prefetchSelectionAsInsertStatement();
+    if (selectionInsertRowCount.value > 1 && canCopyPreparedSelectionInsert()) {
+      await prefetchSelectionAsInsertStatement("row-by-row");
+    }
+  }
   await prefetchRowAsInsertStatement(false);
   if (isMultiRow.value) {
     await prefetchRowAsInsertStatement(false, "row-by-row");
@@ -7262,6 +7284,13 @@ function copySubmenu(): ContextMenuItem {
 }
 
 function selectionSubmenu(): ContextMenuItem {
+  const insertItems: ContextMenuItem[] =
+    selectedCells.value.rows.length > 1
+      ? [
+          { label: t("grid.copySelectionInsertMerged"), action: () => copySelectionAsInsert("merged"), disabled: () => !canCopySelectionAsInsert.value || !canCopyPreparedSelectionInsert("merged") },
+          { label: t("grid.copySelectionInsertRowByRow"), action: () => copySelectionAsInsert("row-by-row"), disabled: () => !canCopySelectionAsInsert.value || !canCopyPreparedSelectionInsert("row-by-row") },
+        ]
+      : [{ label: t("grid.copySelectionInsert"), action: () => copySelectionAsInsert(), disabled: () => !canCopySelectionAsInsert.value || !canCopyPreparedSelectionInsert() }];
   return {
     label: t("grid.selection"),
     icon: SquareDashed,
@@ -7271,6 +7300,7 @@ function selectionSubmenu(): ContextMenuItem {
       { label: t("grid.copySelectionCsv"), action: copySelectionCsv },
       { label: t("grid.copySelectionJson"), action: copySelectionJson },
       { label: t("grid.copySelectionSql"), action: copySelectionSqlInList },
+      ...insertItems,
       { label: "", separator: true },
       { label: t("grid.clearSelection"), action: clearCellSelection },
     ],
@@ -7575,6 +7605,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               :current-match-index="currentMatchIndex"
               :has-deferred-search-text="!!deferredClientSearchText"
               @keydown="onSearchKeydown"
+              @navigate="navigateMatch"
               @close="closeSearch"
               @accept-suggestion="
                 suggestionIndex = $event;
