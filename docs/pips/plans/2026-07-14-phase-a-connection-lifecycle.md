@@ -51,7 +51,7 @@ PIP-0001 **stage-1 bleed-stop work had largely landed before Phase A**. Do not r
 ### Residual (explicitly out of Phase A or polish-only)
 
 - **Phase B / review #2:** hide `PoolKind` behind driver traits / `DatabaseSession`.
-- **Observability polish:** `pool.recycle` / `result.fetch` stage names exist but are not fully instrumented on every driver path.
+- **Observability polish:** `pool.recycle` is instrumented for PostgreSQL via deadpool pre/post_recycle hooks (2026-07-21). `result.fetch` stage names exist but are not fully instrumented on every driver path.
 - **Full default-feature CI** on constrained hosts: prefer `cargo test -p dbx-core --lib --no-default-features --features mq-admin -j 1` to avoid DuckDB native rebuild thrash; enable `duckdb-bundled` only with free memory and low job count.
 
 

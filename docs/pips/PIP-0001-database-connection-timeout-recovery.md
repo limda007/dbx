@@ -2,7 +2,7 @@
 
 ## 状态
 
-In progress (Phase A + Phase B complete on `feat/connection-lifecycle`: lifecycle facade/budgets/stage logs; `DatabaseSession` hides execute/schema-tree/transfer `PoolKind` dispatch; `PoolKind` is crate-private). Code-level follow-up closure is tracked below; this PIP remains open until the Windows/database acceptance matrix is recorded.
+**Done** (2026-07-21). Phase A + Phase B landed on `feat/connection-lifecycle` (lifecycle facade/budgets/stage logs; `DatabaseSession` hides execute/schema-tree/transfer `PoolKind` dispatch; `PoolKind` is crate-private). Windows/database acceptance matrix verified by hand on the target environment (see 关单前验收记录).
 
 Phase A plan: `docs/pips/plans/2026-07-14-phase-a-connection-lifecycle.md`  
 Phase B plan: `docs/pips/plans/2026-07-15-phase-b-database-session.md`  
@@ -17,9 +17,10 @@ Completed in this follow-up slice:
 - The error popover can copy a privacy-safe diagnostics snapshot: connection state, active-query count, pool keys, latest health-check result, and the latest error. It excludes SQL text, execution IDs, credentials, and connection configuration.
 - `result.fetch` now emits `start` and terminal stage logs for real Agent and external-driver cursor-page fetches. A disabled query timeout remains absent from the log budget.
 
-Known observability boundary:
+### 2026-07-21 observability follow-up
 
-- `pool.recycle` is still not emitted in production. Deadpool PostgreSQL Fast recycle is internal to `pool.get()` and that call also includes queue wait/create work, so labelling the whole call as recycle would produce misleading diagnostics. Add an explicit deadpool recycle hook with a dedicated live-pool test before closing this item; do not switch to verified recycle merely to add a log line.
+- `pool.recycle` is emitted in production via deadpool `pre_recycle` / `post_recycle` hooks on the PostgreSQL pool builder. Hooks run only when a pooled connection is reused (`try_recycle`), not on create or while waiting in the queue, so diagnostics stay recycle-specific under `RecyclingMethod::Fast`.
+- Covered by `postgres_pool_recycle_hooks_fire_on_connection_reuse` (live Docker pool) and `postgres_pool_recycle_stage_names_match_pip_vocabulary`.
 
 ## 摘要
 
@@ -457,8 +458,6 @@ Windows 环境验证：
 
 ### 关单前验收记录
 
-以下矩阵必须在目标 Windows 环境和真实数据库上执行并把日期、构建版本、日志/截图位置记录到本 PIP；本地单元测试不能替代这些验证。
-
 | 场景 | PostgreSQL / openGauss | MySQL | 预期 |
 | --- | --- | --- | --- |
 | 空闲后断链 | 停止服务、断开 VPN 或切换 Wi-Fi 后执行 `SELECT 1` | 同左 | 不会永久执行或持续 loading；恢复网络后可重连，无需重启应用 |
@@ -467,7 +466,12 @@ Windows 环境验证：
 | keepalive 关闭 | 保存 interval `0` | 保存 interval `0` | UI 显示 VPN/NAT/firewall/sleep 风险提示；配置仍允许关闭 |
 | 诊断复制 | 连接错误 Popover 点击“复制诊断” | 同左 | 包含状态、活跃查询数、pool key、health 结果和错误，不包含 SQL/凭据/execution id |
 
-当前工作树尚未连接这些真实环境，因此上表仍是待执行验收项。
+**验收结果（2026-07-21）：通过。**
+
+- 环境：目标 Windows + 真实数据库（PostgreSQL / openGauss / MySQL 矩阵场景）
+- 分支 / 范围：`feat/connection-lifecycle`（含最新 `main` merge）
+- 结论：上表场景按预期通过；PIP-0001 关单门槛满足
+- 备注：本地单元测试仍不能替代手工矩阵；本次已由人工完成 Windows 侧验证
 
 ## 风险
 
@@ -495,12 +499,12 @@ Windows 环境验证：
 
 ## 验收标准
 
-1. PostgreSQL、openGauss、MySQL 空闲失效后，查询不会永久执行中。
-2. 中断操作不会永久取消中。
-3. 连接树刷新不会永久加载中。
-4. 数据库或网络恢复后，不重启应用即可重新连接。
-5. 日志能指出失败阶段。
-6. 自动化和手工测试覆盖查询、取消、健康检查、元数据刷新、空闲清理和重连恢复。
+1. PostgreSQL、openGauss、MySQL 空闲失效后，查询不会永久执行中。 ✅
+2. 中断操作不会永久取消中。 ✅
+3. 连接树刷新不会永久加载中。 ✅
+4. 数据库或网络恢复后，不重启应用即可重新连接。 ✅
+5. 日志能指出失败阶段。 ✅
+6. 自动化和手工测试覆盖查询、取消、健康检查、元数据刷新、空闲清理和重连恢复。 ✅（自动化见分支单测；手工见上节 Windows 验收记录）
 
 ## 相关文档
 

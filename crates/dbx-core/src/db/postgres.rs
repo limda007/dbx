@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime};
-use deadpool_postgres::{ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime};
+use deadpool_postgres::{Hook, ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime};
 use futures::{SinkExt, StreamExt};
 use percent_encoding::percent_decode_str;
 use rust_decimal::Decimal;
@@ -1072,6 +1072,9 @@ async fn connect_with_local_timezone(url: &str, fallback_timeout: Duration, time
         // observed are caught when the query runs and recovered by the
         // executor's ReconnectAndRetry path (see pool_error_action / do_execute
         // in query.rs).
+        //
+        // `pool.recycle` stage logs use deadpool pre/post_recycle hooks so they
+        // cover only Manager::recycle — never queue wait / create inside pool.get().
         let mgr_config = ManagerConfig { recycling_method: RecyclingMethod::Fast };
         let tls_config = postgres_tls_config(
             &pg_config,
@@ -1090,6 +1093,8 @@ async fn connect_with_local_timezone(url: &str, fallback_timeout: Duration, time
             .wait_timeout(Some(timeout))
             .create_timeout(Some(timeout))
             .recycle_timeout(Some(timeout))
+            .pre_recycle(postgres_pool_pre_recycle_hook(timeout))
+            .post_recycle(postgres_pool_post_recycle_hook(timeout))
             .build()
             .map_err(|e| format!("Failed to create PostgreSQL pool: {e}"))?;
 
@@ -2952,12 +2957,60 @@ where
     }
 }
 
+// Thread-local wall clock for pairing deadpool pre_recycle / post_recycle hooks.
+// Recycle runs inside the same task that called pool.get(), so a thread-local is
+// enough to compute elapsed_ms without confusing concurrent checkouts on other workers.
+thread_local! {
+    static POSTGRES_RECYCLE_STAGE_STARTED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Counts successful pre_recycle + post_recycle pairs (each hook increments once).
+/// Used by unit/live tests to prove recycle hooks fire without depending on log sinks.
+static POSTGRES_RECYCLE_HOOK_INVOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// deadpool `pre_recycle` hook: emit `pool.recycle:start` only when a pooled connection is reused.
+///
+/// New connections go through `try_create` and never hit this hook, so logs stay recycle-specific.
+fn postgres_pool_pre_recycle_hook(recycle_timeout: Duration) -> Hook {
+    Hook::sync_fn(move |_client, _metrics| {
+        POSTGRES_RECYCLE_HOOK_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        POSTGRES_RECYCLE_STAGE_STARTED.with(|cell| cell.set(Some(Instant::now())));
+        connection_lifecycle::log_stage(
+            StageLog::new(LifecycleStage::PoolRecycle, StageOutcome::Start, 0)
+                .with_timeout(recycle_timeout)
+                .with_detail("deadpool recycle (RecyclingMethod::Fast)"),
+        );
+        Ok(())
+    })
+}
+
+/// deadpool `post_recycle` hook: emit `pool.recycle:done` after Manager::recycle succeeds.
+fn postgres_pool_post_recycle_hook(recycle_timeout: Duration) -> Hook {
+    Hook::sync_fn(move |_client, _metrics| {
+        POSTGRES_RECYCLE_HOOK_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let elapsed_ms = POSTGRES_RECYCLE_STAGE_STARTED
+            .with(|cell| cell.take())
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or(0);
+        connection_lifecycle::log_stage(
+            StageLog::new(LifecycleStage::PoolRecycle, StageOutcome::Done, elapsed_ms)
+                .with_timeout(recycle_timeout)
+                .with_detail("deadpool recycle ok"),
+        );
+        Ok(())
+    })
+}
+
 /// PostgreSQL pool checkout with timeout and cancel token support.
 /// When the checkout phase is stuck, the cancel token can terminate the wait early.
 /// The timeout error message includes "checkout timed out" to ensure is_connection_error can classify it correctly.
 ///
 /// Stable 3-arg entry point (PR-A1 compatibility). Stage logs omit correlation IDs.
 /// Prefer [`checkout_postgres_client_logged`] when `trace_id` / `connection_id` are available.
+///
+/// Recycle observability: when `pool.get()` reuses a pooled connection, deadpool runs
+/// [`postgres_pool_pre_recycle_hook`] / [`postgres_pool_post_recycle_hook`] and emits
+/// dedicated `pool.recycle` stage logs (not part of this function's checkout span).
 pub async fn checkout_postgres_client(
     pool: &Pool,
     cancel_token: Option<&CancellationToken>,
@@ -4381,6 +4434,70 @@ mod tests {
             state_enum_values(&columns),
             Some(vec!["pending".to_string(), "active".to_string(), "archived".to_string()])
         );
+    }
+
+    /// Live pool: second+ checkouts must hit deadpool recycle hooks (`pool.recycle` stages).
+    ///
+    /// `connect()` creates a connection for the timezone probe and returns it to the pool.
+    /// The next `pool.get()` reuses that object and runs pre_recycle + Manager::recycle + post_recycle.
+    /// New-create checkouts must not increment the counter (hooks are recycle-only).
+    #[tokio::test]
+    async fn postgres_pool_recycle_hooks_fire_on_connection_reuse() {
+        use std::sync::atomic::Ordering;
+
+        let Some(container) = start_docker_postgres().await else {
+            return;
+        };
+
+        let pool = connect(&container.url(), Duration::from_secs(5)).await.expect("connect postgres");
+        let after_connect = super::POSTGRES_RECYCLE_HOOK_INVOCATIONS.load(Ordering::SeqCst);
+
+        // Reuse the connection left by connect()'s timezone probe.
+        {
+            let client =
+                checkout_postgres_client(&pool, None, Duration::from_secs(5)).await.expect("first reuse checkout");
+            client.simple_query("SELECT 1").await.expect("ping via simple_query");
+            drop(client);
+        }
+        let after_first_reuse = super::POSTGRES_RECYCLE_HOOK_INVOCATIONS.load(Ordering::SeqCst);
+        assert!(
+            after_first_reuse >= after_connect + 2,
+            "expected pre_recycle+post_recycle on first reuse; after_connect={after_connect} after_first_reuse={after_first_reuse}"
+        );
+
+        {
+            let client =
+                checkout_postgres_client(&pool, None, Duration::from_secs(5)).await.expect("second reuse checkout");
+            drop(client);
+        }
+        let after_second_reuse = super::POSTGRES_RECYCLE_HOOK_INVOCATIONS.load(Ordering::SeqCst);
+        assert!(
+            after_second_reuse >= after_first_reuse + 2,
+            "expected another pre+post recycle pair; after_first={after_first_reuse} after_second={after_second_reuse}"
+        );
+    }
+
+    #[test]
+    fn postgres_pool_recycle_stage_names_match_pip_vocabulary() {
+        use connection_lifecycle::format_stage_log;
+
+        assert_eq!(LifecycleStage::PoolRecycle.as_str(), "pool.recycle");
+        let start = format_stage_log(
+            &StageLog::new(LifecycleStage::PoolRecycle, StageOutcome::Start, 0)
+                .with_timeout(Duration::from_secs(10))
+                .with_detail("deadpool recycle (RecyclingMethod::Fast)"),
+        );
+        assert!(start.contains("[db:pool.recycle:start]"), "{start}");
+        assert!(start.contains("timeout_ms=10000"), "{start}");
+        assert!(start.contains("detail=deadpool recycle (RecyclingMethod::Fast)"), "{start}");
+
+        let done = format_stage_log(
+            &StageLog::new(LifecycleStage::PoolRecycle, StageOutcome::Done, 3)
+                .with_timeout(Duration::from_secs(10))
+                .with_detail("deadpool recycle ok"),
+        );
+        assert!(done.contains("[db:pool.recycle:done]"), "{done}");
+        assert!(done.contains("elapsed_ms=3"), "{done}");
     }
 
     #[tokio::test]

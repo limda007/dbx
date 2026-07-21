@@ -31,7 +31,7 @@ All lifecycle stages emit through `connection_lifecycle::log_stage`:
 | --- | --- |
 | `ensureConnected` | Backend `connect` / register base pool |
 | `pool.checkout` | Waiting for a free pool handle (PG + MySQL hot paths) |
-| `pool.recycle` | Reserved for an explicit pool-recycle hook. It is not emitted for a generic `pool.get()` because that operation also includes wait/create work. |
+| `pool.recycle` | Deadpool `pre_recycle` / `post_recycle` hooks on the PostgreSQL pool (only when a pooled connection is reused). Never labels queue wait or create as recycle. |
 | `ping` | Budgeted health probe (`SELECT 1` / MySQL ping) |
 | `schema.set` | PostgreSQL `SET search_path` (and related) |
 | `query.execute` | SQL execution wrapper around `do_execute` |
