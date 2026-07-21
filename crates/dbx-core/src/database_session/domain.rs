@@ -126,6 +126,16 @@ pub(crate) async fn resolve_sqlserver_client(
     })
 }
 
+/// Clone a vector DB client (Milvus / Qdrant / etc.) for schema browser paths.
+pub(crate) async fn resolve_vector_client(state: &AppState, pool_key: &str) -> Result<Option<VectorClient>, String> {
+    let connections = state.connections.read().await;
+    Ok(match connections.get(pool_key) {
+        Some(PoolKind::VectorDb(client)) => Some(client.clone()),
+        Some(_) => None,
+        None => return Err("Connection not found".to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DocumentHandle, MongoHandle};

@@ -249,4 +249,5 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 Domain-ops + export streams (2026-07-21). **S5 `get_object_source` dispatch moved into
 `database_session::get_object_source`** (ExternalDriver / Agent / SqlServer / native arms).
-Next candidates: Doris/vector resolve helpers; completion_assistant waterfall.
+**S2/S3:** Doris catalog APIs use `resolve_mysql_pool`; vector browser uses `resolve_vector_client`.
+Next candidates: completion_assistant waterfall (S4); list_* External/Agent early peeks (S1).

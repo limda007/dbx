@@ -11,7 +11,7 @@ mod transfer;
 
 pub(crate) use domain::{
     resolve_clickhouse_client, resolve_document_handle, resolve_mongo_handle, resolve_mysql_pool,
-    resolve_postgres_pool, resolve_sqlserver_client, DocumentHandle, MongoHandle,
+    resolve_postgres_pool, resolve_sqlserver_client, resolve_vector_client, DocumentHandle, MongoHandle,
 };
 pub(crate) use execute::execute_sql;
 pub(crate) use schema::{

@@ -722,11 +722,10 @@ pub async fn list_sqlserver_linked_server_tables_core(
 /// flat-sidebar fallback then renders the standard database list.
 pub async fn list_doris_catalogs_core(state: &AppState, connection_id: &str) -> Result<Vec<db::CatalogInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, None).await?;
-    let connections = state.connections.read().await;
-    if let Some(PoolKind::Mysql(p, _)) = connections.get(&pool_key) {
-        return db::mysql::list_doris_catalogs(p).await;
-    }
-    Ok(vec![])
+    let Some((pool, _)) = crate::database_session::resolve_mysql_pool(state, &pool_key).await? else {
+        return Ok(vec![]);
+    };
+    db::mysql::list_doris_catalogs(&pool).await
 }
 
 /// `SHOW DATABASES FROM <catalog>` → databases in the given catalog.
@@ -741,12 +740,10 @@ pub async fn list_doris_catalog_databases_core(
 ) -> Result<Vec<db::DatabaseInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, None).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let Some((pool, _)) = crate::database_session::resolve_mysql_pool(state, &pool_key).await? else {
         return Ok(vec![]);
     };
-    let databases = db::mysql::list_databases_show_from(p, catalog).await;
+    let databases = db::mysql::list_databases_show_from(&pool, catalog).await;
     // External catalogs may reject `SHOW DATABASES FROM <catalog>` when the user
     // lacks permission — surface as an empty list rather than an error.
     let databases = match databases {
@@ -779,12 +776,10 @@ pub async fn list_doris_catalog_tables_core(
     object_types: Option<&[String]>,
 ) -> Result<Vec<db::TableInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, None).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let Some((pool, _)) = crate::database_session::resolve_mysql_pool(state, &pool_key).await? else {
         return Ok(vec![]);
     };
-    db::mysql::list_tables_show_from(p, catalog, database)
+    db::mysql::list_tables_show_from(&pool, catalog, database)
         .await
         .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
 }
@@ -798,12 +793,10 @@ pub async fn get_doris_catalog_columns_core(
     table: &str,
 ) -> Result<Vec<db::ColumnInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, None).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let Some((pool, _)) = crate::database_session::resolve_mysql_pool(state, &pool_key).await? else {
         return Ok(vec![]);
     };
-    db::mysql::get_columns_show_from(p, catalog, database, table).await.map(deduplicate_column_infos)
+    db::mysql::get_columns_show_from(&pool, catalog, database, table).await.map(deduplicate_column_infos)
 }
 
 /// DDL for an external catalog table via `SHOW CREATE TABLE <catalog>.<db>.<table>`.
@@ -815,12 +808,10 @@ pub async fn get_doris_catalog_table_ddl_core(
     table: &str,
 ) -> Result<String, String> {
     let pool_key = state.get_or_create_pool(connection_id, None).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let Some((pool, _)) = crate::database_session::resolve_mysql_pool(state, &pool_key).await? else {
         return Err("DDL not supported for this connection".to_string());
     };
-    db::mysql::show_create_table_ddl_from(p, catalog, database, table).await
+    db::mysql::show_create_table_ddl_from(&pool, catalog, database, table).await
 }
 
 /// Best-effort index listing for an external catalog table (derived from DDL).
@@ -832,12 +823,10 @@ pub async fn list_doris_catalog_indexes_core(
     table: &str,
 ) -> Result<Vec<db::IndexInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, None).await?;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let Some((pool, _)) = crate::database_session::resolve_mysql_pool(state, &pool_key).await? else {
         return Ok(vec![]);
     };
-    db::mysql::list_doris_catalog_indexes(p, catalog, database, table).await
+    db::mysql::list_doris_catalog_indexes(&pool, catalog, database, table).await
 }
 
 /// Table comment for an external catalog table. Doris does not reliably expose
@@ -1167,7 +1156,7 @@ pub async fn list_tables_core(
 }
 
 /// List vector database collections, returning structured info (name, id, dimension).
-/// Only works for PoolKind::VectorDb connections; returns an error for other types.
+/// Only works for vector DB connections; returns an error for other types.
 pub async fn list_vector_collections_core(
     state: &AppState,
     connection_id: &str,
@@ -1175,13 +1164,9 @@ pub async fn list_vector_collections_core(
 ) -> Result<Vec<db::vector_driver::CollectionInfo>, String> {
     let pool_key =
         state.get_or_create_pool(connection_id, if database.is_empty() { None } else { Some(database) }).await?;
-    let client = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
-            Some(PoolKind::VectorDb(client)) => client.clone(),
-            _ => return Err("Not a vector database connection".to_string()),
-        }
-    };
+    let client = crate::database_session::resolve_vector_client(state, &pool_key)
+        .await?
+        .ok_or_else(|| "Not a vector database connection".to_string())?;
     db::vector_driver::list_collections_with_db(&client, database).await
 }
 
@@ -1194,13 +1179,9 @@ pub async fn get_vector_collection_detail_core(
 ) -> Result<db::vector_driver::CollectionInfo, String> {
     let pool_key =
         state.get_or_create_pool(connection_id, if database.is_empty() { None } else { Some(database) }).await?;
-    let client = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
-            Some(PoolKind::VectorDb(client)) => client.clone(),
-            _ => return Err("Not a vector database connection".to_string()),
-        }
-    };
+    let client = crate::database_session::resolve_vector_client(state, &pool_key)
+        .await?
+        .ok_or_else(|| "Not a vector database connection".to_string())?;
     db::vector_driver::get_collection_detail(&client, database, collection).await
 }
 
