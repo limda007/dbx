@@ -473,8 +473,8 @@ pub async fn test_connection_with_info(
                 DatabaseType::MessageQueue => {
                     // Transient adapter only — do not cache under the real connection id.
                     let mqc = state.mq_admin_config_for_connection(connection_id, &config).await?;
-                    let kafka_launch = crate::mq::service::resolve_kafka_launch_spec(&mqc, &state);
-                    let adapter = state.mq_registry.build_transient_config(mqc, kafka_launch).await?;
+                    let agent_launch = crate::mq::service::resolve_mq_agent_launch_spec(&mqc, &state);
+                    let adapter = state.mq_registry.build_transient_config(mqc, agent_launch).await?;
                     adapter.test_connection().await?;
                     "Connection successful".to_string()
                 }
@@ -814,8 +814,8 @@ async fn connect_inner(
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
                 let mqc = state.mq_admin_config_for_connection(id, &config).await?;
-                let kafka_launch = crate::mq::service::resolve_kafka_launch_spec(&mqc, &state);
-                let adapter = match state.mq_registry.get_or_build_config(id, mqc, kafka_launch).await {
+                let agent_launch = crate::mq::service::resolve_mq_agent_launch_spec(&mqc, &state);
+                let adapter = match state.mq_registry.get_or_build_config(id, mqc, agent_launch).await {
                     Ok(adapter) => adapter,
                     Err(err) => {
                         state.mq_registry.drop_connection(id).await;
