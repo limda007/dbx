@@ -21,6 +21,8 @@ Completed in this follow-up slice:
 
 - `pool.recycle` is emitted in production via deadpool `pre_recycle` / `post_recycle` hooks on the PostgreSQL pool builder. Hooks run only when a pooled connection is reused (`try_recycle`), not on create or while waiting in the queue, so diagnostics stay recycle-specific under `RecyclingMethod::Fast`.
 - Covered by `postgres_pool_recycle_hooks_fire_on_connection_reuse` (live Docker pool) and `postgres_pool_recycle_stage_names_match_pip_vocabulary`.
+- `result.fetch` full-driver instrumentation: every execute arm that can perform a cursor-page fetch (`Agent` + `ExternalDriver` when `result_session_id` is set) emits `start` and terminal (`done` / `cancelled` / `error`) stage logs. Native SQL drivers never open result sessions, so they correctly omit `result.fetch` (still covered by `query.execute`).
+- Domain-ops residual: `mongo_ops` / `redis_ops` / `document_ops` and `query_result_export` typed streams resolve handles via `database_session/domain` (no product-file `PoolKind` matches).
 
 ## 摘要
 

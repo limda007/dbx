@@ -89,6 +89,33 @@ mod tests {
         let failed: Result<(), String> = Err("driver request failed".to_string());
         assert_eq!(result_fetch_terminal_outcome(&failed), (StageOutcome::Error, Some("driver request failed")));
     }
+
+    #[test]
+    fn result_fetch_stage_is_only_emitted_for_cursor_page_drivers() {
+        // Full-driver instrumentation gate: every `PoolKind` arm that can call
+        // `fetch_query_page` / `fetchQueryPage` must wrap the RPC with
+        // `result.fetch` start + terminal logs. Native SQL drivers never open a
+        // result session, so they stay on `query.execute` only.
+        let src = include_str!("execute.rs");
+        assert!(src.contains("LifecycleStage::ResultFetch"));
+        assert!(src.contains("let is_result_fetch = options.result_session_id.is_some();"));
+        // Agent + ExternalDriver are the two cursor-page arms (start + terminal each).
+        // Count production uses only (exclude this test source string).
+        let production_is_result_fetch = src.lines().filter(|line| line.trim() == "if is_result_fetch {").count();
+        assert_eq!(production_is_result_fetch, 4);
+        assert!(src.contains("fetch_query_page_with_timeout_and_cancel"));
+        assert!(src.contains("\"fetchQueryPage\""));
+        // Disabled timeout must stay absent from the budget field (None path).
+        let cancelled = format_stage_log(&result_fetch_stage_log(
+            StageOutcome::Cancelled,
+            1,
+            None,
+            StageLogContext::for_pool(Some("c:db"), Some("t1"), Some("agent")),
+            None,
+        ));
+        assert!(!cancelled.contains("timeout_ms="));
+        assert!(cancelled.starts_with("[db:result.fetch:cancelled]"));
+    }
 }
 
 impl From<String> for ExecuteSqlError {

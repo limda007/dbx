@@ -51,7 +51,7 @@ PIP-0001 **stage-1 bleed-stop work had largely landed before Phase A**. Do not r
 ### Residual (explicitly out of Phase A or polish-only)
 
 - **Phase B / review #2:** hide `PoolKind` behind driver traits / `DatabaseSession`.
-- **Observability polish:** `pool.recycle` is instrumented for PostgreSQL via deadpool pre/post_recycle hooks (2026-07-21). `result.fetch` stage names exist but are not fully instrumented on every driver path.
+- **Observability polish:** `pool.recycle` is instrumented for PostgreSQL via deadpool pre/post_recycle hooks (2026-07-21). `result.fetch` is instrumented on every driver path that can open a cursor page (`Agent` `fetch_query_page` and `ExternalDriver` `fetchQueryPage` when `result_session_id` is set). Native SQL drivers do not use result sessions and stay on `query.execute` only.
 - **Full default-feature CI** on constrained hosts: prefer `cargo test -p dbx-core --lib --no-default-features --features mq-admin -j 1` to avoid DuckDB native rebuild thrash; enable `duckdb-bundled` only with free memory and low job count.
 
 
@@ -363,7 +363,7 @@ Phase A code + docs baseline are complete on `feat/connection-lifecycle`. Option
 
 1. Open PR / push when ready (branch was intentionally kept local).
 2. Phase B: hide `PoolKind` behind driver traits / `DatabaseSession`.
-3. Polish: optional `checkout.rs` / `recovery.rs` re-export modules; broader `pool.recycle` / `result.fetch` instrumentation.
+3. Polish: optional `checkout.rs` / `recovery.rs` re-export modules. `pool.recycle` (PG) and `result.fetch` (Agent + ExternalDriver cursor pages) are instrumented as of 2026-07-21.
 
 ---
 

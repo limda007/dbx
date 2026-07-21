@@ -190,12 +190,25 @@ plus PG extras (`list_functions` / `sequences` / `rules` / `extensions` / `owner
 
 ---
 
-### PR-B5 — Optional capability traits (deferred)
+### PR-B5 — Domain capability handles (landed 2026-07-21)
 
-**Intent:** Extract `SqlExecute` / `SchemaBrowse` traits for first-class drivers; remaining variants stay enum.
+**Intent:** Hide `PoolKind` from domain ops without forcing `async_trait` dyn objects.
 
-**Decision (2026-07-16):** Defer. B1–B4 + B2.1 already hide product hot-path matches behind
-`database_session` static dispatch. Traits would add indirection without a second adapter today.
+**Approach (capability enums, not traits):**
+
+- `database_session/domain.rs`:
+  - `MongoHandle` / `DocumentHandle` — Clone capability enums
+  - `resolve_mongo_handle` / `resolve_document_handle`
+  - `with_redis!` macro — Redis is not `Clone`; body runs under registry read lock
+  - `resolve_postgres_pool` / `resolve_mysql_pool` / `resolve_clickhouse_client` /
+    `resolve_sqlserver_client` for typed export streams
+- `mongo_ops` / `document_ops` match handles only
+- `redis_ops` uses `with_redis!` only
+- `query_result_export` typed streams use resolve helpers (no `PoolKind` at call site)
+
+**Decision note:** Full `SqlExecute` / `SchemaBrowse` traits remain optional. Domain
+handles give the same deletion-test property (product files do not name `PoolKind`)
+with less indirection than dyn traits.
 
 ## Compatibility rules
 
@@ -229,11 +242,9 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 ## Residual (out of Phase B)
 
 - `schema.rs` agent/external/SqlServer early paths still peek `PoolKind` before calling session
-- `query.rs` txn / agent helpers
-- domain ops: `mongo_ops` / `redis_ops` / `document_ops`
-- `query_result_export` typed streams
+- `query.rs` txn / agent helpers / drop-database reconnect
 - orphan uncompiled `schema/providers/native.rs` (cleanup later)
 
 ## Immediate next step
 
-Phase B closed. Follow-ups: domain-ops dispatch slices, optional B5 traits if multi-adapter pain appears.
+Domain-ops + export stream dispatch landed (2026-07-21). Remaining: schema/query residual peeks.

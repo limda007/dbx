@@ -35,7 +35,7 @@ All lifecycle stages emit through `connection_lifecycle::log_stage`:
 | `ping` | Budgeted health probe (`SELECT 1` / MySQL ping) |
 | `schema.set` | PostgreSQL `SET search_path` (and related) |
 | `query.execute` | SQL execution wrapper around `do_execute` |
-| `result.fetch` | Agent or external-driver cursor-page fetch (`result_session_id`); this is distinct from the initial query execution. |
+| `result.fetch` | Agent (`fetch_query_page`) or external-driver (`fetchQueryPage`) cursor-page fetch when `result_session_id` is set. Distinct from the initial `query.execute` (including first-page `execute_query_page`). Native SQL drivers do not emit this stage. |
 | `cancel` | User cancel / kill path (`RunningQueries::cancel`, PG cancel packet, MySQL `KILL QUERY`) |
 | `cleanup` | Pool close under cleanup budget |
 
