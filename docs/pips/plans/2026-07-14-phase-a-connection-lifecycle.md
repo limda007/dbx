@@ -359,11 +359,12 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib \
 
 ## Immediate next step
 
-Phase A code + docs baseline are complete on `feat/connection-lifecycle`. Optional follow-ups (not Phase A blockers):
+Phase A + Phase B are complete on `feat/connection-lifecycle` (merged with latest
+`main` as of 2026-07-22). Remaining:
 
-1. Open PR / push when ready (branch was intentionally kept local).
-2. Phase B: hide `PoolKind` behind driver traits / `DatabaseSession`.
-3. Polish: optional `checkout.rs` / `recovery.rs` re-export modules. `pool.recycle` (PG) and `result.fetch` (Agent + ExternalDriver cursor pages) are instrumented as of 2026-07-21.
+1. **Open PR** → `main` (requires `gh auth login` / token).
+2. Optional polish (not blockers): `checkout.rs` / `recovery.rs` re-export modules.
+3. Out of Phase A/B: full `Box<dyn SqlSession>` registry (see Phase B residual).
 
 ---
 

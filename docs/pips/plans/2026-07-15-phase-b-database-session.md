@@ -263,6 +263,16 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 ## Immediate next step
 
+Phase B (B1–B5) is complete on `feat/connection-lifecycle`. Remaining work is
+**release plumbing**, not more Phase B design:
+
+1. Open PR for `feat/connection-lifecycle` → `main` (`gh auth login` if needed).
+2. Optional wider CI: default-features / `duckdb-bundled` rebuild when resources allow.
+3. Out of scope (do not block merge): `Box<dyn SqlSession>` registry; traits for
+   non-PG/MySQL drivers.
+
+### Landed residual log (reference)
+
 Schema residual slices landed 2026-07-21:
 
 - **S5** `get_object_source` → session
@@ -282,6 +292,8 @@ Schema residual collapse landed 2026-07-21:
 - Removed `extract_pool!` / `try_sqlserver!` from product `schema.rs`
 - Added `resolve_influxdb_client` + duckdb-bundled `resolve_duckdb_*` / `resolve_external_tabular`
 - Deleted uncompiled orphan tree `schema/{providers,duckdb_metadata,normalization}`
+
+B5 traits + main integrate landed 2026-07-22.
 
 Transfer / export / agent residual peeks landed 2026-07-22:
 

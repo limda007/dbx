@@ -15,13 +15,15 @@ mod traits;
 mod transfer;
 
 pub(crate) use domain::{
-    concurrent_metadata_prefetch_allowed, concurrent_metadata_prefetch_allowed_for_kind, is_agent_pool,
-    is_sqlserver_pool, resolve_agent_client, resolve_clickhouse_client, resolve_document_handle,
-    resolve_external_driver, resolve_influxdb_client, resolve_manual_txn_pool, resolve_mongo_handle,
-    resolve_mysql_pool, resolve_mysql_session, resolve_postgres_pool, resolve_postgres_session,
-    resolve_sqlserver_client, resolve_tx_path, resolve_vector_client, sqlserver_pool_is_current, DocumentHandle,
-    ManualTxnPool, MongoHandle, TxPath,
+    concurrent_metadata_prefetch_allowed, is_agent_pool, is_sqlserver_pool, resolve_agent_client,
+    resolve_clickhouse_client, resolve_document_handle, resolve_external_driver, resolve_influxdb_client,
+    resolve_manual_txn_pool, resolve_mongo_handle, resolve_mysql_pool, resolve_mysql_session, resolve_postgres_pool,
+    resolve_postgres_session, resolve_sqlserver_client, resolve_tx_path, resolve_vector_client,
+    sqlserver_pool_is_current, DocumentHandle, ManualTxnPool, MongoHandle, TxPath,
 };
+// Test-only: product uses concurrent_metadata_prefetch_allowed; export fixtures use for_kind directly.
+#[cfg(test)]
+pub(crate) use domain::concurrent_metadata_prefetch_allowed_for_kind;
 #[cfg(feature = "duckdb-bundled")]
 pub(crate) use domain::{resolve_duckdb_handle, resolve_duckdb_worker, resolve_external_tabular};
 pub(crate) use execute::execute_sql;
@@ -31,7 +33,11 @@ pub(crate) use schema::{
     list_object_statistics, list_objects, list_owners, list_rules, list_schemas, list_sequences, list_tables,
     list_triggers, try_completion_assistant_search,
 };
-pub(crate) use traits::{MysqlSession, PostgresSession, SchemaBrowse, SqlExecute, SqlSession};
+// Session handles for resolve_*_session callers; traits are implemented on these types.
+pub(crate) use traits::{MysqlSession, PostgresSession};
+// Capability traits: used by transfer/schema via traits module; re-exported for product/tests.
+#[allow(unused_imports)] // intentional facade surface (B5)
+pub(crate) use traits::{SchemaBrowse, SqlExecute, SqlSession};
 pub(crate) use transfer::{execute_transfer_sql, get_columns_for_transfer, stream_native_table_rows};
 
 #[cfg(test)]

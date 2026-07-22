@@ -42,6 +42,9 @@ pub(crate) trait SchemaBrowse: Send + Sync {
 }
 
 /// Combined SQL execute + schema browse (Postgres / MySQL session handles).
+///
+/// Marker for static bounds / tests; product code often uses the split traits.
+#[allow(dead_code)] // intentional B5 marker — implemented by session handles
 pub(crate) trait SqlSession: SqlExecute + SchemaBrowse {}
 
 /// PostgreSQL (and PG-wire cousins that share the deadpool handle) session.
