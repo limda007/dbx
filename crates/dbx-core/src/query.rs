@@ -2190,6 +2190,8 @@ pub async fn execute_statements_in_transaction(
                 operation_budget.clone(),
                 cancel_context,
                 &pool_key,
+                connection_id,
+                if database.is_empty() { None } else { Some(database) },
                 db_type,
             )
             .await
@@ -2238,13 +2240,19 @@ async fn exec_tx_pg_inner(
     budget: DbOperationBudget,
     cancel_context: Option<db::postgres::PostgresCancelContext>,
     pool_key: &str,
+    connection_id: &str,
+    database: Option<&str>,
     db_type: Option<DatabaseType>,
 ) -> Result<db::QueryResult, String> {
     // Checkout stage logs are emitted inside `checkout_postgres_client_logged` (lifecycle facade).
-    // Callers that know the config connection id should prefer an enriched context; here we only
-    // have pool_key so we avoid inventing connection_id by first-colon split.
+    // Prefer explicit connection_id / database from the transaction entrypoint (never first-colon split).
     let db_type_label = connection_lifecycle::optional_database_type_log_label(db_type);
-    let log_context = connection_lifecycle::StageLogContext::for_pool(Some(pool_key), None, db_type_label.as_deref());
+    let mut log_context =
+        connection_lifecycle::StageLogContext::for_pool(Some(pool_key), None, db_type_label.as_deref())
+            .with_connection_id(connection_id);
+    if let Some(database) = database.filter(|db| !db.trim().is_empty()) {
+        log_context = log_context.with_database(database);
+    }
     let mut client = db::postgres::checkout_postgres_client_logged(&pool, None, budget.checkout_timeout, log_context)
         .await
         .map_err(|e| format!("Failed to acquire connection: {e}"))?;

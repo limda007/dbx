@@ -104,13 +104,14 @@ impl RunningQueries {
             (
                 task.token.clone(),
                 task.metadata.connection_id.clone(),
+                task.metadata.database.clone(),
                 task.pool_key.clone(),
                 task.metadata.client_session_id.clone(),
             )
         });
         let interrupt = self.interrupts.lock().unwrap_or_else(|e| e.into_inner()).remove(execution_id);
 
-        let Some((token, connection_id, pool_key, client_session_id)) = task_snapshot else {
+        let Some((token, connection_id, database, pool_key, client_session_id)) = task_snapshot else {
             log_stage(
                 StageLog::new(LifecycleStage::Cancel, StageOutcome::Error, start.elapsed().as_millis())
                     .with_trace_id(execution_id)
@@ -120,12 +121,13 @@ impl RunningQueries {
         };
 
         let connection_id_ref = connection_id.as_deref();
+        let database_ref = database.as_deref().filter(|s| !s.is_empty());
         let pool_key_ref = pool_key.as_deref();
         let client_session_id_ref = client_session_id.as_deref();
         let log_context = StageLogContext {
             connection_id: connection_id_ref,
             pool_key: pool_key_ref,
-            database: None,
+            database: database_ref,
             db_type: None,
             trace_id: Some(execution_id),
             client_session_id: client_session_id_ref,

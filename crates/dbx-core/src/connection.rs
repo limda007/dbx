@@ -940,7 +940,7 @@ impl AppState {
         let previous_key = pool_key.clone();
         let previous = self.connections.write().await.insert(pool_key, pool);
         if let Some(pool) = previous {
-            close_pool_kind_with_timeout(previous_key, pool).await;
+            self.close_pool_kind_logged(previous_key, pool).await;
         }
     }
 
@@ -1177,7 +1177,7 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<(), String> {
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, Some(attempt)).await {
-            close_pool_kind_with_timeout(pool_key, pool).await;
+            self.close_pool_kind_logged(pool_key, pool).await;
             return Err(err);
         }
         self.insert_connection_pool(pool_key, pool, config).await;
@@ -1197,7 +1197,34 @@ impl AppState {
             self.mq_registry.drop_connection(connection_id).await;
         }
         self.reset_connection_transport_for_config(connection_id, config).await;
-        close_pool_kind_with_timeout(pool_key, pool).await;
+        self.close_pool_kind_logged(pool_key, pool).await;
+    }
+
+    /// Budgeted pool close with lifecycle correlation from the config map.
+    async fn close_pool_kind_logged(&self, pool_key: String, pool: PoolKind) {
+        let (connection_id, database, db_type_label) = self.lifecycle_correlation_for_pool_key(&pool_key).await;
+        close_pool_kind_with_timeout_and_context(
+            pool_key,
+            pool,
+            connection_id.as_deref(),
+            database.as_deref(),
+            db_type_label.as_deref(),
+        )
+        .await;
+    }
+
+    async fn close_removed_pools_logged(&self, removed: Vec<(String, PoolKind)>) {
+        for (pool_key, pool) in removed {
+            self.close_pool_kind_logged(pool_key, pool).await;
+        }
+    }
+
+    async fn close_removed_pools_logged_in_background(&self, removed: Vec<(String, PoolKind)>) {
+        if removed.is_empty() {
+            return;
+        }
+        let configs = self.configs.read().await.clone();
+        close_removed_pools_in_background(removed, configs);
     }
 
     async fn start_keepalive_task(&self, pool_key: &str, pool: &PoolKind, config: &ConnectionConfig) {
@@ -1220,6 +1247,11 @@ impl AppState {
         let pool_activity = self.pool_activity.clone();
         let cancel_contexts = self.postgres_cancel_contexts.clone();
         let running_queries = self.running_queries.clone();
+        // Capture correlation at task start (config may be removed later; never invent from pool_key).
+        let keepalive_connection_id = config.id.clone();
+        let keepalive_database =
+            crate::connection_lifecycle::database_from_pool_key(pool_key, &keepalive_connection_id).map(str::to_string);
+        let keepalive_db_type = crate::connection_lifecycle::database_type_log_label(config.db_type);
         self.task_supervisor.spawn_replace(format!("keepalive:{pool_key}"), move |shutdown| async move {
             loop {
                 tokio::select! {
@@ -1241,7 +1273,14 @@ impl AppState {
                             cancel_contexts.write().await.remove(&key);
                             let removed = connections.write().await.remove(&key);
                             if let Some(pool) = removed {
-                                close_pool_kind_with_timeout(key, pool).await;
+                                close_pool_kind_with_timeout_and_context(
+                                    key,
+                                    pool,
+                                    Some(keepalive_connection_id.as_str()),
+                                    keepalive_database.as_deref(),
+                                    Some(keepalive_db_type.as_str()),
+                                )
+                                .await;
                             }
                             break;
                         }
@@ -1254,7 +1293,14 @@ impl AppState {
                             cancel_contexts.write().await.remove(&key);
                             let removed = connections.write().await.remove(&key);
                             if let Some(pool) = removed {
-                                close_pool_kind_with_timeout(key, pool).await;
+                                close_pool_kind_with_timeout_and_context(
+                                    key,
+                                    pool,
+                                    Some(keepalive_connection_id.as_str()),
+                                    keepalive_database.as_deref(),
+                                    Some(keepalive_db_type.as_str()),
+                                )
+                                .await;
                             }
                             break;
                         }
@@ -1524,7 +1570,7 @@ impl AppState {
                             Ok(()) => {
                                 // Re-check: another task may have created the pool while we were connecting.
                                 if self.connections.read().await.contains_key(&pool_key) {
-                                    close_pool_kind_with_timeout(pool_key.clone(), PoolKind::MongoDb(client)).await;
+                                    self.close_pool_kind_logged(pool_key.clone(), PoolKind::MongoDb(client)).await;
                                     return Ok(pool_key);
                                 }
                                 if let Err(err) =
@@ -2451,7 +2497,7 @@ impl AppState {
         self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
+            self.close_pool_kind_logged(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -2484,7 +2530,7 @@ impl AppState {
             self.postgres_cancel_contexts.write().await.remove(&pool_key);
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
-                close_pool_kind_with_timeout(pool_key.clone(), pool).await;
+                self.close_pool_kind_logged(pool_key.clone(), pool).await;
             }
         }
         self.get_or_create_pool_for_session(connection_id, database, client_session_id).await
@@ -2515,7 +2561,7 @@ impl AppState {
         self.postgres_cancel_contexts.write().await.remove(&pool_key);
         let removed = self.connections.write().await.remove(&pool_key);
         if let Some(pool) = removed {
-            close_pool_kind_with_timeout(pool_key, pool).await;
+            self.close_pool_kind_logged(pool_key, pool).await;
             Ok(true)
         } else {
             Ok(false)
@@ -2528,7 +2574,7 @@ impl AppState {
         self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
+            self.close_pool_kind_logged(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -2641,7 +2687,7 @@ impl AppState {
         self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_removed_pools_in_background(vec![(pool_key.to_string(), pool)]);
+            self.close_removed_pools_logged_in_background(vec![(pool_key.to_string(), pool)]).await;
             true
         } else {
             false
@@ -2677,6 +2723,10 @@ impl AppState {
         let supervisor = self.task_supervisor.clone();
         let pool_activity = self.pool_activity.clone();
         let postgres_cancel_contexts = self.postgres_cancel_contexts.clone();
+        let configs = match self.configs.try_read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => HashMap::new(),
+        };
         let task_key = format!("duckdb-cleanup:{pool_key}");
         supervisor.clone().spawn_replace(task_key, move |shutdown| async move {
             while Arc::strong_count(&con) > 2 {
@@ -2700,7 +2750,7 @@ impl AppState {
                 // visible in the pool map, otherwise a concurrent query could reuse it.
                 con.clear_draining();
                 drop(con);
-                close_pool_kind_with_timeout(pool_key, pool).await;
+                close_pool_kind_with_timeout(pool_key, pool, Some(&configs)).await;
             }
         });
     }
@@ -2716,6 +2766,10 @@ impl AppState {
         let supervisor = self.task_supervisor.clone();
         let pool_activity = self.pool_activity.clone();
         let postgres_cancel_contexts = self.postgres_cancel_contexts.clone();
+        let configs = match self.configs.try_read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => HashMap::new(),
+        };
         let task_key = format!("duckdb-draining:{pool_key}");
         supervisor.clone().spawn_replace(task_key, move |shutdown| async move {
             tokio::select! {
@@ -2746,7 +2800,7 @@ impl AppState {
                 // visible in the pool map, otherwise a concurrent query could reuse it.
                 con.clear_draining();
                 drop(con);
-                close_pool_kind_with_timeout(pool_key, pool).await;
+                close_pool_kind_with_timeout(pool_key, pool, Some(&configs)).await;
             }
         });
     }
@@ -2788,7 +2842,7 @@ impl AppState {
         drop(conns);
         let closed = !removed.is_empty();
         for (key, pool) in removed {
-            close_pool_kind_with_timeout(key, pool).await;
+            self.close_pool_kind_logged(key, pool).await;
         }
         Ok(closed)
     }
@@ -3225,7 +3279,7 @@ impl AppState {
                 }
             }
             drop(conns);
-            close_removed_pools(removed).await;
+            self.close_removed_pools_logged(removed).await;
         }
 
         // Re-establish SSH tunnels that have died
@@ -3241,18 +3295,18 @@ impl AppState {
 
     pub async fn remove_connection_pools(&self, connection_id: &str) {
         let removed = self.drain_connection_pools(connection_id).await;
-        close_removed_pools(removed).await;
+        self.close_removed_pools_logged(removed).await;
     }
 
     pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
         let removed = self.drain_connection_pools(connection_id).await;
-        close_removed_pools_in_background(removed);
+        self.close_removed_pools_logged_in_background(removed).await;
     }
 
     #[cfg(feature = "duckdb-bundled")]
     async fn remove_duckdb_pools_detached(&self) {
         let removed = self.drain_duckdb_pools().await;
-        close_removed_pools_in_background(removed);
+        self.close_removed_pools_logged_in_background(removed).await;
     }
 
     #[cfg(not(feature = "duckdb-bundled"))]
@@ -3260,7 +3314,7 @@ impl AppState {
 
     pub async fn remove_external_driver_pools(&self, driver_id: &str) {
         let removed = self.drain_external_driver_pools(driver_id).await;
-        close_removed_pools(removed).await;
+        self.close_removed_pools_logged(removed).await;
     }
 
     async fn drain_connection_pools(&self, connection_id: &str) -> Vec<(String, PoolKind)> {
@@ -3688,26 +3742,68 @@ async fn close_reclaimed_agent_pool(pool: PoolKind) -> Result<(), (PoolKind, Str
     }
 }
 
-async fn close_removed_pools(removed: Vec<(String, PoolKind)>) {
+fn lifecycle_correlation_from_configs(
+    pool_key: &str,
+    configs: &HashMap<String, ConnectionConfig>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(config) = config_for_pool_key(pool_key, configs) else {
+        return (None, None, None);
+    };
+    let connection_id = config.id.clone();
+    let database = crate::connection_lifecycle::database_from_pool_key(pool_key, &connection_id).map(str::to_string);
+    let db_type_label = crate::connection_lifecycle::database_type_log_label(config.db_type);
+    (Some(connection_id), database, Some(db_type_label))
+}
+
+async fn close_removed_pools(removed: Vec<(String, PoolKind)>, configs: Option<&HashMap<String, ConnectionConfig>>) {
     for (pool_key, pool) in removed {
-        close_pool_kind_with_timeout(pool_key, pool).await;
+        close_pool_kind_with_timeout(pool_key, pool, configs).await;
     }
 }
 
-fn close_removed_pools_in_background(removed: Vec<(String, PoolKind)>) {
+fn close_removed_pools_in_background(removed: Vec<(String, PoolKind)>, configs: HashMap<String, ConnectionConfig>) {
     if removed.is_empty() {
         return;
     }
     tokio::spawn(async move {
-        close_removed_pools(removed).await;
+        close_removed_pools(removed, Some(&configs)).await;
     });
 }
 
-async fn close_pool_kind_with_timeout(pool_key: String, pool: PoolKind) {
+async fn close_pool_kind_with_timeout(
+    pool_key: String,
+    pool: PoolKind,
+    configs: Option<&HashMap<String, ConnectionConfig>>,
+) {
     // Detach map entry first (caller), then budgeted close without holding connections lock.
-    // Do not invent connection_id by splitting pool_key on `:` (ids may contain colons).
-    // pool_key remains the primary correlation field for cleanup.
-    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(Some(pool_key.as_str()), None, None);
+    // Resolve connection_id / database via config map when available (never first-colon split).
+    let (connection_id, database, db_type_label) =
+        configs.map(|c| lifecycle_correlation_from_configs(&pool_key, c)).unwrap_or((None, None, None));
+    close_pool_kind_with_timeout_and_context(
+        pool_key,
+        pool,
+        connection_id.as_deref(),
+        database.as_deref(),
+        db_type_label.as_deref(),
+    )
+    .await;
+}
+
+async fn close_pool_kind_with_timeout_and_context(
+    pool_key: String,
+    pool: PoolKind,
+    connection_id: Option<&str>,
+    database: Option<&str>,
+    db_type_label: Option<&str>,
+) {
+    let mut log_context =
+        crate::connection_lifecycle::StageLogContext::for_pool(Some(pool_key.as_str()), None, db_type_label);
+    if let Some(connection_id) = connection_id.filter(|s| !s.is_empty()) {
+        log_context = log_context.with_connection_id(connection_id);
+    }
+    if let Some(database) = database.filter(|s| !s.is_empty()) {
+        log_context = log_context.with_database(database);
+    }
     crate::connection_lifecycle::close_with_default_timeout(pool_key.as_str(), log_context, close_pool_kind(pool))
         .await;
 }
