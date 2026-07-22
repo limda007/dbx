@@ -119,6 +119,8 @@ type DataGridHandle = {
 type SearchableBrowserHandle = {
   focusSearch: () => boolean;
   refresh?: () => boolean;
+  insertCommand?: (command: string) => Promise<boolean>;
+  executeCommand?: (command: string) => Promise<boolean>;
 };
 
 const props = defineProps<{
@@ -788,7 +790,17 @@ function applyTableStructureChanges() {
   return tableStructureEditorRef.value?.applyChanges() ?? Promise.resolve(false);
 }
 
-defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, handleModRTarget, requestQueryEditorExecute, pasteClipboardAsSqlInCondition, applyTableStructureChanges });
+async function insertRedisCommand(command: string): Promise<boolean> {
+  if (props.activeTab.mode !== "redis") return false;
+  return (await redisKeyBrowserRef.value?.insertCommand?.(command)) ?? false;
+}
+
+async function executeRedisCommand(command: string): Promise<boolean> {
+  if (props.activeTab.mode !== "redis") return false;
+  return (await redisKeyBrowserRef.value?.executeCommand?.(command)) ?? false;
+}
+
+defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, handleModRTarget, requestQueryEditorExecute, pasteClipboardAsSqlInCondition, applyTableStructureChanges, insertRedisCommand, executeRedisCommand });
 </script>
 
 <template>

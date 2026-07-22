@@ -374,6 +374,7 @@ pub async fn test_connection_with_info(
                         username,
                         password,
                         Some(&config.ca_cert_path),
+                        config.url_params.as_deref(),
                         connect_timeout,
                     )?;
                     db::clickhouse_driver::test_connection(&client, connect_timeout).await?;
@@ -722,6 +723,7 @@ async fn connect_inner(
                     username,
                     password,
                     Some(&db_config.ca_cert_path),
+                    db_config.url_params.as_deref(),
                     connect_timeout,
                 )?;
                 db::clickhouse_driver::test_connection(&client, connect_timeout).await?;

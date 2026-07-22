@@ -462,7 +462,7 @@ pub(crate) async fn list_rules(state: &AppState, pool_key: &str, schema: &str) -
 pub(crate) async fn list_extensions(
     state: &AppState,
     pool_key: &str,
-    schema: &str,
+    schema: Option<&str>,
 ) -> Result<Vec<db::ExtensionInfo>, String> {
     let connections = state.connections.read().await;
     let pool = connections.get(pool_key).ok_or("Pool not found")?;

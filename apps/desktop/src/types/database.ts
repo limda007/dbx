@@ -595,6 +595,7 @@ export interface SqlTextSpan {
 
 export interface SqlTableReference {
   name: string;
+  database?: string | null;
   schema?: string | null;
   alias?: string | null;
   span: SqlTextSpan;
