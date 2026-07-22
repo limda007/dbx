@@ -535,6 +535,7 @@ pub async fn connect(
     let log_context = StageLogContext {
         connection_id: Some(id.as_str()),
         pool_key: Some(id.as_str()),
+        database: None,
         db_type: Some(db_type_label.as_str()),
         trace_id: None,
         client_session_id: None,
@@ -1007,6 +1008,7 @@ mod tests {
             port: 65000,
             username: String::new(),
             password: String::new(),
+            test_target: None,
         })
     }
 

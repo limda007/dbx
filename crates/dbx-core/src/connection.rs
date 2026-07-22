@@ -2246,10 +2246,12 @@ impl AppState {
                     drop(connections);
                     // Pool saturation means active work, not a dead connection.
                     let budget = self.lifecycle_budget_for_pool_key(pool_key).await;
-                    let db_type_label = self.lifecycle_db_type_label_for_pool_key(pool_key).await;
-                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
-                        Some(pool_key),
-                        None,
+                    let (connection_id, database, db_type_label) =
+                        self.lifecycle_correlation_for_pool_key(pool_key).await;
+                    let log_context = Self::lifecycle_log_context_from_correlation(
+                        pool_key,
+                        connection_id.as_deref(),
+                        database.as_deref(),
                         db_type_label.as_deref(),
                     );
                     let probe = crate::connection_lifecycle::probe_mysql_pool_health(&pool, &budget, log_context).await;
@@ -2268,10 +2270,12 @@ impl AppState {
                     let pool = pool.clone();
                     drop(connections);
                     let budget = self.lifecycle_budget_for_pool_key(pool_key).await;
-                    let db_type_label = self.lifecycle_db_type_label_for_pool_key(pool_key).await;
-                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
-                        Some(pool_key),
-                        None,
+                    let (connection_id, database, db_type_label) =
+                        self.lifecycle_correlation_for_pool_key(pool_key).await;
+                    let log_context = Self::lifecycle_log_context_from_correlation(
+                        pool_key,
+                        connection_id.as_deref(),
+                        database.as_deref(),
                         db_type_label.as_deref(),
                     );
                     let probe =
@@ -3001,10 +3005,37 @@ impl AppState {
             .unwrap_or_else(crate::connection_lifecycle::health_budget_defaults)
     }
 
-    async fn lifecycle_db_type_label_for_pool_key(&self, pool_key: &str) -> Option<String> {
+    /// Owned correlation ids for lifecycle stage logs (connection id from config map, never first-colon split).
+    async fn lifecycle_correlation_for_pool_key(
+        &self,
+        pool_key: &str,
+    ) -> (Option<String>, Option<String>, Option<String>) {
         let configs = self.configs.read().await;
-        config_for_pool_key(pool_key, &configs)
-            .map(|config| crate::connection_lifecycle::database_type_log_label(config.db_type))
+        let Some(config) = config_for_pool_key(pool_key, &configs) else {
+            return (None, None, None);
+        };
+        let connection_id = config.id.clone();
+        let database =
+            crate::connection_lifecycle::database_from_pool_key(pool_key, &connection_id).map(str::to_string);
+        let db_type_label = crate::connection_lifecycle::database_type_log_label(config.db_type);
+        (Some(connection_id), database, Some(db_type_label))
+    }
+
+    fn lifecycle_log_context_from_correlation<'a>(
+        pool_key: &'a str,
+        connection_id: Option<&'a str>,
+        database: Option<&'a str>,
+        db_type_label: Option<&'a str>,
+    ) -> crate::connection_lifecycle::StageLogContext<'a> {
+        let mut log_context =
+            crate::connection_lifecycle::StageLogContext::for_pool(Some(pool_key), None, db_type_label);
+        if let Some(connection_id) = connection_id {
+            log_context = log_context.with_connection_id(connection_id);
+        }
+        if let Some(database) = database {
+            log_context = log_context.with_database(database);
+        }
+        log_context
     }
 
     pub async fn refresh_connections(&self) {
@@ -3032,10 +3063,11 @@ impl AppState {
             let healthy = match pool {
                 PoolKind::Mysql(p, _) => {
                     let budget = self.lifecycle_budget_for_pool_key(key).await;
-                    let db_type_label = self.lifecycle_db_type_label_for_pool_key(key).await;
-                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
-                        Some(key.as_str()),
-                        None,
+                    let (connection_id, database, db_type_label) = self.lifecycle_correlation_for_pool_key(key).await;
+                    let log_context = Self::lifecycle_log_context_from_correlation(
+                        key.as_str(),
+                        connection_id.as_deref(),
+                        database.as_deref(),
                         db_type_label.as_deref(),
                     );
                     let probe = crate::connection_lifecycle::probe_mysql_pool_health(p, &budget, log_context).await;
@@ -3050,10 +3082,11 @@ impl AppState {
                 }
                 PoolKind::Postgres(p) => {
                     let budget = self.lifecycle_budget_for_pool_key(key).await;
-                    let db_type_label = self.lifecycle_db_type_label_for_pool_key(key).await;
-                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
-                        Some(key.as_str()),
-                        None,
+                    let (connection_id, database, db_type_label) = self.lifecycle_correlation_for_pool_key(key).await;
+                    let log_context = Self::lifecycle_log_context_from_correlation(
+                        key.as_str(),
+                        connection_id.as_deref(),
+                        database.as_deref(),
                         db_type_label.as_deref(),
                     );
                     let probe = crate::connection_lifecycle::probe_postgres_pool_health(p, &budget, log_context).await;
@@ -3672,11 +3705,9 @@ fn close_removed_pools_in_background(removed: Vec<(String, PoolKind)>) {
 
 async fn close_pool_kind_with_timeout(pool_key: String, pool: PoolKind) {
     // Detach map entry first (caller), then budgeted close without holding connections lock.
-    let connection_id = crate::connection_lifecycle::connection_id_from_pool_key(&pool_key);
-    let mut log_context = crate::connection_lifecycle::StageLogContext::for_pool(Some(pool_key.as_str()), None, None);
-    if !connection_id.is_empty() {
-        log_context.connection_id = Some(connection_id);
-    }
+    // Do not invent connection_id by splitting pool_key on `:` (ids may contain colons).
+    // pool_key remains the primary correlation field for cleanup.
+    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(Some(pool_key.as_str()), None, None);
     crate::connection_lifecycle::close_with_default_timeout(pool_key.as_str(), log_context, close_pool_kind(pool))
         .await;
 }

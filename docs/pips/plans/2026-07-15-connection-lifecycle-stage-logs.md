@@ -8,7 +8,7 @@
 All lifecycle stages emit through `connection_lifecycle::log_stage`:
 
 ```text
-[db:<stage>:<outcome>] elapsed_ms=… timeout_ms=… trace_id=… connection_id=… pool_key=… db_type=… client_session_id=… detail=… error=…
+[db:<stage>:<outcome>] elapsed_ms=… timeout_ms=… trace_id=… connection_id=… pool_key=… database=… db_type=… client_session_id=… detail=… error=…
 ```
 
 | Field | Meaning |
@@ -18,7 +18,8 @@ All lifecycle stages emit through `connection_lifecycle::log_stage`:
 | `elapsed_ms` | Wall time spent in that stage so far |
 | `timeout_ms` | Budget for the stage (when known) |
 | `trace_id` | Usually the query `execution_id` |
-| `connection_id` / `pool_key` | Which connection / pool |
+| `connection_id` / `pool_key` | Which connection / pool (`connection_id` is never invented by splitting `pool_key` on the first `:`) |
+| `database` | Target database/catalog when known (PIP-0001); from the query/export call or derived via config map + pool key |
 | `db_type` | Product label (`postgres`, `opengauss`, `mysql`, …) — not the pool adapter |
 | `detail` | Non-error notes (e.g. `cancel:accepted` explanation) — not a failure |
 | `error` | Present only for real failures (`outcome=error` or failed ops) |
@@ -58,7 +59,7 @@ All lifecycle stages emit through `connection_lifecycle::log_stage`:
 ### Example healthy PG query
 
 ```text
-[db:query.execute:start] elapsed_ms=0 timeout_ms=30000 trace_id=exec-1 connection_id=c1 pool_key=c1:app db_type=postgres
+[db:query.execute:start] elapsed_ms=0 timeout_ms=30000 trace_id=exec-1 connection_id=c1 pool_key=c1:app database=app db_type=postgres
 [db:pool.checkout:done] elapsed_ms=2 timeout_ms=10000 trace_id=exec-1 …
 [db:schema.set:done] elapsed_ms=1 …
 [db:query.execute:done] elapsed_ms=45 …

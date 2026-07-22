@@ -737,7 +737,11 @@ async fn try_export_postgres_query_result_stream(
         Some(pool_key.as_str()),
         request.execution_id.as_deref(),
         db_type_label.as_deref(),
-    );
+    )
+    .with_connection_id(request.connection_id.as_str());
+    if !database.is_empty() {
+        log_context = log_context.with_database(database);
+    }
     if let Some(ref client_session_id) = request.client_session_id {
         log_context.client_session_id = Some(client_session_id.as_str());
     }
@@ -921,17 +925,25 @@ async fn try_export_mysql_query_result_stream(
         let kill_pool_key = pool_key.clone();
         let kill_trace_id = execution_id.clone();
         let kill_db_type = export_db_type_label.clone();
+        let kill_connection_id = request.connection_id.clone();
+        let kill_database = request.database.trim().to_string();
         state.running_queries.register_interrupt(&execution_id, move || {
             let kill_opts = interrupt_kill_opts.clone();
             let kill_pool_key = kill_pool_key.clone();
             let kill_trace_id = kill_trace_id.clone();
             let kill_db_type = kill_db_type.clone();
+            let kill_connection_id = kill_connection_id.clone();
+            let kill_database = kill_database.clone();
             tokio::spawn(async move {
-                let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+                let mut log_context = crate::connection_lifecycle::StageLogContext::for_pool(
                     Some(kill_pool_key.as_str()),
                     Some(kill_trace_id.as_str()),
                     Some(kill_db_type.as_str()),
-                );
+                )
+                .with_connection_id(kill_connection_id.as_str());
+                if !kill_database.is_empty() {
+                    log_context = log_context.with_database(kill_database.as_str());
+                }
                 if let Err(error) =
                     crate::db::mysql::kill_query_with_opts_logged(kill_opts, mysql_connection_id, log_context).await
                 {
@@ -1051,11 +1063,16 @@ async fn try_export_mysql_query_result_stream(
     )
     .await;
     if stream_result.as_ref().is_err_and(|error| error == &timeout_error) {
-        let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+        let mut log_context = crate::connection_lifecycle::StageLogContext::for_pool(
             Some(pool_key.as_str()),
             request.execution_id.as_deref(),
             Some(export_db_type_label.as_str()),
-        );
+        )
+        .with_connection_id(request.connection_id.as_str());
+        let database = request.database.trim();
+        if !database.is_empty() {
+            log_context = log_context.with_database(database);
+        }
         let _ = crate::db::mysql::kill_query_with_opts_logged(kill_opts, mysql_connection_id, log_context).await;
     }
     watcher_done.cancel();

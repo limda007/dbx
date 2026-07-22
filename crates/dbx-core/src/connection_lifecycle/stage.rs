@@ -63,6 +63,8 @@ impl StageOutcome {
 pub struct StageLogContext<'a> {
     pub connection_id: Option<&'a str>,
     pub pool_key: Option<&'a str>,
+    /// Target database/catalog when known (PIP-0001 field). Prefer explicit values.
+    pub database: Option<&'a str>,
     pub db_type: Option<&'a str>,
     pub trace_id: Option<&'a str>,
     pub client_session_id: Option<&'a str>,
@@ -70,7 +72,14 @@ pub struct StageLogContext<'a> {
 
 impl<'a> StageLogContext<'a> {
     pub const fn empty() -> Self {
-        Self { connection_id: None, pool_key: None, db_type: None, trace_id: None, client_session_id: None }
+        Self {
+            connection_id: None,
+            pool_key: None,
+            database: None,
+            db_type: None,
+            trace_id: None,
+            client_session_id: None,
+        }
     }
 
     /// Build correlation fields for a pool-backed operation.
@@ -78,21 +87,68 @@ impl<'a> StageLogContext<'a> {
     /// `db_type` must be the configured product name (e.g. `opengauss`, `redshift`,
     /// `questdb`), not the pool adapter. Use [`database_type_log_label`] so PG-wire
     /// cousins are not all logged as `postgres`.
+    ///
+    /// Does **not** invent `connection_id` by splitting on `:` (ids may contain colons).
+    /// Call [`Self::with_connection_id`] when the real connection id is known so
+    /// `database` can be derived from the pool key.
     pub fn for_pool(pool_key: Option<&'a str>, trace_id: Option<&'a str>, db_type: Option<&'a str>) -> Self {
-        let connection_id = pool_key.map(connection_id_from_pool_key).filter(|s| !s.is_empty());
         Self {
-            connection_id,
+            connection_id: None,
             pool_key: pool_key.filter(|s| !s.is_empty()),
+            database: None,
             db_type: db_type.filter(|s| !s.is_empty()),
             trace_id: trace_id.filter(|s| !s.is_empty()),
             client_session_id: None,
         }
     }
+
+    /// Attach an explicit connection id and best-effort `database` from `pool_key`.
+    pub fn with_connection_id(mut self, connection_id: &'a str) -> Self {
+        if connection_id.is_empty() {
+            return self;
+        }
+        self.connection_id = Some(connection_id);
+        if self.database.is_none() {
+            if let Some(pool_key) = self.pool_key {
+                self.database = database_from_pool_key(pool_key, connection_id);
+            }
+        }
+        self
+    }
+
+    /// Attach an explicit database name when the caller already knows it.
+    pub fn with_database(mut self, database: &'a str) -> Self {
+        if !database.is_empty() {
+            self.database = Some(database);
+        }
+        self
+    }
 }
 
-/// Best-effort connection id from a pool key (`connection_id` or `connection_id:database`).
+/// Best-effort base pool key without inventing a connection id.
+///
+/// Strips only the `:session:…` suffix. Does **not** split on the first `:` —
+/// connection ids may contain colons (`conn:other`). Prefer an explicit
+/// connection id from config when correlating logs.
 pub fn connection_id_from_pool_key(pool_key: &str) -> &str {
-    pool_key.split(':').next().unwrap_or(pool_key)
+    pool_key.split_once(":session:").map(|(base, _)| base).unwrap_or(pool_key)
+}
+
+/// Database segment of a pool key when `connection_id` is known.
+///
+/// Pool keys are `{connection_id}`, `{connection_id}:{database}`, or
+/// `{connection_id}:{database}:session:{session}` (see `base_pool_key_for`).
+pub fn database_from_pool_key<'a>(pool_key: &'a str, connection_id: &str) -> Option<&'a str> {
+    if connection_id.is_empty() {
+        return None;
+    }
+    let rest = pool_key.strip_prefix(connection_id)?.strip_prefix(':')?;
+    let database = rest.split_once(":session:").map(|(db, _)| db).unwrap_or(rest);
+    if database.is_empty() {
+        None
+    } else {
+        Some(database)
+    }
 }
 
 /// Stable log label for a configured [`DatabaseType`] (serde rename, lowercased).
@@ -119,6 +175,7 @@ pub struct StageLog<'a> {
     pub timeout_ms: Option<u128>,
     pub connection_id: Option<&'a str>,
     pub pool_key: Option<&'a str>,
+    pub database: Option<&'a str>,
     pub db_type: Option<&'a str>,
     pub trace_id: Option<&'a str>,
     pub client_session_id: Option<&'a str>,
@@ -136,6 +193,7 @@ impl<'a> StageLog<'a> {
             timeout_ms: None,
             connection_id: None,
             pool_key: None,
+            database: None,
             db_type: None,
             trace_id: None,
             client_session_id: None,
@@ -161,6 +219,11 @@ impl<'a> StageLog<'a> {
 
     pub fn with_pool_key(mut self, pool_key: &'a str) -> Self {
         self.pool_key = Some(pool_key);
+        self
+    }
+
+    pub fn with_database(mut self, database: &'a str) -> Self {
+        self.database = Some(database);
         self
     }
 
@@ -195,6 +258,9 @@ impl<'a> StageLog<'a> {
         }
         if self.pool_key.is_none() {
             self.pool_key = context.pool_key;
+        }
+        if self.database.is_none() {
+            self.database = context.database;
         }
         if self.db_type.is_none() {
             self.db_type = context.db_type;
@@ -231,6 +297,9 @@ fn write_stage_log(f: &mut impl Write, fields: &StageLog<'_>) -> fmt::Result {
     }
     if let Some(pool_key) = fields.pool_key.filter(|s| !s.is_empty()) {
         write!(f, " pool_key={pool_key}")?;
+    }
+    if let Some(database) = fields.database.filter(|s| !s.is_empty()) {
+        write!(f, " database={database}")?;
     }
     if let Some(db_type) = fields.db_type.filter(|s| !s.is_empty()) {
         write!(f, " db_type={db_type}")?;
@@ -383,12 +452,47 @@ mod tests {
     }
 
     #[test]
-    fn stage_log_context_for_pool_derives_connection_id() {
-        let ctx = StageLogContext::for_pool(Some("conn-1:app"), Some("exec-9"), Some("opengauss"));
-        assert_eq!(ctx.connection_id, Some("conn-1"));
-        assert_eq!(ctx.pool_key, Some("conn-1:app"));
+    fn stage_log_context_for_pool_does_not_invent_connection_id() {
+        // Connection ids may contain colons; for_pool must not split on the first `:`.
+        let ctx = StageLogContext::for_pool(Some("conn:other:app"), Some("exec-9"), Some("opengauss"));
+        assert_eq!(ctx.connection_id, None);
+        assert_eq!(ctx.database, None);
+        assert_eq!(ctx.pool_key, Some("conn:other:app"));
         assert_eq!(ctx.db_type, Some("opengauss"));
         assert_eq!(ctx.trace_id, Some("exec-9"));
+    }
+
+    #[test]
+    fn with_connection_id_derives_database_from_pool_key() {
+        let ctx = StageLogContext::for_pool(Some("conn:other:app:session:tab-1"), Some("exec-9"), Some("postgres"))
+            .with_connection_id("conn:other");
+        assert_eq!(ctx.connection_id, Some("conn:other"));
+        assert_eq!(ctx.database, Some("app"));
+        assert_eq!(ctx.pool_key, Some("conn:other:app:session:tab-1"));
+    }
+
+    #[test]
+    fn with_database_overrides_derived_value() {
+        let ctx =
+            StageLogContext::for_pool(Some("c1:app"), None, None).with_connection_id("c1").with_database("explicit-db");
+        assert_eq!(ctx.database, Some("explicit-db"));
+    }
+
+    #[test]
+    fn connection_id_from_pool_key_only_strips_session_suffix() {
+        assert_eq!(connection_id_from_pool_key("conn:other:app:session:tab"), "conn:other:app");
+        assert_eq!(connection_id_from_pool_key("plain"), "plain");
+        // Still not a full connection id when database is embedded — callers must pass id explicitly.
+        assert_eq!(connection_id_from_pool_key("conn:other:app"), "conn:other:app");
+    }
+
+    #[test]
+    fn database_from_pool_key_requires_known_connection_id() {
+        assert_eq!(database_from_pool_key("conn:other:app", "conn:other"), Some("app"));
+        assert_eq!(database_from_pool_key("conn:other", "conn:other"), None);
+        assert_eq!(database_from_pool_key("conn:other:app:session:t", "conn:other"), Some("app"));
+        // First-colon split would wrongly return "other" for connection id "conn".
+        assert_eq!(database_from_pool_key("conn:other:app", "conn"), Some("other:app"));
     }
 
     #[test]
@@ -403,14 +507,27 @@ mod tests {
     }
 
     #[test]
+    fn format_stage_log_includes_database_field() {
+        let line = format_stage_log(
+            &StageLog::new(LifecycleStage::QueryExecute, StageOutcome::Start, 0)
+                .with_connection_id("c1")
+                .with_pool_key("c1:app")
+                .with_database("app")
+                .with_db_type("postgres")
+                .with_trace_id("exec-1"),
+        );
+        assert!(line.contains("database=app"));
+        assert!(line.contains("connection_id=c1"));
+        assert!(line.contains("pool_key=c1:app"));
+    }
+
+    #[test]
     fn with_context_fills_missing_correlation_fields() {
-        let line =
-            format_stage_log(
-                &StageLog::new(LifecycleStage::SchemaSet, StageOutcome::Done, 7)
-                    .with_context(StageLogContext::for_pool(Some("c1:db"), Some("t1"), Some("gaussdb"))),
-            );
+        let ctx = StageLogContext::for_pool(Some("c1:db"), Some("t1"), Some("gaussdb")).with_connection_id("c1");
+        let line = format_stage_log(&StageLog::new(LifecycleStage::SchemaSet, StageOutcome::Done, 7).with_context(ctx));
         assert!(line.contains("connection_id=c1"));
         assert!(line.contains("pool_key=c1:db"));
+        assert!(line.contains("database=db"));
         assert!(line.contains("trace_id=t1"));
         assert!(line.contains("db_type=gaussdb"));
         assert!(!line.contains("db_type=postgres"));

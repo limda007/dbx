@@ -1240,12 +1240,13 @@ pub async fn do_execute(
     let _activity_touch = state.pool_activity_touch(pool_key);
 
     let query_timeout = resolve_query_timeout(options.timeout_secs);
-    let (_duckdb_attached_names, read_only_connection) = {
+    let (_duckdb_attached_names, read_only_connection, connection_id_for_log) = {
         let configs = state.configs.read().await;
         let config = crate::connection::config_for_pool_key(pool_key, &configs);
         let attached = config.map(crate::db::duckdb_sql::config_attached_names).unwrap_or_default();
         let connection = config.filter(|config| config.read_only).map(|config| (config.name.clone(), config.db_type));
-        (attached, connection)
+        let connection_id = config.map(|config| config.id.clone());
+        (attached, connection, connection_id)
     };
     let operation_budget = operation_budget_for_pool_key(state, pool_key, query_timeout).await;
     if let Some((name, database_type)) = read_only_connection {
@@ -1256,11 +1257,18 @@ pub async fn do_execute(
     let db_type_label = connection_lifecycle::optional_database_type_log_label(pool_db_type);
     let execution_id_owned = options.execution_id.clone();
     let client_session_id_owned = options.client_session_id.clone();
+    let database_for_log = database.filter(|db| !db.trim().is_empty()).map(|db| db.to_string());
     let mut execute_log_context = connection_lifecycle::StageLogContext::for_pool(
         Some(pool_key),
         execution_id_owned.as_deref(),
         db_type_label.as_deref(),
     );
+    if let Some(ref connection_id) = connection_id_for_log {
+        execute_log_context = execute_log_context.with_connection_id(connection_id);
+    }
+    if let Some(ref database) = database_for_log {
+        execute_log_context = execute_log_context.with_database(database);
+    }
     if let Some(ref client_session_id) = client_session_id_owned {
         execute_log_context.client_session_id = Some(client_session_id.as_str());
     }
@@ -2233,6 +2241,8 @@ async fn exec_tx_pg_inner(
     db_type: Option<DatabaseType>,
 ) -> Result<db::QueryResult, String> {
     // Checkout stage logs are emitted inside `checkout_postgres_client_logged` (lifecycle facade).
+    // Callers that know the config connection id should prefer an enriched context; here we only
+    // have pool_key so we avoid inventing connection_id by first-colon split.
     let db_type_label = connection_lifecycle::optional_database_type_log_label(db_type);
     let log_context = connection_lifecycle::StageLogContext::for_pool(Some(pool_key), None, db_type_label.as_deref());
     let mut client = db::postgres::checkout_postgres_client_logged(&pool, None, budget.checkout_timeout, log_context)

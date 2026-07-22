@@ -2969,24 +2969,33 @@ where
     }
 }
 
-// Thread-local wall clock for pairing deadpool pre_recycle / post_recycle hooks.
-// Recycle runs inside the same task that called pool.get(), so a thread-local is
-// enough to compute elapsed_ms without confusing concurrent checkouts on other workers.
-thread_local! {
-    static POSTGRES_RECYCLE_STAGE_STARTED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
-}
+// Per-object wall clocks for pairing deadpool pre_recycle / post_recycle hooks.
+// Keyed by the stable address of the pooled `Client` for the duration of one recycle.
+// Thread-local is unsafe: Manager::recycle is async (task may migrate threads) and
+// concurrent recycles on one worker would overwrite a single Cell.
+static POSTGRES_RECYCLE_STAGE_STARTED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Counts successful pre_recycle + post_recycle pairs (each hook increments once).
 /// Used by unit/live tests to prove recycle hooks fire without depending on log sinks.
 static POSTGRES_RECYCLE_HOOK_INVOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+fn postgres_recycle_client_key(client: &tokio_postgres::Client) -> usize {
+    // Address is stable for the single try_recycle that owns this ObjectInner.
+    std::ptr::from_ref(client) as usize
+}
+
 /// deadpool `pre_recycle` hook: emit `pool.recycle:start` only when a pooled connection is reused.
 ///
 /// New connections go through `try_create` and never hit this hook, so logs stay recycle-specific.
 fn postgres_pool_pre_recycle_hook(recycle_timeout: Duration) -> Hook {
-    Hook::sync_fn(move |_client, _metrics| {
+    Hook::sync_fn(move |client, _metrics| {
         POSTGRES_RECYCLE_HOOK_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        POSTGRES_RECYCLE_STAGE_STARTED.with(|cell| cell.set(Some(Instant::now())));
+        let key = postgres_recycle_client_key(client);
+        if let Ok(mut map) = POSTGRES_RECYCLE_STAGE_STARTED.lock() {
+            map.insert(key, Instant::now());
+        }
         connection_lifecycle::log_stage(
             StageLog::new(LifecycleStage::PoolRecycle, StageOutcome::Start, 0)
                 .with_timeout(recycle_timeout)
@@ -2998,10 +3007,13 @@ fn postgres_pool_pre_recycle_hook(recycle_timeout: Duration) -> Hook {
 
 /// deadpool `post_recycle` hook: emit `pool.recycle:done` after Manager::recycle succeeds.
 fn postgres_pool_post_recycle_hook(recycle_timeout: Duration) -> Hook {
-    Hook::sync_fn(move |_client, _metrics| {
+    Hook::sync_fn(move |client, _metrics| {
         POSTGRES_RECYCLE_HOOK_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let key = postgres_recycle_client_key(client);
         let elapsed_ms = POSTGRES_RECYCLE_STAGE_STARTED
-            .with(|cell| cell.take())
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&key))
             .map(|started| started.elapsed().as_millis())
             .unwrap_or(0);
         connection_lifecycle::log_stage(

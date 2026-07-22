@@ -48,7 +48,9 @@ mod tests {
 
     #[test]
     fn result_fetch_stage_logs_keep_timeout_context_and_terminal_outcome() {
-        let context = StageLogContext::for_pool(Some("conn:app"), Some("exec-1"), Some("postgres"));
+        let context = StageLogContext::for_pool(Some("conn:app"), Some("exec-1"), Some("postgres"))
+            .with_connection_id("conn")
+            .with_database("app");
 
         let start = format_stage_log(&result_fetch_stage_log(
             StageOutcome::Start,
@@ -73,10 +75,10 @@ mod tests {
             Some("driver request failed"),
         ));
 
-        assert_eq!(start, "[db:result.fetch:start] elapsed_ms=0 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app db_type=postgres");
-        assert_eq!(done, "[db:result.fetch:done] elapsed_ms=12 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app db_type=postgres");
-        assert_eq!(cancelled, "[db:result.fetch:cancelled] elapsed_ms=13 trace_id=exec-1 connection_id=conn pool_key=conn:app db_type=postgres");
-        assert_eq!(error, "[db:result.fetch:error] elapsed_ms=14 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app db_type=postgres error=driver request failed");
+        assert_eq!(start, "[db:result.fetch:start] elapsed_ms=0 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app database=app db_type=postgres");
+        assert_eq!(done, "[db:result.fetch:done] elapsed_ms=12 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app database=app db_type=postgres");
+        assert_eq!(cancelled, "[db:result.fetch:cancelled] elapsed_ms=13 trace_id=exec-1 connection_id=conn pool_key=conn:app database=app db_type=postgres");
+        assert_eq!(error, "[db:result.fetch:error] elapsed_ms=14 timeout_ms=8000 trace_id=exec-1 connection_id=conn pool_key=conn:app database=app db_type=postgres error=driver request failed");
     }
 
     #[test]
@@ -333,17 +335,27 @@ pub(crate) async fn execute_sql(
                 let kill_pool_key = pool_key.to_string();
                 let kill_trace_id = execution_id.clone();
                 let kill_db_type = db_type_label.clone();
+                let kill_connection_id = execute_log_context.connection_id.map(str::to_string);
+                let kill_database = execute_log_context.database.map(str::to_string);
                 state.running_queries.register_interrupt(execution_id, move || {
                     let kill_opts = kill_opts.clone();
                     let kill_pool_key = kill_pool_key.clone();
                     let kill_trace_id = kill_trace_id.clone();
                     let kill_db_type = kill_db_type.clone();
+                    let kill_connection_id = kill_connection_id.clone();
+                    let kill_database = kill_database.clone();
                     tokio::spawn(async move {
-                        let log_context = connection_lifecycle::StageLogContext::for_pool(
+                        let mut log_context = connection_lifecycle::StageLogContext::for_pool(
                             Some(kill_pool_key.as_str()),
                             Some(kill_trace_id.as_str()),
                             kill_db_type.as_deref(),
                         );
+                        if let Some(ref connection_id) = kill_connection_id {
+                            log_context = log_context.with_connection_id(connection_id);
+                        }
+                        if let Some(ref database) = kill_database {
+                            log_context = log_context.with_database(database);
+                        }
                         if let Err(error) =
                             db::mysql::kill_query_with_opts_logged(kill_opts, connection_id, log_context).await
                         {
@@ -365,16 +377,9 @@ pub(crate) async fn execute_sql(
             let schema = schema.map(|s| s.to_string());
             let max_rows = options.max_rows;
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
-            // Owned label so openGauss/Redshift/etc. are not all logged as "postgres".
-            let db_type_label = connection_lifecycle::optional_database_type_log_label(pool_db_type);
-            let mut log_context = connection_lifecycle::StageLogContext::for_pool(
-                Some(pool_key),
-                options.execution_id.as_deref(),
-                db_type_label.as_deref(),
-            );
-            if let Some(ref client_session_id) = options.client_session_id {
-                log_context.client_session_id = Some(client_session_id.as_str());
-            }
+            // Reuse outer execute_log_context (connection_id / database already set by do_execute).
+            // Do not rebuild from pool_key alone — connection ids may contain colons.
+            let log_context = execute_log_context;
             drop(connections);
             if let Some(schema) = schema {
                 db::postgres::execute_query_with_schema_and_max_rows_and_cancel_logged(

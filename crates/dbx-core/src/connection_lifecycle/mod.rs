@@ -24,6 +24,6 @@ pub use health::{
     probe_postgres_pool_health, PoolHealthProbeResult, HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT,
 };
 pub use stage::{
-    connection_id_from_pool_key, database_type_log_label, format_stage_log, log_stage,
+    connection_id_from_pool_key, database_from_pool_key, database_type_log_label, format_stage_log, log_stage,
     optional_database_type_log_label, LifecycleStage, StageLog, StageLogContext, StageOutcome,
 };

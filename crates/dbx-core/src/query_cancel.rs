@@ -125,6 +125,7 @@ impl RunningQueries {
         let log_context = StageLogContext {
             connection_id: connection_id_ref,
             pool_key: pool_key_ref,
+            database: None,
             db_type: None,
             trace_id: Some(execution_id),
             client_session_id: client_session_id_ref,
