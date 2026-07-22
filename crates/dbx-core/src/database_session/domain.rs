@@ -89,6 +89,14 @@ pub(crate) async fn resolve_postgres_pool(
     })
 }
 
+/// B5: resolve a [`super::PostgresSession`] capability handle (execute + schema browse).
+pub(crate) async fn resolve_postgres_session(
+    state: &AppState,
+    pool_key: &str,
+) -> Result<Option<super::PostgresSession>, String> {
+    Ok(resolve_postgres_pool(state, pool_key).await?.map(super::PostgresSession::new))
+}
+
 /// Clone a MySQL pool + bare-mode flag for stream/export paths.
 pub(crate) async fn resolve_mysql_pool(
     state: &AppState,
@@ -100,6 +108,14 @@ pub(crate) async fn resolve_mysql_pool(
         Some(_) => None,
         None => return Err("Connection not found".to_string()),
     })
+}
+
+/// B5: resolve a [`super::MysqlSession`] capability handle (execute + schema browse).
+pub(crate) async fn resolve_mysql_session(
+    state: &AppState,
+    pool_key: &str,
+) -> Result<Option<super::MysqlSession>, String> {
+    Ok(resolve_mysql_pool(state, pool_key).await?.map(|(pool, bare)| super::MysqlSession::new(pool, bare)))
 }
 
 /// Clone a ClickHouse client for stream/export paths.
@@ -348,5 +364,14 @@ mod tests {
         assert!(src.contains("pub(crate) enum ManualTxnPool"));
         assert!(src.contains("async fn resolve_tx_path"));
         assert!(src.contains("async fn resolve_manual_txn_pool"));
+    }
+
+    #[test]
+    fn b5_session_resolvers_are_exported_from_domain() {
+        let src = include_str!("domain.rs");
+        assert!(src.contains("async fn resolve_postgres_session"));
+        assert!(src.contains("async fn resolve_mysql_session"));
+        assert!(src.contains("PostgresSession::new"));
+        assert!(src.contains("MysqlSession::new"));
     }
 }

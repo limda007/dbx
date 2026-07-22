@@ -8,6 +8,8 @@ use crate::connection::{AppState, MysqlMode, PoolKind};
 use crate::db;
 use crate::models::connection::ConnectionConfig;
 
+use super::traits::SchemaBrowse;
+
 /// Final native-pool dispatch for listing databases.
 ///
 /// Callers must already handle ExternalDriver / Agent / ClickHouse / SqlServer /
@@ -29,8 +31,11 @@ pub(crate) async fn list_databases(
                 .map(|databases| crate::schema::filter_mysql_system_databases_for_config(databases, db_config))
         }
         PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => db::ob_oracle::list_databases(p).await,
-        PoolKind::Mysql(p, _) => db::mysql::list_databases(p).await,
-        PoolKind::Postgres(p) => db::postgres::list_databases(p).await,
+        PoolKind::Mysql(p, _) => {
+            // B5 SchemaBrowse default path (non-Doris / non-OB-Oracle special cases).
+            super::MysqlSession::new(p.clone(), false).list_databases().await
+        }
+        PoolKind::Postgres(p) => super::PostgresSession::new(p.clone()).list_databases().await,
         PoolKind::Sqlite(p) => db::sqlite::list_databases(p).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::list_databases(client).await,
         #[cfg(feature = "duckdb-bundled")]
@@ -63,7 +68,7 @@ pub(crate) async fn list_schemas(
 
     match pool {
         PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => db::ob_oracle::list_schemas(p).await,
-        PoolKind::Postgres(p) => db::postgres::list_schemas(p).await,
+        PoolKind::Postgres(p) => super::PostgresSession::new(p.clone()).list_schemas().await,
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             let duckdb_attached_names = crate::schema::duckdb_attached_database_names(state, connection_id).await;
@@ -114,16 +119,10 @@ pub(crate) async fn list_tables(
                 let tables = db::ob_oracle::list_tables(p, schema).await?;
                 Ok(crate::schema::filter_table_infos(tables, filter, limit, offset, object_types))
             } else {
-                db::mysql::list_tables_filtered(
-                    p,
-                    crate::schema::mysql_table_metadata_catalog(database, schema),
-                    filter,
-                    limit,
-                    offset,
-                    object_types,
-                )
-                .await
-                .map(|tables| crate::schema::filter_table_infos(tables, None, None, None, object_types))
+                // B5 SchemaBrowse default MySQL path.
+                super::MysqlSession::new(p.clone(), *mode == MysqlMode::Bare)
+                    .list_tables(database, schema, filter, limit, offset, object_types)
+                    .await
             }
         }
         PoolKind::Postgres(p) if db_config.is_some_and(crate::schema::is_questdb_config) => {
@@ -132,13 +131,9 @@ pub(crate) async fn list_tables(
                 .map(|tables| crate::schema::filter_table_infos(tables, filter, limit, offset, object_types))
         }
         PoolKind::Postgres(p) => {
-            if object_types.is_some() {
-                db::postgres::list_tables_filtered(p, schema, filter, None, None)
-                    .await
-                    .map(|tables| crate::schema::filter_table_infos(tables, filter, limit, offset, object_types))
-            } else {
-                db::postgres::list_tables_filtered(p, schema, filter, limit, offset).await
-            }
+            super::PostgresSession::new(p.clone())
+                .list_tables(database, schema, filter, limit, offset, object_types)
+                .await
         }
         PoolKind::Sqlite(p) => db::sqlite::list_tables(p, schema)
             .await

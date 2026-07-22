@@ -1,7 +1,7 @@
 # Phase B: Hide `PoolKind` Behind DatabaseSession
 
-**Status:** **Done** (B1–B4 + B2.1 schema tree; B5 traits deferred)  
-**Date:** 2026-07-15 / closed 2026-07-16  
+**Status:** **Done** (B1–B5; optional dyn mega-object still out of scope)  
+**Date:** 2026-07-15 / closed 2026-07-16 / B5 traits 2026-07-22  
 **Branch:** `feat/connection-lifecycle`
 
 **Anchors:**
@@ -190,11 +190,12 @@ plus PG extras (`list_functions` / `sequences` / `rules` / `extensions` / `owner
 
 ---
 
-### PR-B5 — Domain capability handles (landed 2026-07-21)
+### PR-B5 — Domain capability handles + PG/MySQL traits
 
-**Intent:** Hide `PoolKind` from domain ops without forcing `async_trait` dyn objects.
+**Intent:** Hide `PoolKind` from domain ops; add optional capability traits for the
+two first-class SQL families without a dyn mega-object for every driver.
 
-**Approach (capability enums, not traits):**
+**Part A — Domain capability handles (landed 2026-07-21):**
 
 - `database_session/domain.rs`:
   - `MongoHandle` / `DocumentHandle` — Clone capability enums
@@ -206,9 +207,21 @@ plus PG extras (`list_functions` / `sequences` / `rules` / `extensions` / `owner
 - `redis_ops` uses `with_redis!` only
 - `query_result_export` typed streams use resolve helpers (no `PoolKind` at call site)
 
-**Decision note:** Full `SqlExecute` / `SchemaBrowse` traits remain optional. Domain
-handles give the same deletion-test property (product files do not name `PoolKind`)
-with less indirection than dyn traits.
+**Part B — `SqlExecute` / `SchemaBrowse` / `SqlSession` (landed 2026-07-22):**
+
+- `database_session/traits.rs`:
+  - `SqlExecute::execute_with_max_rows`
+  - `SchemaBrowse::{list_databases,list_schemas,list_tables}`
+  - `SqlSession` marker = execute + browse
+  - `PostgresSession` / `MysqlSession` implement both
+- `resolve_postgres_session` / `resolve_mysql_session` on domain
+- Transfer `execute_transfer_sql` PG/MySQL arms call `SqlExecute`
+- Schema `list_databases` / `list_schemas` / `list_tables` default PG/MySQL arms call
+  `SchemaBrowse` (Doris / StarRocks / QuestDB / OceanBase Oracle stay special-cased)
+
+**Decision note:** Other drivers remain free-function `PoolKind` arms inside
+`database_session`. No `Box<dyn SqlSession>` registry — static dispatch via
+concrete session types is enough for extension and tests.
 
 ## Compatibility rules
 
@@ -245,7 +258,8 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
   product paths use session resolves
 - full default-features / duckdb-bundled rebuild when resources allow
 - `driver_runtime` still walks the registry (runtime inventory UI; intentional)
-- optional B5 traits (`SqlExecute` / `SchemaBrowse`) remain deferred
+- B5 traits cover Postgres + MySQL first; other drivers stay free-function arms
+- full `Box<dyn SqlSession>` registry / agent schema traits remain out of scope
 
 ## Immediate next step
 

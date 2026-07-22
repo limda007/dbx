@@ -16,6 +16,8 @@ use crate::query::{agent_execute_query_params, QueryExecutionOptions};
 #[cfg(feature = "duckdb-bundled")]
 use crate::sql::starts_with_executable_sql_keyword;
 
+use super::traits::SqlExecute;
+
 fn database_from_pool_key(pool_key: &str) -> Option<&str> {
     pool_key
         .split_once(":session:")
@@ -35,20 +37,21 @@ pub(crate) async fn execute_transfer_sql(
     sql: &str,
     max_rows: Option<usize>,
 ) -> Result<db::QueryResult, String> {
+    // B5 first-class families: resolve capability handles, then SqlExecute.
+    if let Some(session) = super::resolve_mysql_session(state, pool_key).await? {
+        return session.execute_with_max_rows(sql, max_rows).await;
+    }
+    if let Some(session) = super::resolve_postgres_session(state, pool_key).await? {
+        return session.execute_with_max_rows(sql, max_rows).await;
+    }
+
     let connections = state.connections.read().await;
     let pool = connections.get(pool_key).ok_or("Connection not found")?;
 
     match pool {
-        PoolKind::Mysql(p, mode) => {
-            let p = p.clone();
-            let bare = *mode == MysqlMode::Bare;
-            drop(connections);
-            db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows, Default::default()).await
-        }
-        PoolKind::Postgres(p) => {
-            let p = p.clone();
-            drop(connections);
-            db::postgres::execute_query_with_max_rows(&p, sql, max_rows).await
+        // Mysql / Postgres handled above via SqlSession resolvers.
+        PoolKind::Mysql(..) | PoolKind::Postgres(_) => {
+            unreachable!("MySQL/Postgres transfer SQL should resolve via SqlSession")
         }
         PoolKind::Sqlite(p) => {
             let p = p.clone();
