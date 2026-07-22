@@ -244,6 +244,8 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 - `query.rs` / other tests may still seed or assert `PoolKind` (DuckDb drain fixtures);
   product paths use session resolves
 - full default-features / duckdb-bundled rebuild when resources allow
+- `driver_runtime` still walks the registry (runtime inventory UI; intentional)
+- optional B5 traits (`SqlExecute` / `SchemaBrowse`) remain deferred
 
 ## Immediate next step
 
@@ -266,3 +268,11 @@ Schema residual collapse landed 2026-07-21:
 - Removed `extract_pool!` / `try_sqlserver!` from product `schema.rs`
 - Added `resolve_influxdb_client` + duckdb-bundled `resolve_duckdb_*` / `resolve_external_tabular`
 - Deleted uncompiled orphan tree `schema/{providers,duckdb_metadata,normalization}`
+
+Transfer / export / agent residual peeks landed 2026-07-22:
+
+- `transfer` PG index/FK/sequence helpers → `resolve_postgres_pool`
+- `table_export` agent table-read → `is_agent_pool` / `resolve_agent_client`
+- `database_export` PG extension/sequence + concurrent prefetch gate → session helpers
+- `agent_explain` / `agent_kv` / `sql_file_import` MySQL → `resolve_agent_client` / `resolve_mysql_pool`
+- Log polish: sql-file cancel interrupt carries `database=`

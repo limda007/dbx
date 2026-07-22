@@ -112,11 +112,14 @@ mod tests {
             StageOutcome::Cancelled,
             1,
             None,
-            StageLogContext::for_pool(Some("c:db"), Some("t1"), Some("agent")),
+            StageLogContext::for_pool(Some("c:db"), Some("t1"), Some("agent"))
+                .with_connection_id("c")
+                .with_database("db"),
             None,
         ));
         assert!(!cancelled.contains("timeout_ms="));
         assert!(cancelled.starts_with("[db:result.fetch:cancelled]"));
+        assert!(cancelled.contains("database=db"));
     }
 }
 

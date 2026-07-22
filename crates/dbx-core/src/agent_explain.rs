@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::connection::{AppState, PoolKind};
+use crate::connection::AppState;
 use crate::query_execution_sql::{is_safe_dameng_autotrace_sql, is_safe_explain_sql};
 
 pub async fn get_agent_explain_info_core(
@@ -22,16 +22,11 @@ pub async fn get_agent_explain_info_core(
     }
 
     let database_for_pool = database.filter(|value| !value.trim().is_empty());
-    state.get_or_create_pool(connection_id, database_for_pool).await?;
+    let pool_key = state.get_or_create_pool(connection_id, database_for_pool).await?;
 
-    let client = {
-        let connections = state.connections.read().await;
-        let pool = connections.get(connection_id).ok_or_else(|| "Connection not found".to_string())?;
-        match pool {
-            PoolKind::Agent(client) => client.clone(),
-            _ => return Err("Connection is not an agent-based connection".to_string()),
-        }
-    };
+    let client = crate::database_session::resolve_agent_client(state, &pool_key)
+        .await?
+        .ok_or_else(|| "Connection is not an agent-based connection".to_string())?;
 
     let timeout_secs = {
         let configs = state.configs.read().await;

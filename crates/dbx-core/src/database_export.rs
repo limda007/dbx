@@ -956,12 +956,8 @@ async fn list_postgres_extension_members(
     pool_key: &str,
     schema: &str,
 ) -> Result<PostgresExtensionMembers, String> {
-    let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(pool_key) {
-            Some(crate::connection::PoolKind::Postgres(pool)) => pool.clone(),
-            _ => return Ok(PostgresExtensionMembers::default()),
-        }
+    let Some(pool) = crate::database_session::resolve_postgres_pool(state, pool_key).await? else {
+        return Ok(PostgresExtensionMembers::default());
     };
     let mut members = PostgresExtensionMembers::default();
     for (kind, name, signature) in crate::db::postgres::list_extension_member_objects(&pool, schema).await? {
@@ -987,12 +983,8 @@ async fn list_postgres_export_sequences(
     include_objects: bool,
     fail_on_error: bool,
 ) -> Result<Vec<PostgresExportSequence>, String> {
-    let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(pool_key) {
-            Some(crate::connection::PoolKind::Postgres(pool)) => pool.clone(),
-            _ => return Ok(Vec::new()),
-        }
+    let Some(pool) = crate::database_session::resolve_postgres_pool(state, pool_key).await? else {
+        return Ok(Vec::new());
     };
     let client = crate::db::postgres::checkout_postgres_client(&pool, None, crate::db::connection_timeout()).await?;
     let rows = client
@@ -1155,13 +1147,11 @@ pub async fn begin_database_backup_snapshot_core(
 /// 只有确认底层支持并发请求的多连接池才允许并发预取导出元数据。
 /// SqlServer（Arc<Mutex> 串行客户端）、Agent/ExternalDriver（插件请求超时覆盖
 /// 排队时间且超时会终止 sidecar）、SQLite/DuckDB 等单连接类型都必须回退串行。
-fn concurrent_metadata_prefetch_allowed(pool_kind: Option<&crate::connection::PoolKind>) -> bool {
-    matches!(
-        pool_kind,
-        Some(crate::connection::PoolKind::Postgres(_))
-            | Some(crate::connection::PoolKind::Mysql(..))
-            | Some(crate::connection::PoolKind::ClickHouse(_))
-    )
+///
+/// Dispatch lives in [`database_session::concurrent_metadata_prefetch_allowed`] so
+/// callers never match `PoolKind`.
+async fn concurrent_metadata_prefetch_allowed(state: &crate::connection::AppState, pool_key: &str) -> bool {
+    crate::database_session::concurrent_metadata_prefetch_allowed(state, pool_key).await
 }
 
 fn record_export_error(file: &mut std::fs::File, fail_on_error: bool, message: String) -> Result<(), String> {
@@ -1435,9 +1425,7 @@ pub async fn export_database_sql_core(
     // 写出循环内的 None 回退路径即原有的逐表串行直查行为。
     let concurrent_prefetch_is_safe =
         match state.get_or_create_pool(&request.connection_id, Some(&request.database)).await {
-            Ok(metadata_pool_key) => {
-                concurrent_metadata_prefetch_allowed(state.connections.read().await.get(&metadata_pool_key))
-            }
+            Ok(metadata_pool_key) => concurrent_metadata_prefetch_allowed(state, &metadata_pool_key).await,
             // 建池失败时不预取，让写出循环的直查路径按原有方式报告错误
             Err(_) => false,
         };
@@ -1993,7 +1981,6 @@ fn build_database_export_object_source_sql(
 
 #[cfg(test)]
 mod tests {
-    use super::concurrent_metadata_prefetch_allowed;
     use super::{
         build_database_export_object_source_sql, build_database_sql_export, build_export_insert_statements,
         drop_table_if_exists_sql, filter_export_table_infos, format_export_sql_literal, format_export_table_ddl,
@@ -2055,6 +2042,7 @@ mod tests {
     #[test]
     fn concurrent_prefetch_only_allowed_for_multi_connection_pools() {
         use crate::connection::PoolKind;
+        use crate::database_session::concurrent_metadata_prefetch_allowed_for_kind;
         use std::sync::Arc;
 
         // ChClient::new 只构造 HTTP 客户端，不发起连接
@@ -2064,14 +2052,14 @@ mod tests {
             None,
             std::time::Duration::from_secs(1),
         ));
-        assert!(concurrent_metadata_prefetch_allowed(Some(&clickhouse)));
+        assert!(concurrent_metadata_prefetch_allowed_for_kind(Some(&clickhouse)));
 
         // Agent（JDBC sidecar）请求超时覆盖排队时间，必须回退串行
         let agent =
             PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(crate::db::agent_driver::AgentDriverClient::test_stub())));
-        assert!(!concurrent_metadata_prefetch_allowed(Some(&agent)));
+        assert!(!concurrent_metadata_prefetch_allowed_for_kind(Some(&agent)));
 
-        assert!(!concurrent_metadata_prefetch_allowed(None));
+        assert!(!concurrent_metadata_prefetch_allowed_for_kind(None));
     }
 
     #[test]

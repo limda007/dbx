@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{AppState, PoolKind};
+use crate::connection::AppState;
 use crate::db;
 use crate::models::connection::DatabaseType;
 use crate::query::{
@@ -149,13 +149,10 @@ impl MySqlSqlFileExecutor {
         let database = request.database.trim();
         let database = (!database.is_empty()).then_some(database);
         let pool_key = state.get_or_create_pool_for_session(&request.connection_id, database, None).await?;
-        let (db_type, driver_profile, bare) = {
-            let connections = state.connections.read().await;
-            let Some(PoolKind::Mysql(_, mode)) = connections.get(&pool_key) else {
-                return Ok(None);
-            };
-            (Some(target.db_type), target.driver_profile.as_deref(), *mode == crate::connection::MysqlMode::Bare)
+        let Some((_pool, bare)) = crate::database_session::resolve_mysql_pool(state, &pool_key).await? else {
+            return Ok(None);
         };
+        let (db_type, driver_profile) = (Some(target.db_type), target.driver_profile.as_deref());
         let budget = {
             let configs = state.configs.read().await;
             let config = configs.get(&request.connection_id).ok_or("Connection config not found")?;
@@ -231,19 +228,24 @@ impl MySqlSqlFileExecutor {
             let kill_db_type = crate::connection_lifecycle::optional_database_type_log_label(self.db_type)
                 .unwrap_or_else(|| "mysql".to_string());
             let kill_config_connection_id = self.connection_id.clone();
+            let kill_database = self.database.clone();
             state.running_queries.register_interrupt(execution_id, move || {
                 let kill_opts = kill_opts.clone();
                 let kill_pool_key = kill_pool_key.clone();
                 let kill_trace_id = kill_trace_id.clone();
                 let kill_db_type = kill_db_type.clone();
                 let kill_config_connection_id = kill_config_connection_id.clone();
+                let kill_database = kill_database.clone();
                 tokio::spawn(async move {
-                    let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+                    let mut log_context = crate::connection_lifecycle::StageLogContext::for_pool(
                         Some(kill_pool_key.as_str()),
                         Some(kill_trace_id.as_str()),
                         Some(kill_db_type.as_str()),
                     )
                     .with_connection_id(kill_config_connection_id.as_str());
+                    if !kill_database.is_empty() {
+                        log_context = log_context.with_database(kill_database.as_str());
+                    }
                     if let Err(error) =
                         db::mysql::kill_query_with_opts_logged(kill_opts, connection_id, log_context).await
                     {
@@ -308,14 +310,10 @@ impl MySqlSqlFileExecutor {
         let database = self.database.trim();
         let database = (!database.is_empty()).then_some(database);
         self.pool_key = state.get_or_create_pool_for_session(&self.connection_id, database, None).await?;
-        let pool = {
-            let connections = state.connections.read().await;
-            match connections.get(&self.pool_key) {
-                Some(PoolKind::Mysql(pool, _)) => pool.clone(),
-                Some(_) => return Err("SQL file import expected a MySQL-compatible pooled connection".to_string()),
-                None => return Err("Connection not found".to_string()),
-            }
-        };
+        let pool = crate::database_session::resolve_mysql_pool(state, &self.pool_key)
+            .await?
+            .map(|(pool, _)| pool)
+            .ok_or_else(|| "SQL file import expected a MySQL-compatible pooled connection".to_string())?;
 
         self.conn = Some(
             db::mysql::get_conn_with_health_check_with_cancel(

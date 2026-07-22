@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{config_for_pool_key, task_client_session_id, AppState, PoolKind};
+use crate::connection::{config_for_pool_key, task_client_session_id, AppState};
 use crate::csv_export::{format_csv, format_tsv, format_tsv_rows, push_csv_text_value};
 pub use crate::database_export::ExportStatus;
 use crate::database_export::{
@@ -258,8 +258,7 @@ fn is_agent_table_read_unsupported(error: &str) -> bool {
 }
 
 async fn pool_is_agent(state: &AppState, pool_key: &str) -> bool {
-    let connections = state.connections.read().await;
-    matches!(connections.get(pool_key), Some(PoolKind::Agent(_)))
+    crate::database_session::is_agent_pool(state, pool_key).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -314,9 +313,7 @@ async fn fetch_table_export_batch(
             fetch_size: Some(active_batch_size),
             timeout_secs,
         };
-        let connections = state.connections.read().await;
-        let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {
-            drop(connections);
+        let Some(client) = crate::database_session::resolve_agent_client(state, pool_key).await? else {
             return fetch_paginated_table_export_batch(
                 state,
                 pool_key,
@@ -331,8 +328,6 @@ async fn fetch_table_export_batch(
             )
             .await;
         };
-        let client = client.clone();
-        drop(connections);
         let mut client = client.lock().await;
         match client.start_table_read::<QueryResult>(params).await {
             Ok(result) => {
@@ -350,12 +345,9 @@ async fn fetch_table_export_batch(
     }
 
     if let Some(session_id) = table_read_session_id.as_deref() {
-        let connections = state.connections.read().await;
-        let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {
+        let Some(client) = crate::database_session::resolve_agent_client(state, pool_key).await? else {
             return Err("Table read session requires an agent connection".to_string());
         };
-        let client = client.clone();
-        drop(connections);
         let mut client = client.lock().await;
         return match client.fetch_table_read_page::<QueryResult>(session_id, active_batch_size).await {
             Ok(result) => {
@@ -423,12 +415,9 @@ async fn close_table_read_session_if_open(
     let Some(session_id) = table_read_session_id.take() else {
         return;
     };
-    let connections = state.connections.read().await;
-    let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {
+    let Ok(Some(client)) = crate::database_session::resolve_agent_client(state, pool_key).await else {
         return;
     };
-    let client = client.clone();
-    drop(connections);
     let mut client = client.lock().await;
     let _ = client.close_table_read_session::<bool>(&session_id).await;
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 
-use crate::connection::{config_for_pool_key, AppState, PoolKind};
+use crate::connection::{config_for_pool_key, AppState};
 use crate::db;
 use crate::db::mongo_driver::MongoDocumentResult;
 use crate::models::connection::DatabaseType;
@@ -2763,12 +2763,9 @@ async fn get_postgres_indexes_for_transfer(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::IndexInfo>, String> {
-    let connections = state.connections.read().await;
-    let Some(PoolKind::Postgres(pool)) = connections.get(pool_key) else {
-        return Err("PostgreSQL pool not found".to_string());
-    };
-    let pool = pool.clone();
-    drop(connections);
+    let pool = crate::database_session::resolve_postgres_pool(state, pool_key)
+        .await?
+        .ok_or_else(|| "PostgreSQL pool not found".to_string())?;
     db::postgres::list_indexes(&pool, schema, table).await
 }
 
@@ -2778,12 +2775,9 @@ async fn get_postgres_foreign_keys_for_transfer(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::ForeignKeyInfo>, String> {
-    let connections = state.connections.read().await;
-    let Some(PoolKind::Postgres(pool)) = connections.get(pool_key) else {
-        return Err("PostgreSQL pool not found".to_string());
-    };
-    let pool = pool.clone();
-    drop(connections);
+    let pool = crate::database_session::resolve_postgres_pool(state, pool_key)
+        .await?
+        .ok_or_else(|| "PostgreSQL pool not found".to_string())?;
     db::postgres::list_foreign_keys(&pool, schema, table).await
 }
 
@@ -2797,12 +2791,8 @@ async fn get_postgres_owned_sequences_for_transfer(
         return Ok(Vec::new());
     }
 
-    let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(pool_key) {
-            Some(PoolKind::Postgres(pool)) => pool.clone(),
-            _ => return Ok(Vec::new()),
-        }
+    let Some(pool) = crate::database_session::resolve_postgres_pool(state, pool_key).await? else {
+        return Ok(Vec::new());
     };
     let client = crate::db::postgres::checkout_postgres_client(&pool, None, crate::db::connection_timeout()).await?;
     let rows = client
@@ -2849,12 +2839,8 @@ async fn get_postgres_sequence_snapshots_for_transfer(
     pool_key: &str,
     schema: &str,
 ) -> Result<Vec<PostgresSequenceSnapshot>, String> {
-    let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(pool_key) {
-            Some(PoolKind::Postgres(pool)) => pool.clone(),
-            _ => return Ok(Vec::new()),
-        }
+    let Some(pool) = crate::database_session::resolve_postgres_pool(state, pool_key).await? else {
+        return Ok(Vec::new());
     };
     let client = crate::db::postgres::checkout_postgres_client(&pool, None, crate::db::connection_timeout()).await?;
     let rows = client

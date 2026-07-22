@@ -10,6 +10,7 @@ mod schema;
 mod transfer;
 
 pub(crate) use domain::{
+    concurrent_metadata_prefetch_allowed, concurrent_metadata_prefetch_allowed_for_kind, is_agent_pool,
     is_sqlserver_pool, resolve_agent_client, resolve_clickhouse_client, resolve_document_handle,
     resolve_external_driver, resolve_influxdb_client, resolve_manual_txn_pool, resolve_mongo_handle,
     resolve_mysql_pool, resolve_postgres_pool, resolve_sqlserver_client, resolve_tx_path, resolve_vector_client,

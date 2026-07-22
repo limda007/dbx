@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::connection::{AppState, PoolKind};
+use crate::connection::AppState;
 use crate::db::agent_driver::{AgentCapability, AgentKvMethod};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,18 +250,14 @@ async fn call_agent_kv<T: serde::de::DeserializeOwned + Send + 'static>(
 ) -> Result<T, String> {
     ensure_agent_kv_pool(state, connection_id).await?;
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(connection_id).ok_or("Connection not found")?;
-    match pool {
-        PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
-            if !client.supports_capability(AgentCapability::Kv) {
-                return Err("Agent does not support key-value operations".to_string());
-            }
-            client.call_kv_method(method, params).await
-        }
-        _ => Err("Not an agent key-value connection".to_string()),
+    let Some(client) = crate::database_session::resolve_agent_client(state, connection_id).await? else {
+        return Err("Not an agent key-value connection".to_string());
+    };
+    let mut client = client.lock().await;
+    if !client.supports_capability(AgentCapability::Kv) {
+        return Err("Agent does not support key-value operations".to_string());
     }
+    client.call_kv_method(method, params).await
 }
 
 #[cfg(test)]

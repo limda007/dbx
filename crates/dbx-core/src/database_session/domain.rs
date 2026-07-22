@@ -228,6 +228,26 @@ pub(crate) async fn resolve_agent_client(
     })
 }
 
+/// Whether the registry entry for `pool_key` is a legacy agent client (no clone).
+pub(crate) async fn is_agent_pool(state: &AppState, pool_key: &str) -> bool {
+    let connections = state.connections.read().await;
+    matches!(connections.get(pool_key), Some(PoolKind::Agent(_)))
+}
+
+/// Whether concurrent export-metadata prefetch is safe for this live pool kind.
+///
+/// Multi-connection pools only (Postgres / MySQL / ClickHouse). Serial clients
+/// (SQL Server mutex, Agent, SQLite, DuckDB, …) must stay sequential.
+pub(crate) fn concurrent_metadata_prefetch_allowed_for_kind(pool: Option<&PoolKind>) -> bool {
+    matches!(pool, Some(PoolKind::Postgres(_)) | Some(PoolKind::Mysql(..)) | Some(PoolKind::ClickHouse(_)))
+}
+
+/// Registry lookup wrapper for [`concurrent_metadata_prefetch_allowed_for_kind`].
+pub(crate) async fn concurrent_metadata_prefetch_allowed(state: &AppState, pool_key: &str) -> bool {
+    let connections = state.connections.read().await;
+    concurrent_metadata_prefetch_allowed_for_kind(connections.get(pool_key))
+}
+
 /// Whether the registry entry for `pool_key` is a SQL Server client (no clone).
 pub(crate) async fn is_sqlserver_pool(state: &AppState, pool_key: &str) -> bool {
     let connections = state.connections.read().await;
