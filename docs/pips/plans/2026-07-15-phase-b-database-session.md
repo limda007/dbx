@@ -241,10 +241,9 @@ CARGO_BUILD_JOBS=1 cargo test -p dbx-core --lib -j 1 -- --test-threads=1
 
 ## Residual (out of Phase B)
 
-- `schema.rs` still uses `extract_pool!` / `try_sqlserver!` for ClickHouse / Influx / DuckDb /
-  SqlServer / Agent peeks that need lock-held early returns (not always Clone-friendly)
-- `query.rs` tests still seed / assert `PoolKind` (DuckDb drain fixtures); product paths use session resolves
-- orphan uncompiled `schema/providers/native.rs` (cleanup later)
+- `query.rs` / other tests may still seed or assert `PoolKind` (DuckDb drain fixtures);
+  product paths use session resolves
+- full default-features / duckdb-bundled rebuild when resources allow
 
 ## Immediate next step
 
@@ -262,4 +261,8 @@ Query residual (product peeks) landed 2026-07-21:
 - close_query_session / drop-database / multi MySQL+SQL Server / agent batch+explicit txn /
   TxPath / manual txn → `resolve_*` + `TxPath` / `ManualTxnPool` in `database_session/domain`
 
-Next: optional further `extract_pool!` collapse.
+Schema residual collapse landed 2026-07-21:
+
+- Removed `extract_pool!` / `try_sqlserver!` from product `schema.rs`
+- Added `resolve_influxdb_client` + duckdb-bundled `resolve_duckdb_*` / `resolve_external_tabular`
+- Deleted uncompiled orphan tree `schema/{providers,duckdb_metadata,normalization}`

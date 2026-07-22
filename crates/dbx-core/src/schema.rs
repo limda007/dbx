@@ -1,4 +1,4 @@
-use crate::connection::{connection_url_for_endpoint, database_connection_config, AppState, PoolKind};
+use crate::connection::{connection_url_for_endpoint, database_connection_config, AppState};
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query::{agent_execute_query_params, QueryExecutionOptions};
@@ -6,25 +6,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-macro_rules! extract_pool {
-    ($connections:expr, $key:expr, $variant:ident) => {
-        $connections.get($key).and_then(|v| match v {
-            PoolKind::$variant(val) => Some(val.clone()),
-            _ => None,
-        })
-    };
-}
-
-macro_rules! try_sqlserver {
-    ($connections:expr, $pool_key:expr, $method:ident $(, $arg:expr)*) => {
-        if let Some(client) = extract_pool!(&$connections, $pool_key, SqlServer) {
-            drop($connections);
-            let mut client = client.lock().await;
-            return db::sqlserver::$method(&mut client $(, $arg)*).await;
-        }
-    };
-}
 
 const ORACLE_TABLE_COMMENT_BATCH_SIZE: usize = 500;
 
@@ -647,13 +628,11 @@ pub async fn list_sqlserver_linked_servers_core(
     state: &AppState,
     connection_id: &str,
 ) -> Result<Vec<db::LinkedServerInfo>, String> {
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
-        let mut client = client.lock().await;
-        return db::sqlserver::list_linked_servers(&mut client).await;
-    }
-    Ok(vec![])
+    let Some(client) = crate::database_session::resolve_sqlserver_client(state, connection_id).await? else {
+        return Ok(vec![]);
+    };
+    let mut client = client.lock().await;
+    db::sqlserver::list_linked_servers(&mut client).await
 }
 
 pub async fn list_sqlserver_linked_server_catalogs_core(
@@ -661,13 +640,11 @@ pub async fn list_sqlserver_linked_server_catalogs_core(
     connection_id: &str,
     server: &str,
 ) -> Result<Vec<db::DatabaseInfo>, String> {
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
-        let mut client = client.lock().await;
-        return db::sqlserver::list_linked_server_catalogs(&mut client, server).await;
-    }
-    Ok(vec![])
+    let Some(client) = crate::database_session::resolve_sqlserver_client(state, connection_id).await? else {
+        return Ok(vec![]);
+    };
+    let mut client = client.lock().await;
+    db::sqlserver::list_linked_server_catalogs(&mut client, server).await
 }
 
 pub async fn list_sqlserver_linked_server_schemas_core(
@@ -676,13 +653,11 @@ pub async fn list_sqlserver_linked_server_schemas_core(
     server: &str,
     catalog: &str,
 ) -> Result<Vec<String>, String> {
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
-        let mut client = client.lock().await;
-        return db::sqlserver::list_linked_server_schemas(&mut client, server, catalog).await;
-    }
-    Ok(vec![])
+    let Some(client) = crate::database_session::resolve_sqlserver_client(state, connection_id).await? else {
+        return Ok(vec![]);
+    };
+    let mut client = client.lock().await;
+    db::sqlserver::list_linked_server_schemas(&mut client, server, catalog).await
 }
 
 pub async fn list_sqlserver_linked_server_tables_core(
@@ -695,14 +670,11 @@ pub async fn list_sqlserver_linked_server_tables_core(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<db::TableInfo>, String> {
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
-        let mut client = client.lock().await;
-        return db::sqlserver::list_linked_server_tables(&mut client, server, catalog, schema, filter, limit, offset)
-            .await;
-    }
-    Ok(vec![])
+    let Some(client) = crate::database_session::resolve_sqlserver_client(state, connection_id).await? else {
+        return Ok(vec![]);
+    };
+    let mut client = client.lock().await;
+    db::sqlserver::list_linked_server_tables(&mut client, server, catalog, schema, filter, limit, offset).await
 }
 
 // ---------------------------------------------------------------------------
@@ -907,21 +879,19 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         let mut client = client.lock().await;
         return client.list_databases(agent_metadata_timeout(db_config.as_ref())).await;
     }
-    {
-        let connections = state.connections.read().await;
-        #[cfg(feature = "duckdb-bundled")]
-        if extract_pool!(&connections, connection_id, ExternalTabular).is_some() {
-            return Ok(vec![db::DatabaseInfo { name: "main".to_string() }]);
-        }
-        if let Some(client) = extract_pool!(&connections, connection_id, ClickHouse) {
-            drop(connections);
-            return db::clickhouse_driver::list_databases(&client).await;
-        }
-        if let Some(client) = extract_pool!(&connections, connection_id, InfluxDb) {
-            drop(connections);
-            return db::influxdb_driver::list_databases(&client).await;
-        }
-        try_sqlserver!(connections, connection_id, list_databases);
+    #[cfg(feature = "duckdb-bundled")]
+    if crate::database_session::resolve_external_tabular(state, connection_id).await?.is_some() {
+        return Ok(vec![db::DatabaseInfo { name: "main".to_string() }]);
+    }
+    if let Some(client) = crate::database_session::resolve_clickhouse_client(state, connection_id).await? {
+        return db::clickhouse_driver::list_databases(&client).await;
+    }
+    if let Some(client) = crate::database_session::resolve_influxdb_client(state, connection_id).await? {
+        return db::influxdb_driver::list_databases(&client).await;
+    }
+    if let Some(client) = crate::database_session::resolve_sqlserver_client(state, connection_id).await? {
+        let mut client = client.lock().await;
+        return db::sqlserver::list_databases(&mut client).await;
     }
 
     #[cfg(feature = "duckdb-bundled")]
@@ -1090,9 +1060,11 @@ async fn list_schemas_once(
             }
         }
     }
-    {
-        let connections = state.connections.read().await;
-        try_sqlserver!(connections, &pool_key, list_schemas);
+    if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+        let mut client = client.lock().await;
+        return db::sqlserver::list_schemas(&mut client)
+            .await
+            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()));
     }
 
     crate::database_session::list_schemas(state, &pool_key, database, connection_id)
@@ -1180,30 +1152,30 @@ pub async fn get_table_comment_core(
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
         let db_config = connection_config(state, connection_id).await;
 
-        {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, get_table_comment, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                if db_config.as_ref().is_some_and(|config| {
-                    matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
-                }) {
-                    let sql = oracle_table_comment_sql(schema, table);
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    drop(connections);
-                    let mut client = client.lock().await;
-                    let result = client
-                        .execute_query_with_timeout::<db::QueryResult>(
-                            agent_execute_query_params(
-                                &sql,
-                                Some(database),
-                                Some(schema),
-                                QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
-                            ),
-                            timeout,
-                        )
-                        .await?;
-                    return oracle_table_comment_from_query_result(result);
-                }
+        if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return db::sqlserver::get_table_comment(&mut client, schema, table).await;
+        }
+        if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+            if db_config
+                .as_ref()
+                .is_some_and(|config| matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+            {
+                let sql = oracle_table_comment_sql(schema, table);
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                let result = client
+                    .execute_query_with_timeout::<db::QueryResult>(
+                        agent_execute_query_params(
+                            &sql,
+                            Some(database),
+                            Some(schema),
+                            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                        ),
+                        timeout,
+                    )
+                    .await?;
+                return oracle_table_comment_from_query_result(result);
             }
         }
 
@@ -1728,178 +1700,159 @@ async fn list_tables_once(
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
     }
 
-    {
-        let connections = state.connections.read().await;
-        #[cfg(feature = "duckdb-bundled")]
-        if let Some(ext_pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
-            drop(connections);
-            let cache = ext_pool.cache.clone();
-            return tokio::task::spawn_blocking(move || {
-                let con = cache.lock().map_err(|e| e.to_string())?;
-                duckdb_query_tables(&con)
-            })
+    #[cfg(feature = "duckdb-bundled")]
+    if let Some(ext_pool) = crate::database_session::resolve_external_tabular(state, &pool_key).await? {
+        let cache = ext_pool.cache.clone();
+        return tokio::task::spawn_blocking(move || {
+            let con = cache.lock().map_err(|e| e.to_string())?;
+            duckdb_query_tables(&con)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+    }
+    #[cfg(feature = "duckdb-bundled")]
+    if let Some(con) = crate::database_session::resolve_duckdb_handle(state, &pool_key).await? {
+        let con = con.lock().map_err(|e| e.to_string())?;
+        return duckdb_query_tables_in_database_with_attached(&con, database, schema, &duckdb_attached_names)
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+    }
+    #[cfg(feature = "duckdb-bundled")]
+    if let Some(client) = crate::database_session::resolve_duckdb_worker(state, &pool_key).await? {
+        return client
+            .list_tables(database.to_string(), schema.to_string())
             .await
-            .map_err(|e| e.to_string())?
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+    }
+    if let Some(client) = crate::database_session::resolve_clickhouse_client(state, &pool_key).await? {
+        return db::clickhouse_driver::list_tables(&client, clickhouse_metadata_database(database, schema))
+            .await
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+    }
+    if let Some(client) = crate::database_session::resolve_influxdb_client(state, &pool_key).await? {
+        return db::influxdb_driver::list_tables(&client, database)
+            .await
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+    }
+    if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
+        if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return db::sqlserver::list_linked_server_tables(
+                &mut client,
+                &linked.server,
+                &linked.catalog,
+                &linked.schema,
+                filter,
+                None,
+                None,
+            )
+            .await
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
         }
-        #[cfg(feature = "duckdb-bundled")]
-        if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {
-            drop(connections);
-            let con = con.lock().map_err(|e| e.to_string())?;
-            return duckdb_query_tables_in_database_with_attached(&con, database, schema, &duckdb_attached_names)
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
-        }
-        #[cfg(feature = "duckdb-bundled")]
-        if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
-            let database = database.to_string();
-            let schema = schema.to_string();
-            drop(connections);
-            return client
-                .list_tables(database, schema)
-                .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
-            drop(connections);
-            return db::clickhouse_driver::list_tables(&client, clickhouse_metadata_database(database, schema))
-                .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, InfluxDb) {
-            drop(connections);
-            return db::influxdb_driver::list_tables(&client, database)
-                .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
-        }
-        if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
-            if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-                drop(connections);
-                let mut client = client.lock().await;
-                return db::sqlserver::list_linked_server_tables(
-                    &mut client,
-                    &linked.server,
-                    &linked.catalog,
-                    &linked.schema,
-                    filter,
-                    None,
-                    None,
-                )
-                .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
-            }
-        }
-        if object_types.is_some() {
-            if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-                drop(connections);
-                let mut client = client.lock().await;
-                return db::sqlserver::list_tables(&mut client, schema, filter, None, None)
-                    .await
-                    .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
-            }
-        }
-        try_sqlserver!(connections, &pool_key, list_tables, schema, filter, limit, offset);
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
-            let use_agent_table_paging = db_config.as_ref().is_some_and(supports_agent_table_paging);
-            let filter_locally_after_oracle_comments =
-                is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
-            let timeout_duration = agent_metadata_timeout(db_config.as_ref());
-            let fallback_config = db_config.clone();
-            drop(connections);
+    }
+    if object_types.is_some() {
+        if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
             let mut client = client.lock().await;
-            let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
-            let agent_limit = if filter_locally_after_oracle_comments {
-                None
-            } else if use_agent_table_paging {
-                limit
-            } else {
-                None
-            };
-            let agent_offset = if filter_locally_after_oracle_comments {
-                None
-            } else if use_agent_table_paging {
-                offset
-            } else {
-                None
-            };
-            match client
-                .list_tables_constrained::<Vec<db::TableInfo>>(
-                    database,
-                    schema,
-                    agent_filter,
-                    agent_limit,
-                    agent_offset,
-                    object_types,
-                    timeout_duration,
-                )
+            return db::sqlserver::list_tables(&mut client, schema, filter, None, None)
                 .await
-            {
-                Ok(mut tables) if !tables.is_empty() => {
-                    if is_oracle {
-                        load_oracle_table_comments_for_tables(
-                            &mut client,
-                            database,
-                            schema,
-                            &mut tables,
-                            timeout_duration,
-                        )
+                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+        }
+    }
+    if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+        let mut client = client.lock().await;
+        return db::sqlserver::list_tables(&mut client, schema, filter, limit, offset).await;
+    }
+    if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+        let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
+        let use_agent_table_paging = db_config.as_ref().is_some_and(supports_agent_table_paging);
+        let filter_locally_after_oracle_comments = is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
+        let timeout_duration = agent_metadata_timeout(db_config.as_ref());
+        let fallback_config = db_config.clone();
+        let mut client = client.lock().await;
+        let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
+        let agent_limit = if filter_locally_after_oracle_comments {
+            None
+        } else if use_agent_table_paging {
+            limit
+        } else {
+            None
+        };
+        let agent_offset = if filter_locally_after_oracle_comments {
+            None
+        } else if use_agent_table_paging {
+            offset
+        } else {
+            None
+        };
+        match client
+            .list_tables_constrained::<Vec<db::TableInfo>>(
+                database,
+                schema,
+                agent_filter,
+                agent_limit,
+                agent_offset,
+                object_types,
+                timeout_duration,
+            )
+            .await
+        {
+            Ok(mut tables) if !tables.is_empty() => {
+                if is_oracle {
+                    load_oracle_table_comments_for_tables(&mut client, database, schema, &mut tables, timeout_duration)
                         .await?;
-                    }
-                    let final_offset = if filter_locally_after_oracle_comments {
-                        offset
-                    } else if agent_paging_likely_applied(use_agent_table_paging, limit, tables.len()) {
-                        Some(0)
-                    } else {
-                        offset
-                    };
-                    let tables = filter_table_infos(tables, filter, limit, final_offset, object_types);
-                    return Ok(tables);
                 }
-                Ok(tables) => {
-                    if let Some(config) = fallback_config.as_ref() {
-                        match native_postgres_metadata_pool(state, connection_id, database, config).await {
-                            Ok(Some(pool)) => {
-                                return if object_types.is_some() {
-                                    db::postgres::list_tables_filtered(&pool, schema, filter, None, None)
-                                        .await
-                                        .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
-                                } else {
-                                    db::postgres::list_tables_filtered(&pool, schema, filter, limit, offset).await
-                                };
-                            }
-                            Ok(None) => return Ok(filter_table_infos(tables, filter, limit, offset, object_types)),
-                            Err(error) => {
-                                log::warn!(
-                                    "[schema][agent:list_tables:fallback-failed] connection_id={} database={} schema={} error={}",
-                                    connection_id,
-                                    database,
-                                    schema,
-                                    error
-                                );
-                            }
-                        }
-                    }
-                    return Ok(filter_table_infos(tables, filter, limit, offset, object_types));
-                }
-                Err(agent_error) => {
-                    if let Some(config) = fallback_config.as_ref() {
-                        if let Some(pool) =
-                            native_postgres_metadata_pool(state, connection_id, database, config).await?
-                        {
-                            let result = if object_types.is_some() {
+                let final_offset = if filter_locally_after_oracle_comments {
+                    offset
+                } else if agent_paging_likely_applied(use_agent_table_paging, limit, tables.len()) {
+                    Some(0)
+                } else {
+                    offset
+                };
+                let tables = filter_table_infos(tables, filter, limit, final_offset, object_types);
+                return Ok(tables);
+            }
+            Ok(tables) => {
+                if let Some(config) = fallback_config.as_ref() {
+                    match native_postgres_metadata_pool(state, connection_id, database, config).await {
+                        Ok(Some(pool)) => {
+                            return if object_types.is_some() {
                                 db::postgres::list_tables_filtered(&pool, schema, filter, None, None)
                                     .await
                                     .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
                             } else {
                                 db::postgres::list_tables_filtered(&pool, schema, filter, limit, offset).await
                             };
-                            return result.map_err(|fallback_error| {
-                                format!("{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}")
-                            });
+                        }
+                        Ok(None) => return Ok(filter_table_infos(tables, filter, limit, offset, object_types)),
+                        Err(error) => {
+                            log::warn!(
+                                "[schema][agent:list_tables:fallback-failed] connection_id={} database={} schema={} error={}",
+                                connection_id,
+                                database,
+                                schema,
+                                error
+                            );
                         }
                     }
-                    return Err(agent_error);
                 }
+                return Ok(filter_table_infos(tables, filter, limit, offset, object_types));
+            }
+            Err(agent_error) => {
+                if let Some(config) = fallback_config.as_ref() {
+                    if let Some(pool) = native_postgres_metadata_pool(state, connection_id, database, config).await? {
+                        let result = if object_types.is_some() {
+                            db::postgres::list_tables_filtered(&pool, schema, filter, None, None)
+                                .await
+                                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
+                        } else {
+                            db::postgres::list_tables_filtered(&pool, schema, filter, limit, offset).await
+                        };
+                        return result.map_err(|fallback_error| {
+                            format!("{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}")
+                        });
+                    }
+                }
+                return Err(agent_error);
             }
         }
     }
@@ -3586,11 +3539,12 @@ async fn list_object_statistics_once(
 ) -> Result<Vec<db::ObjectStatistics>, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    try_sqlserver!(connections, &pool_key, list_object_statistics, schema);
-    if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+    if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+        let mut client = client.lock().await;
+        return db::sqlserver::list_object_statistics(&mut client, schema).await;
+    }
+    if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
         if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle) {
-            drop(connections);
             return oracle_agent_list_object_statistics(
                 client,
                 database,
@@ -3600,7 +3554,6 @@ async fn list_object_statistics_once(
             .await;
         }
     }
-    drop(connections);
     crate::database_session::list_object_statistics(state, &pool_key, db_config.as_ref(), database, schema).await
 }
 
@@ -3660,129 +3613,118 @@ async fn list_objects_once(
             .map(unpaged_object_list);
     }
 
-    {
-        let connections = state.connections.read().await;
-        #[cfg(feature = "duckdb-bundled")]
-        if let Some(ext_pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
-            drop(connections);
-            let cache = ext_pool.cache.clone();
-            let objects = tokio::task::spawn_blocking(move || {
-                let con = cache.lock().map_err(|e| e.to_string())?;
-                Ok(duckdb_query_tables(&con)?
-                    .into_iter()
-                    .map(|table| db::ObjectInfo {
-                        name: table.name,
-                        object_type: table.table_type,
-                        schema: None,
-                        valid: None,
-                        signature: None,
-                        comment: table.comment,
-                        created_at: None,
-                        updated_at: None,
-                        parent_schema: table.parent_schema,
-                        parent_name: table.parent_name,
-                    })
-                    .collect())
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-            return objects.map(unpaged_object_list);
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-            drop(connections);
-            let mut client = client.lock().await;
-            return db::sqlserver::list_objects(&mut client, schema).await.map(unpaged_object_list);
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
-            let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config);
-            let filter_locally_after_oracle_comments =
-                is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
-            let timeout_duration = agent_metadata_timeout(db_config.as_ref());
-            let fallback_config = db_config.clone();
-            drop(connections);
-            if is_oracle && !use_oracle_agent_paging {
-                return oracle_agent_list_objects(client, database, schema, timeout_duration)
-                    .await
-                    .map(unpaged_object_list);
-            }
-            let mut client = client.lock().await;
-            let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
-            let agent_limit = if filter_locally_after_oracle_comments {
-                None
-            } else if use_oracle_agent_paging {
-                limit
-            } else {
-                None
-            };
-            let agent_offset = if filter_locally_after_oracle_comments {
-                None
-            } else if use_oracle_agent_paging {
-                offset
-            } else {
-                None
-            };
-            match client
-                .list_objects_constrained::<Vec<db::ObjectInfo>>(
-                    database,
-                    schema,
-                    agent_filter,
-                    agent_limit,
-                    agent_offset,
-                    object_types,
-                    timeout_duration,
-                )
+    #[cfg(feature = "duckdb-bundled")]
+    if let Some(ext_pool) = crate::database_session::resolve_external_tabular(state, &pool_key).await? {
+        let cache = ext_pool.cache.clone();
+        let objects = tokio::task::spawn_blocking(move || {
+            let con = cache.lock().map_err(|e| e.to_string())?;
+            Ok(duckdb_query_tables(&con)?
+                .into_iter()
+                .map(|table| db::ObjectInfo {
+                    name: table.name,
+                    object_type: table.table_type,
+                    schema: None,
+                    valid: None,
+                    signature: None,
+                    comment: table.comment,
+                    created_at: None,
+                    updated_at: None,
+                    parent_schema: table.parent_schema,
+                    parent_name: table.parent_name,
+                })
+                .collect())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        return objects.map(unpaged_object_list);
+    }
+    if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+        let mut client = client.lock().await;
+        return db::sqlserver::list_objects(&mut client, schema).await.map(unpaged_object_list);
+    }
+    if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+        let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
+        let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config);
+        let filter_locally_after_oracle_comments = is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
+        let timeout_duration = agent_metadata_timeout(db_config.as_ref());
+        let fallback_config = db_config.clone();
+        if is_oracle && !use_oracle_agent_paging {
+            return oracle_agent_list_objects(client, database, schema, timeout_duration)
                 .await
-            {
-                Ok(mut objects) if !objects.is_empty() => {
-                    if is_oracle {
-                        load_oracle_table_comments_for_objects(
-                            &mut client,
-                            database,
-                            schema,
-                            &mut objects,
-                            timeout_duration,
-                        )
-                        .await?;
-                    }
-                    return Ok(unpaged_object_list(objects));
+                .map(unpaged_object_list);
+        }
+        let mut client = client.lock().await;
+        let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
+        let agent_limit = if filter_locally_after_oracle_comments {
+            None
+        } else if use_oracle_agent_paging {
+            limit
+        } else {
+            None
+        };
+        let agent_offset = if filter_locally_after_oracle_comments {
+            None
+        } else if use_oracle_agent_paging {
+            offset
+        } else {
+            None
+        };
+        match client
+            .list_objects_constrained::<Vec<db::ObjectInfo>>(
+                database,
+                schema,
+                agent_filter,
+                agent_limit,
+                agent_offset,
+                object_types,
+                timeout_duration,
+            )
+            .await
+        {
+            Ok(mut objects) if !objects.is_empty() => {
+                if is_oracle {
+                    load_oracle_table_comments_for_objects(
+                        &mut client,
+                        database,
+                        schema,
+                        &mut objects,
+                        timeout_duration,
+                    )
+                    .await?;
                 }
-                Ok(objects) => {
-                    if let Some(config) = fallback_config.as_ref() {
-                        match native_postgres_metadata_pool(state, connection_id, database, config).await {
-                            Ok(Some(pool)) => {
-                                return db::postgres::list_objects(&pool, schema).await.map(unpaged_object_list)
-                            }
-                            Ok(None) => return Ok(unpaged_object_list(objects)),
-                            Err(error) => {
-                                log::warn!(
-                                    "[schema][agent:list_objects:fallback-failed] connection_id={} database={} schema={} error={}",
-                                    connection_id,
-                                    database,
-                                    schema,
-                                    error
-                                );
-                            }
+                return Ok(unpaged_object_list(objects));
+            }
+            Ok(objects) => {
+                if let Some(config) = fallback_config.as_ref() {
+                    match native_postgres_metadata_pool(state, connection_id, database, config).await {
+                        Ok(Some(pool)) => {
+                            return db::postgres::list_objects(&pool, schema).await.map(unpaged_object_list)
                         }
-                    }
-                    return Ok(unpaged_object_list(objects));
-                }
-                Err(agent_error) => {
-                    if let Some(config) = fallback_config.as_ref() {
-                        if let Some(pool) =
-                            native_postgres_metadata_pool(state, connection_id, database, config).await?
-                        {
-                            return db::postgres::list_objects(&pool, schema).await.map(unpaged_object_list).map_err(
-                                |fallback_error| {
-                                    format!(
-                                        "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
-                                    )
-                                },
+                        Ok(None) => return Ok(unpaged_object_list(objects)),
+                        Err(error) => {
+                            log::warn!(
+                                "[schema][agent:list_objects:fallback-failed] connection_id={} database={} schema={} error={}",
+                                connection_id,
+                                database,
+                                schema,
+                                error
                             );
                         }
                     }
-                    return Err(agent_error);
                 }
+                return Ok(unpaged_object_list(objects));
+            }
+            Err(agent_error) => {
+                if let Some(config) = fallback_config.as_ref() {
+                    if let Some(pool) = native_postgres_metadata_pool(state, connection_id, database, config).await? {
+                        return db::postgres::list_objects(&pool, schema).await.map(unpaged_object_list).map_err(
+                            |fallback_error| {
+                                format!("{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}")
+                            },
+                        );
+                    }
+                }
+                return Err(agent_error);
             }
         }
     }
@@ -4019,116 +3961,88 @@ pub async fn get_columns_core(
             return Ok(deduplicate_column_infos(columns));
         }
 
-        {
-            let connections = state.connections.read().await;
-            #[cfg(feature = "duckdb-bundled")]
-            if let Some(ext_pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
-                drop(connections);
-                let cache = ext_pool.cache.clone();
-                let table = table.to_string();
-                return tokio::task::spawn_blocking(move || {
-                    let con = cache.lock().map_err(|e| e.to_string())?;
-                    duckdb_query_columns(&con, &table)
-                })
+        #[cfg(feature = "duckdb-bundled")]
+        if let Some(ext_pool) = crate::database_session::resolve_external_tabular(state, &pool_key).await? {
+            let cache = ext_pool.cache.clone();
+            let table = table.to_string();
+            return tokio::task::spawn_blocking(move || {
+                let con = cache.lock().map_err(|e| e.to_string())?;
+                duckdb_query_columns(&con, &table)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        #[cfg(feature = "duckdb-bundled")]
+        if let Some(con) = crate::database_session::resolve_duckdb_handle(state, &pool_key).await? {
+            let con = con.lock().map_err(|e| e.to_string())?;
+            return duckdb_query_columns_in_database_with_attached(
+                &con,
+                database,
+                schema,
+                table,
+                &duckdb_attached_names,
+            );
+        }
+        #[cfg(feature = "duckdb-bundled")]
+        if let Some(client) = crate::database_session::resolve_duckdb_worker(state, &pool_key).await? {
+            return client.list_columns(database.to_string(), schema.to_string(), table.to_string()).await;
+        }
+        if let Some(client) = crate::database_session::resolve_clickhouse_client(state, &pool_key).await? {
+            return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map(deduplicate_column_infos);
+        }
+        if let Some(client) = crate::database_session::resolve_influxdb_client(state, &pool_key).await? {
+            return db::influxdb_driver::get_columns(&client, database, table).await.map(deduplicate_column_infos);
+        }
+        if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
+            if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+                let mut client = client.lock().await;
+                return db::sqlserver::get_linked_server_columns(
+                    &mut client,
+                    &linked.server,
+                    &linked.catalog,
+                    &linked.schema,
+                    table,
+                )
+                .await
+                .map(deduplicate_column_infos);
             }
-            #[cfg(feature = "duckdb-bundled")]
-            if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {
-                drop(connections);
-                let con = con.lock().map_err(|e| e.to_string())?;
-                return duckdb_query_columns_in_database_with_attached(
-                    &con,
+        }
+        if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return db::sqlserver::get_columns(&mut client, schema, table).await;
+        }
+        if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+            let fallback_config = db_config.clone();
+            let mut client = client.lock().await;
+            match client
+                .get_columns::<Vec<db::ColumnInfo>>(
                     database,
                     schema,
                     table,
-                    &duckdb_attached_names,
-                );
-            }
-            #[cfg(feature = "duckdb-bundled")]
-            if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
-                let database = database.to_string();
-                let schema = schema.to_string();
-                let table = table.to_string();
-                drop(connections);
-                return client.list_columns(database, schema, table).await;
-            }
-            if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
-                drop(connections);
-                return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
-                    .await
-                    .map(deduplicate_column_infos);
-            }
-            if let Some(client) = extract_pool!(&connections, &pool_key, InfluxDb) {
-                drop(connections);
-                return db::influxdb_driver::get_columns(&client, database, table).await.map(deduplicate_column_infos);
-            }
-            if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
-                if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-                    drop(connections);
-                    let mut client = client.lock().await;
-                    return db::sqlserver::get_linked_server_columns(
-                        &mut client,
-                        &linked.server,
-                        &linked.catalog,
-                        &linked.schema,
-                        table,
-                    )
-                    .await
-                    .map(deduplicate_column_infos);
-                }
-            }
-            try_sqlserver!(connections, &pool_key, get_columns, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                let fallback_config = db_config.clone();
-                drop(connections);
-                let mut client = client.lock().await;
-                match client
-                    .get_columns::<Vec<db::ColumnInfo>>(
-                        database,
-                        schema,
-                        table,
-                        agent_metadata_timeout(db_config.as_ref()),
-                    )
-                    .await
-                {
-                    Ok(columns) if !columns.is_empty() => return Ok(deduplicate_column_infos(columns)),
-                    Ok(columns) => {
-                        if let Some(config) = fallback_config.as_ref() {
-                            if config.db_type == DatabaseType::Oracle {
-                                match oracle_columns_via_sql(
-                                    database,
-                                    schema,
-                                    table,
-                                    &mut client,
-                                    agent_metadata_timeout(Some(config)),
-                                )
-                                .await
-                                {
-                                    Ok(fallback_columns) if !fallback_columns.is_empty() => return Ok(fallback_columns),
-                                    Ok(_) => {}
-                                    Err(error) => {
-                                        log::warn!(
-                                            "[schema][agent:get_columns:oracle-fallback-failed] connection_id={} database={} schema={} table={} error={}",
-                                            connection_id,
-                                            database,
-                                            schema,
-                                            table,
-                                            error
-                                        );
-                                    }
-                                }
-                            }
-                            match native_postgres_metadata_pool(state, connection_id, database, config).await {
-                                Ok(Some(pool)) => {
-                                    return db::postgres::get_columns(&pool, schema, table)
-                                        .await
-                                        .map(deduplicate_column_infos);
-                                }
-                                Ok(None) => return Ok(deduplicate_column_infos(columns)),
+                    agent_metadata_timeout(db_config.as_ref()),
+                )
+                .await
+            {
+                Ok(columns) if !columns.is_empty() => return Ok(deduplicate_column_infos(columns)),
+                Ok(columns) => {
+                    if let Some(config) = fallback_config.as_ref() {
+                        if config.db_type == DatabaseType::Oracle {
+                            match oracle_columns_via_sql(
+                                database,
+                                schema,
+                                table,
+                                &mut client,
+                                agent_metadata_timeout(Some(config)),
+                            )
+                            .await
+                            {
+                                Ok(fallback_columns) if !fallback_columns.is_empty() => return Ok(fallback_columns),
+                                Ok(_) => {}
                                 Err(error) => {
                                     log::warn!(
-                                        "[schema][agent:get_columns:fallback-failed] connection_id={} database={} schema={} table={} error={}",
+                                        "[schema][agent:get_columns:oracle-fallback-failed] connection_id={} database={} schema={} table={} error={}",
                                         connection_id,
                                         database,
                                         schema,
@@ -4138,25 +4052,43 @@ pub async fn get_columns_core(
                                 }
                             }
                         }
-                        return Ok(deduplicate_column_infos(columns));
-                    }
-                    Err(agent_error) => {
-                        if let Some(config) = fallback_config.as_ref() {
-                            if let Some(pool) =
-                                native_postgres_metadata_pool(state, connection_id, database, config).await?
-                            {
+                        match native_postgres_metadata_pool(state, connection_id, database, config).await {
+                            Ok(Some(pool)) => {
                                 return db::postgres::get_columns(&pool, schema, table)
                                     .await
-                                    .map(deduplicate_column_infos)
-                                    .map_err(|fallback_error| {
-                                        format!(
-                                            "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
-                                        )
-                                    });
+                                    .map(deduplicate_column_infos);
+                            }
+                            Ok(None) => return Ok(deduplicate_column_infos(columns)),
+                            Err(error) => {
+                                log::warn!(
+                                    "[schema][agent:get_columns:fallback-failed] connection_id={} database={} schema={} table={} error={}",
+                                    connection_id,
+                                    database,
+                                    schema,
+                                    table,
+                                    error
+                                );
                             }
                         }
-                        return Err(agent_error);
                     }
+                    return Ok(deduplicate_column_infos(columns));
+                }
+                Err(agent_error) => {
+                    if let Some(config) = fallback_config.as_ref() {
+                        if let Some(pool) =
+                            native_postgres_metadata_pool(state, connection_id, database, config).await?
+                        {
+                            return db::postgres::get_columns(&pool, schema, table)
+                                .await
+                                .map(deduplicate_column_infos)
+                                .map_err(|fallback_error| {
+                                    format!(
+                                        "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
+                                    )
+                                });
+                        }
+                    }
+                    return Err(agent_error);
                 }
             }
         }
@@ -4183,8 +4115,10 @@ pub async fn get_sqlserver_column_metadata_core(
 ) -> Result<Vec<db::sqlserver::SqlServerColumnMetadata>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
-        let connections = state.connections.read().await;
-        try_sqlserver!(connections, &pool_key, get_column_metadata, schema, table);
+        if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return db::sqlserver::get_column_metadata(&mut client, schema, table).await;
+        }
         Err("SQL Server column metadata requires a native SQL Server connection".to_string())
     })
     .await
@@ -4247,14 +4181,13 @@ pub async fn list_indexes_core(
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
         let db_config = connection_config(state, connection_id).await;
 
-        {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, list_indexes, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
-                let mut client = client.lock().await;
-                return client.list_indexes(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
-            }
+        if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return db::sqlserver::list_indexes(&mut client, schema, table).await;
+        }
+        if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return client.list_indexes(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
 
         crate::database_session::list_indexes(state, &pool_key, db_config.as_ref(), database, schema, table).await
@@ -4276,16 +4209,13 @@ pub async fn list_foreign_keys_core(
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
         let db_config = connection_config(state, connection_id).await;
 
-        {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, list_foreign_keys, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
-                let mut client = client.lock().await;
-                return client
-                    .list_foreign_keys(database, schema, table, agent_metadata_timeout(db_config.as_ref()))
-                    .await;
-            }
+        if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return db::sqlserver::list_foreign_keys(&mut client, schema, table).await;
+        }
+        if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return client.list_foreign_keys(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
 
         crate::database_session::list_foreign_keys(state, &pool_key, database, schema, table).await
@@ -4307,14 +4237,13 @@ pub async fn list_triggers_core(
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
         let db_config = connection_config(state, connection_id).await;
 
-        {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, list_triggers, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
-                let mut client = client.lock().await;
-                return client.list_triggers(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
-            }
+        if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return db::sqlserver::list_triggers(&mut client, schema, table).await;
+        }
+        if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+            let mut client = client.lock().await;
+            return client.list_triggers(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
 
         crate::database_session::list_triggers(state, &pool_key, database, schema, table).await
@@ -4440,66 +4369,44 @@ pub async fn get_table_ddl_core(
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
 
-    {
-        let connections = state.connections.read().await;
-        #[cfg(feature = "duckdb-bundled")]
-        if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {
-            drop(connections);
-            let tbl = table.replace('\'', "''");
-            let con = con.lock().map_err(|e| e.to_string())?;
-            let mut stmt = con
-                .prepare(&format!("SELECT sql FROM duckdb_tables() WHERE table_name = '{tbl}'"))
-                .map_err(|e| e.to_string())?;
-            let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-            if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                return row.get::<_, String>(0).map_err(|e| e.to_string());
-            }
-            return Err("Table not found".to_string());
+    #[cfg(feature = "duckdb-bundled")]
+    if let Some(con) = crate::database_session::resolve_duckdb_handle(state, &pool_key).await? {
+        let tbl = table.replace('\'', "''");
+        let con = con.lock().map_err(|e| e.to_string())?;
+        let mut stmt = con
+            .prepare(&format!("SELECT sql FROM duckdb_tables() WHERE table_name = '{tbl}'"))
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            return row.get::<_, String>(0).map_err(|e| e.to_string());
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
-            drop(connections);
-            let clickhouse_database = clickhouse_metadata_database(database, schema);
-            let result = db::clickhouse_driver::execute_query(
-                &client,
-                clickhouse_database,
-                &format!("SHOW CREATE TABLE `{table}`"),
-            )
-            .await?;
-            return result
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| "Table not found".to_string());
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-            drop(connections);
-            let mut client = client.lock().await;
-            return build_sqlserver_ddl(&mut client, schema, table).await;
-        }
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
-            if let Some(config) = db_config.as_ref().filter(|config| is_agent_postgres_metadata_fallback_config(config))
-            {
-                match native_postgres_metadata_pool(state, connection_id, database, config).await {
-                    Ok(Some(pool)) => match pg_ddl(&pool, schema, table).await {
-                        Ok(ddl) => return Ok(ddl),
-                        Err(error) => {
-                            log::warn!(
-                                "[schema][agent:get_table_ddl:postgres-compatible-native-fallback-failed] connection_id={} database={} schema={} table={} error={}",
-                                connection_id,
-                                database,
-                                schema,
-                                table,
-                                error
-                            );
-                        }
-                    },
-                    Ok(None) => {}
+        return Err("Table not found".to_string());
+    }
+    if let Some(client) = crate::database_session::resolve_clickhouse_client(state, &pool_key).await? {
+        let clickhouse_database = clickhouse_metadata_database(database, schema);
+        let result =
+            db::clickhouse_driver::execute_query(&client, clickhouse_database, &format!("SHOW CREATE TABLE `{table}`"))
+                .await?;
+        return result
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Table not found".to_string());
+    }
+    if let Some(client) = crate::database_session::resolve_sqlserver_client(state, &pool_key).await? {
+        let mut client = client.lock().await;
+        return build_sqlserver_ddl(&mut client, schema, table).await;
+    }
+    if let Some(client) = crate::database_session::resolve_agent_client(state, &pool_key).await? {
+        if let Some(config) = db_config.as_ref().filter(|config| is_agent_postgres_metadata_fallback_config(config)) {
+            match native_postgres_metadata_pool(state, connection_id, database, config).await {
+                Ok(Some(pool)) => match pg_ddl(&pool, schema, table).await {
+                    Ok(ddl) => return Ok(ddl),
                     Err(error) => {
                         log::warn!(
-                            "[schema][agent:get_table_ddl:postgres-compatible-native-pool-failed] connection_id={} database={} schema={} table={} error={}",
+                            "[schema][agent:get_table_ddl:postgres-compatible-native-fallback-failed] connection_id={} database={} schema={} table={} error={}",
                             connection_id,
                             database,
                             schema,
@@ -4507,31 +4414,30 @@ pub async fn get_table_ddl_core(
                             error
                         );
                     }
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!(
+                        "[schema][agent:get_table_ddl:postgres-compatible-native-pool-failed] connection_id={} database={} schema={} table={} error={}",
+                        connection_id,
+                        database,
+                        schema,
+                        table,
+                        error
+                    );
                 }
             }
-            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle) {
-                return oracle_agent_table_ddl(
-                    client,
-                    database,
-                    schema,
-                    table,
-                    agent_metadata_timeout(db_config.as_ref()),
-                )
-                .await;
-            }
-            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Db2) {
-                return db2_agent_table_ddl(
-                    client,
-                    database,
-                    schema,
-                    table,
-                    agent_metadata_timeout(db_config.as_ref()),
-                )
-                .await;
-            }
-            let mut client = client.lock().await;
-            return client.get_table_ddl(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
+        if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle) {
+            return oracle_agent_table_ddl(client, database, schema, table, agent_metadata_timeout(db_config.as_ref()))
+                .await;
+        }
+        if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Db2) {
+            return db2_agent_table_ddl(client, database, schema, table, agent_metadata_timeout(db_config.as_ref()))
+                .await;
+        }
+        let mut client = client.lock().await;
+        return client.get_table_ddl(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
     }
 
     crate::database_session::get_table_ddl(state, &pool_key, db_config.as_ref(), database, schema, table).await

@@ -11,10 +11,12 @@ mod transfer;
 
 pub(crate) use domain::{
     is_sqlserver_pool, resolve_agent_client, resolve_clickhouse_client, resolve_document_handle,
-    resolve_external_driver, resolve_manual_txn_pool, resolve_mongo_handle, resolve_mysql_pool, resolve_postgres_pool,
-    resolve_sqlserver_client, resolve_tx_path, resolve_vector_client, sqlserver_pool_is_current, DocumentHandle,
-    ManualTxnPool, MongoHandle, TxPath,
+    resolve_external_driver, resolve_influxdb_client, resolve_manual_txn_pool, resolve_mongo_handle,
+    resolve_mysql_pool, resolve_postgres_pool, resolve_sqlserver_client, resolve_tx_path, resolve_vector_client,
+    sqlserver_pool_is_current, DocumentHandle, ManualTxnPool, MongoHandle, TxPath,
 };
+#[cfg(feature = "duckdb-bundled")]
+pub(crate) use domain::{resolve_duckdb_handle, resolve_duckdb_worker, resolve_external_tabular};
 pub(crate) use execute::execute_sql;
 pub(crate) use schema::{
     get_columns, get_object_source, get_table_comment, get_table_ddl, list_available_extensions,

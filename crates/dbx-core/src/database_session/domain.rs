@@ -115,6 +115,19 @@ pub(crate) async fn resolve_clickhouse_client(
     })
 }
 
+/// Clone an InfluxDB client for schema early paths.
+pub(crate) async fn resolve_influxdb_client(
+    state: &AppState,
+    pool_key: &str,
+) -> Result<Option<crate::db::influxdb_driver::InfluxdbClient>, String> {
+    let connections = state.connections.read().await;
+    Ok(match connections.get(pool_key) {
+        Some(PoolKind::InfluxDb(client)) => Some(client.clone()),
+        Some(_) => None,
+        None => return Err("Connection not found".to_string()),
+    })
+}
+
 /// Clone a SQL Server client for stream/export paths.
 pub(crate) async fn resolve_sqlserver_client(
     state: &AppState,
@@ -123,6 +136,48 @@ pub(crate) async fn resolve_sqlserver_client(
     let connections = state.connections.read().await;
     Ok(match connections.get(pool_key) {
         Some(PoolKind::SqlServer(client)) => Some(client.clone()),
+        Some(_) => None,
+        None => return Err("Connection not found".to_string()),
+    })
+}
+
+/// Clone a native DuckDB handle (feature-gated registry arm).
+#[cfg(feature = "duckdb-bundled")]
+pub(crate) async fn resolve_duckdb_handle(
+    state: &AppState,
+    pool_key: &str,
+) -> Result<Option<Arc<crate::db::duckdb_driver::DuckDbConnection>>, String> {
+    let connections = state.connections.read().await;
+    Ok(match connections.get(pool_key) {
+        Some(PoolKind::DuckDb(con)) => Some(con.clone()),
+        Some(_) => None,
+        None => return Err("Connection not found".to_string()),
+    })
+}
+
+/// Clone a DuckDB worker-process client handle.
+#[cfg(feature = "duckdb-bundled")]
+pub(crate) async fn resolve_duckdb_worker(
+    state: &AppState,
+    pool_key: &str,
+) -> Result<Option<Arc<crate::db::duckdb_worker_process::DuckDbWorkerClient>>, String> {
+    let connections = state.connections.read().await;
+    Ok(match connections.get(pool_key) {
+        Some(PoolKind::DuckDbWorker(client)) => Some(client.clone()),
+        Some(_) => None,
+        None => return Err("Connection not found".to_string()),
+    })
+}
+
+/// Clone an external-tabular (DuckDB-backed) pool handle.
+#[cfg(feature = "duckdb-bundled")]
+pub(crate) async fn resolve_external_tabular(
+    state: &AppState,
+    pool_key: &str,
+) -> Result<Option<Arc<crate::external::ExternalPool>>, String> {
+    let connections = state.connections.read().await;
+    Ok(match connections.get(pool_key) {
+        Some(PoolKind::ExternalTabular(pool)) => Some(pool.clone()),
         Some(_) => None,
         None => return Err("Connection not found".to_string()),
     })
