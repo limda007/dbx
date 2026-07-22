@@ -99,6 +99,11 @@ pub(crate) async fn list_tables(
     let pool = connections.get(pool_key).ok_or("Pool not found")?;
 
     match pool {
+        PoolKind::Mysql(p, _) if db_config.is_some_and(crate::schema::is_starrocks_config) => {
+            db::mysql::list_starrocks_tables(p, database)
+                .await
+                .map(|tables| crate::schema::filter_table_infos(tables, filter, limit, offset, object_types))
+        }
         PoolKind::Mysql(p, _) if db_config.is_some_and(crate::schema::is_doris_family_config) => {
             db::mysql::list_tables_show(p, database)
                 .await
@@ -185,6 +190,11 @@ pub(crate) async fn list_objects(
                 db::ob_oracle::list_objects(p, schema).await.map(crate::schema::unpaged_object_list).map(Some)
             } else if db_config.is_some_and(crate::schema::is_manticoresearch_config) {
                 db::manticoresearch::list_objects(p, database).await.map(crate::schema::unpaged_object_list).map(Some)
+            } else if db_config.is_some_and(crate::schema::is_starrocks_config) {
+                db::mysql::list_starrocks_table_objects(p, database)
+                    .await
+                    .map(crate::schema::unpaged_object_list)
+                    .map(Some)
             } else if db_config.is_some_and(crate::schema::is_doris_family_config) {
                 db::mysql::list_table_objects_show(p, database).await.map(crate::schema::unpaged_object_list).map(Some)
             } else {
@@ -762,7 +772,16 @@ pub(crate) async fn get_object_source(
                     db::questdb::questdb_object_source(pool, name).await?
                 }
                 PoolKind::Postgres(pool) => {
-                    crate::schema::postgres_object_source(pool, schema, name, &object_type, signature).await?
+                    let unwrap_opengauss_record = db_config.is_some_and(crate::schema::is_opengauss_family_config);
+                    crate::schema::postgres_object_source(
+                        pool,
+                        schema,
+                        name,
+                        &object_type,
+                        signature,
+                        unwrap_opengauss_record,
+                    )
+                    .await?
                 }
                 PoolKind::Sqlite(pool) => crate::schema::first_string_cell(
                     db::sqlite::execute_query(

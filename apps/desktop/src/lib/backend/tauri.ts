@@ -806,8 +806,8 @@ export async function listSchemaInfos(connectionId: string, database: string): P
   return invoke("list_schema_infos", { connectionId, database });
 }
 
-export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ColumnInfo[]> {
-  return invoke("get_columns", { connectionId, database, schema, table, catalog });
+export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string, clientSessionId?: string): Promise<ColumnInfo[]> {
+  return invoke("get_columns", { connectionId, database, schema, table, catalog, clientSessionId });
 }
 
 export async function getSqlServerColumnMetadata(connectionId: string, database: string, schema: string, table: string): Promise<SqlServerColumnMetadata[]> {
@@ -1877,6 +1877,10 @@ export async function mongoDropCollection(connectionId: string, database: string
   return invoke("mongo_drop_collection", { connectionId, database, collection });
 }
 
+export async function mongoRenameCollection(connectionId: string, database: string, collection: string, newName: string): Promise<void> {
+  return invoke("mongo_rename_collection", { connectionId, database, collection, newName });
+}
+
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
   const collections = await documentListCollections(connectionId, "default");
   return collections.map((c) => c.name);
@@ -2331,6 +2335,7 @@ export interface DatabaseExportRequest {
   includeData: boolean;
   includeObjects: boolean;
   dropTableIfExists?: boolean;
+  omitAutoIncrement?: boolean;
   failOnError?: boolean;
   snapshotSessionId?: string;
   batchSize: number;

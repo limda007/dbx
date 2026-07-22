@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::future::Future;
 use std::io::{BufWriter, Seek, Write};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -17,8 +16,8 @@ use crate::database_session::{
 };
 use crate::models::connection::DatabaseType;
 use crate::query::{
-    canceled_error, close_query_session, execute_sql_statement_with_options, operation_budget_for_pool_key,
-    QueryExecutionOptions, QUERY_CANCELED,
+    await_stream_with_progress_timeout, canceled_error, close_query_session, execute_sql_statement_with_options,
+    operation_budget_for_pool_key, QueryExecutionOptions, StreamProgressClock, QUERY_CANCELED,
 };
 use crate::query_result_sql::{
     build_query_pagination_execution_plan, QueryPagination, QueryPaginationExecutionPlanOptions,
@@ -193,85 +192,6 @@ fn query_export_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
         Some(0) => None,
         Some(seconds) => Some(Duration::from_secs(seconds)),
         None => Some(Duration::from_secs(30)),
-    }
-}
-
-struct StreamProgressClock {
-    started_at: tokio::time::Instant,
-    last_progress_ms: AtomicU64,
-}
-
-impl StreamProgressClock {
-    fn new() -> Self {
-        Self { started_at: tokio::time::Instant::now(), last_progress_ms: AtomicU64::new(0) }
-    }
-
-    fn mark(&self) {
-        self.last_progress_ms.store(self.started_at.elapsed().as_millis() as u64, Ordering::Relaxed);
-    }
-
-    fn elapsed_since_progress(&self) -> Duration {
-        let last_progress_ms = self.last_progress_ms.load(Ordering::Relaxed);
-        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
-        Duration::from_millis(elapsed_ms.saturating_sub(last_progress_ms))
-    }
-}
-
-async fn await_stream_with_progress_timeout<F, T>(
-    stream_future: F,
-    timeout: Option<Duration>,
-    progress_clock: Arc<StreamProgressClock>,
-    cancel_token: Option<&CancellationToken>,
-    timeout_message: String,
-) -> Result<T, String>
-where
-    F: Future<Output = Result<T, String>>,
-{
-    let Some(timeout) = timeout else {
-        return match cancel_token {
-            Some(token) => {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => Err(canceled_error()),
-                    result = stream_future => result,
-                }
-            }
-            None => stream_future.await,
-        };
-    };
-
-    tokio::pin!(stream_future);
-    loop {
-        // The query timeout is an inactivity budget, not a cap on total export duration.
-        // This keeps a stalled server bounded while allowing large local file writes to finish.
-        let remaining = timeout.saturating_sub(progress_clock.elapsed_since_progress());
-        if remaining.is_zero() {
-            return Err(timeout_message.clone());
-        }
-        let sleep = tokio::time::sleep(remaining);
-        tokio::pin!(sleep);
-
-        match cancel_token {
-            Some(token) => {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => return Err(canceled_error()),
-                    result = &mut stream_future => return result,
-                    _ = &mut sleep => {},
-                }
-            }
-            None => {
-                tokio::select! {
-                    biased;
-                    result = &mut stream_future => return result,
-                    _ = &mut sleep => {},
-                }
-            }
-        }
-
-        if progress_clock.elapsed_since_progress() >= timeout {
-            return Err(timeout_message);
-        }
     }
 }
 
@@ -1046,6 +966,8 @@ async fn try_export_mysql_query_result_stream(
         }
     });
 
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
     let stream_future = crate::db::mysql::stream_query_result_on_conn(
         &mut conn,
         &request.sql,
@@ -1114,25 +1036,28 @@ async fn try_export_mysql_query_result_stream(
                     }
                 }
             }
+            progress_clock_for_stream.mark();
             Ok(())
         },
     );
-    let stream_result = match query_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, stream_future).await {
-            Ok(result) => result,
-            Err(_) => {
-                let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
-                    Some(pool_key.as_str()),
-                    request.execution_id.as_deref(),
-                    Some(export_db_type_label.as_str()),
-                );
-                let _ =
-                    crate::db::mysql::kill_query_with_opts_logged(kill_opts, mysql_connection_id, log_context).await;
-                Err(format!("Query timed out after {} seconds", timeout.as_secs()))
-            }
-        },
-        None => stream_future.await,
-    };
+    let timeout_error =
+        format!("Query timed out after {} seconds", query_timeout.map_or(0, |timeout| timeout.as_secs()));
+    let stream_result = await_stream_with_progress_timeout(
+        stream_future,
+        query_timeout,
+        progress_clock,
+        cancel_token.as_ref(),
+        timeout_error.clone(),
+    )
+    .await;
+    if stream_result.as_ref().is_err_and(|error| error == &timeout_error) {
+        let log_context = crate::connection_lifecycle::StageLogContext::for_pool(
+            Some(pool_key.as_str()),
+            request.execution_id.as_deref(),
+            Some(export_db_type_label.as_str()),
+        );
+        let _ = crate::db::mysql::kill_query_with_opts_logged(kill_opts, mysql_connection_id, log_context).await;
+    }
     watcher_done.cancel();
 
     if let Err(error) = stream_result {
@@ -1251,8 +1176,11 @@ async fn try_export_clickhouse_query_result_stream(
         None
     };
     let mut xlsx = None;
+    let query_timeout = query_export_timeout(request.timeout_secs);
     let clickhouse_database = if database.is_empty() { "default" } else { database };
 
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
     let stream_future = crate::db::clickhouse_driver::stream_query_with_max_rows(
         &client,
         clickhouse_database,
@@ -1318,16 +1246,18 @@ async fn try_export_clickhouse_query_result_stream(
                     }
                 }
             }
+            progress_clock_for_stream.mark();
             Ok(())
         },
     );
-    let stream_result = match query_export_timeout(request.timeout_secs) {
-        Some(timeout) => match tokio::time::timeout(timeout, stream_future).await {
-            Ok(result) => result,
-            Err(_) => Err(format!("Query timed out after {} seconds", timeout.as_secs())),
-        },
-        None => stream_future.await,
-    };
+    let stream_result = await_stream_with_progress_timeout(
+        stream_future,
+        query_timeout,
+        progress_clock,
+        cancel_token.as_ref(),
+        format!("Query timed out after {} seconds", query_timeout.map_or(0, |timeout| timeout.as_secs())),
+    )
+    .await;
 
     if let Err(error) = stream_result {
         if error == QUERY_CANCELED
@@ -1406,8 +1336,6 @@ async fn try_export_sqlserver_query_result_stream(
         None
     };
     let mut xlsx = None;
-    let progress_clock = Arc::new(StreamProgressClock::new());
-    let progress_clock_for_stream = progress_clock.clone();
     let query_timeout = query_export_timeout(request.timeout_secs);
 
     let mut client = match cancel_token.as_ref() {
@@ -1421,6 +1349,8 @@ async fn try_export_sqlserver_query_result_stream(
         None => client.lock().await,
     };
 
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
     let stream_future = crate::db::sqlserver::stream_first_result_set(
         &mut client,
         &request.sql,
@@ -1700,7 +1630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlserver_stream_times_out_when_database_makes_no_progress() {
+    async fn stream_times_out_when_database_makes_no_progress() {
         let progress_clock = Arc::new(StreamProgressClock::new());
         let result = await_stream_with_progress_timeout(
             std::future::pending::<Result<(), String>>(),
@@ -1715,7 +1645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlserver_stream_timeout_resets_after_each_completed_row() {
+    async fn stream_timeout_resets_after_each_completed_row() {
         let progress_clock = Arc::new(StreamProgressClock::new());
         let progress_clock_for_stream = progress_clock.clone();
         let result = await_stream_with_progress_timeout(
@@ -1738,7 +1668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlserver_stream_does_not_count_synchronous_local_writes_as_database_idle_time() {
+    async fn stream_does_not_count_synchronous_local_writes_as_database_idle_time() {
         let progress_clock = Arc::new(StreamProgressClock::new());
         let progress_clock_for_stream = progress_clock.clone();
         let result = await_stream_with_progress_timeout(
@@ -1758,7 +1688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlserver_stream_timeout_zero_disables_idle_timeout() {
+    async fn stream_timeout_zero_disables_idle_timeout() {
         let progress_clock = Arc::new(StreamProgressClock::new());
         let result = await_stream_with_progress_timeout(
             async {
@@ -1776,7 +1706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlserver_stream_cancellation_wins_over_idle_timeout() {
+    async fn stream_cancellation_wins_over_idle_timeout() {
         let progress_clock = Arc::new(StreamProgressClock::new());
         let cancel_token = CancellationToken::new();
         let cancel_token_for_task = cancel_token.clone();

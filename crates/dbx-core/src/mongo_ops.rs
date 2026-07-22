@@ -50,6 +50,21 @@ pub async fn mongo_drop_collection_core(
     }
 }
 
+pub async fn mongo_rename_collection_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    collection: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    match resolve_mongo_handle(state, connection_id).await? {
+        MongoHandle::Native(ref client) => {
+            mongo_driver::rename_collection(client, database, collection, new_name).await
+        }
+        MongoHandle::Agent(_) => Err("MongoDB legacy agent does not support rename collection".to_string()),
+    }
+}
+
 pub async fn mongo_server_version_core(
     state: &AppState,
     connection_id: &str,
