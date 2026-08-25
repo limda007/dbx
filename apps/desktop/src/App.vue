@@ -85,6 +85,7 @@ import {
   isSendSelectionToAiShortcut,
   isSwitchToNextTabShortcut,
   isSwitchToPreviousTabShortcut,
+  isToggleResultsPaneShortcut,
   isToggleSidebarShortcut,
   isZoomInShortcut,
   isZoomOutShortcut,
@@ -118,7 +119,11 @@ import { initSavedSqlEditorPositions } from "@/lib/app/savedSqlEditorPosition";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { isSchemaAware, isSingleDatabase, usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
+import { canFormatSqlForDatabaseType, formatSqlForEditing, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
+import { formatSqlSnapshotForSave } from "@/lib/sql/sqlFormatOnSave";
+import { detectAndFormatStructured } from "@/lib/sql/autoFormat";
+import { formatMongoShellText } from "@/lib/mongo/mongoFormatter";
+import { detectAndFormatElasticsearchRequests } from "@/lib/elasticsearch/elasticsearchFormatter";
 import { detectDatabaseFileType } from "@/lib/database/databaseFileDetection";
 import { ensureJdbcxRuntimeDrivers } from "@/lib/database/jdbcxBuiltinDriver";
 import { ensureRegisteredJdbcProductRuntimeDrivers } from "@/lib/database/jdbcProductProfiles";
@@ -535,6 +540,13 @@ function openSettings(initialTab = "appearance", initialSection?: string) {
   activateSettingsPage();
 }
 
+type MainContentSurface = "query" | "settings" | "driverStore";
+
+function activateMainContentSurface(surface: MainContentSurface) {
+  settingsStore.settingsPageActive = surface === "settings";
+  driverStoreActive.value = surface === "driverStore";
+}
+
 watch(
   () => settingsStore.settingsNavigationRequest,
   (request) => {
@@ -546,23 +558,20 @@ watch(
 
 function activateSettingsPage() {
   settingsPageTabOpen.value = true;
-  settingsStore.settingsPageActive = true;
-  driverStoreActive.value = false;
+  activateMainContentSurface("settings");
 }
 
 function activateQuerySurface() {
-  driverStoreActive.value = false;
-  settingsStore.settingsPageActive = false;
+  activateMainContentSurface("query");
 }
 
 function closeSettingsPage() {
   settingsPageTabOpen.value = false;
-  settingsStore.settingsPageActive = false;
   if (settingsReturnSurface.value === "driverStore" && driverStoreTabOpen.value) {
-    driverStoreActive.value = true;
+    activateMainContentSurface("driverStore");
     return;
   }
-  driverStoreActive.value = false;
+  activateMainContentSurface("query");
 }
 
 const driverStoreFocus = ref<DriverStoreFocus | null>(null);
@@ -578,13 +587,12 @@ function openDriverStorePage(target?: "agent" | "jdbc" | "storage" | "runtime" |
     driverStoreFocus.value = target ?? null;
   }
   driverStoreTabOpen.value = true;
-  driverStoreActive.value = true;
-  settingsStore.settingsPageActive = false;
+  activateMainContentSurface("driverStore");
 }
 
 function closeDriverStorePage() {
   driverStoreTabOpen.value = false;
-  driverStoreActive.value = false;
+  activateMainContentSurface("query");
   driverStoreActiveTab.value = "agent";
   driverStoreFocus.value = null;
 }
@@ -1161,7 +1169,7 @@ function handleCloseActionPromptOpenChange(open: boolean) {
 async function writeExternalSqlTab(tab: QueryTab, options: { closeAfterSave?: boolean; expectedContentHash?: string; expectedMissing?: boolean } = {}): Promise<"saved" | "retry" | "failed"> {
   if (!tab.externalSqlPath || !isTauriRuntime()) return "failed";
   try {
-    const result = await api.writeExternalSqlFile(tab.externalSqlPath, tab.sql, {
+    const result = await api.writeExternalSqlFile(tab.externalSqlPath, await formattedSqlForSave(tab), {
       expectedContentHash: options.expectedContentHash,
       expectedMissing: options.expectedMissing,
     });
@@ -1207,6 +1215,45 @@ function savedSqlTargetForSave(tab: QueryTab) {
   });
 }
 
+/**
+ * Applies the "format SQL when saving SQL files" editor setting: returns the
+ * formatted SQL that should be written to disk / the SQL library, mirroring the
+ * editor's own formatting logic (Mongo shell, Elasticsearch, structured JSON/XML
+ * and SQL) so a save never corrupts non-SQL content. When formatting changes the
+ * SQL, the tab content is also updated so the editor reflects exactly what was
+ * saved and stays clean if `markTabClean` runs afterwards.
+ */
+async function formattedSqlForSave(tab: QueryTab): Promise<string> {
+  if (!settingsStore.editorSettings.formatSqlOnSqlFileSave) return tab.sql;
+  const sqlSnapshot = tab.sql;
+  if (!sqlSnapshot.trim()) return sqlSnapshot;
+  const connection = connectionStore.getConfig(tab.connectionId);
+  const databaseType = effectiveDatabaseTypeForConnection(connection) ?? connection?.db_type;
+  if (!canFormatSqlForDatabaseType(databaseType)) return sqlSnapshot;
+  try {
+    return await formatSqlSnapshotForSave(
+      sqlSnapshot,
+      () => tab.sql,
+      async (sql) => {
+        if (databaseType === "mongodb") return formatMongoShellText(sql, settingsStore.editorSettings.sqlFormatter);
+        const esRequest = detectAndFormatElasticsearchRequests(sql, databaseType, settingsStore.editorSettings.sqlFormatter.tabWidth);
+        if (esRequest.kind === "elasticsearch") return esRequest.formatted;
+        if (esRequest.kind === "unsupported") return sql;
+        const structured = detectAndFormatStructured(sql, {
+          indentSize: settingsStore.editorSettings.sqlFormatter.tabWidth,
+          useTabs: settingsStore.editorSettings.sqlFormatter.useTabs,
+        });
+        if (structured.kind === "json" || structured.kind === "xml") return structured.formatted;
+        if (structured.kind === "unsupported") return sql;
+        return formatSqlForEditing(sql, sqlFormatDialectForDbType(databaseType), settingsStore.editorSettings.sqlFormatter);
+      },
+      (formatted) => queryStore.updateSql(tab.id, formatted),
+    );
+  } catch {
+    return tab.sql;
+  }
+}
+
 async function saveTabForCloseAll(tabId: string): Promise<boolean> {
   const tab = queryStore.tabs.find((t) => t.id === tabId);
   if (!tab) return true;
@@ -1233,7 +1280,7 @@ async function saveTabForCloseAll(tabId: string): Promise<boolean> {
       database: target.database,
       catalog: target.catalog,
       schema: target.schema,
-      sql: tab.sql,
+      sql: await formattedSqlForSave(tab),
     });
     queryStore.linkSavedSql(tab.id, saved.id, saved.name);
     queryStore.markTabClean(tab);
@@ -1301,7 +1348,7 @@ async function handleSaveTab(tabId: string) {
         database: target.database,
         catalog: target.catalog,
         schema: target.schema,
-        sql: tab.sql,
+        sql: await formattedSqlForSave(tab),
       });
       queryStore.linkSavedSql(tab.id, updated.id, updated.name);
       queryStore.markTabClean(tab);
@@ -1343,7 +1390,7 @@ async function openSaveSqlDialog() {
         database: target.database,
         catalog: target.catalog,
         schema: target.schema,
-        sql: tab.sql,
+        sql: await formattedSqlForSave(tab),
       });
       queryStore.linkSavedSql(tab.id, updated.id, updated.name);
       queryStore.markTabClean(tab);
@@ -1442,7 +1489,7 @@ async function confirmSaveSqlToLibrary() {
       database: target.database,
       catalog: target.catalog,
       schema: target.schema,
-      sql: tab.sql,
+      sql: await formattedSqlForSave(tab),
     });
     queryStore.linkSavedSql(tab.id, saved.id, saved.name);
     queryStore.markTabClean(tab);
@@ -1457,7 +1504,7 @@ async function confirmSaveSqlToLibrary() {
 async function saveExternalSqlTabAs(tab: QueryTab): Promise<boolean> {
   if (!canSaveSqlTab(tab) || !isTauriRuntime()) return false;
   try {
-    const saved = await api.saveExternalSqlFile(defaultSavedSqlName(tab.title), tab.sql);
+    const saved = await api.saveExternalSqlFile(defaultSavedSqlName(tab.title), await formattedSqlForSave(tab));
     if (!saved) return false;
     queryStore.linkExternalSqlPath(tab.id, saved.path, sqlFileTitleFromPath(saved.path), saved.version);
     rememberExternalSqlFileTarget(saved.path, { connectionId: tab.connectionId, database: tab.database, catalog: tab.catalog });
@@ -2502,6 +2549,11 @@ async function handleKeydown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     contentAreaRef.value?.refreshData();
+    return;
+  }
+  if (isToggleResultsPaneShortcut(e, shortcuts) && contentAreaRef.value?.toggleResultsPane()) {
+    e.preventDefault();
+    e.stopPropagation();
     return;
   }
   if (isNewQueryShortcut(e, shortcuts)) {

@@ -147,6 +147,50 @@ describe("AI assistant clear/switch cancels an in-flight request (issue #5941, P
     const sessionResetIdx = finallyBody.indexOf('currentSessionId.value = "";');
     expect(isGeneratingIdx).toBeGreaterThan(guardIdx);
     expect(sessionResetIdx).toBeGreaterThan(guardIdx);
+    // Issue #6743 feature 1 dual-path reset: the normal-completion path must stop
+    // the 1s status timer and clear the generation-status ref inside the guarded
+    // finally (the abandon path clears it via resetPendingRequestState()).
+    expect(finallyBody.indexOf("stopStatusTimer();")).toBeGreaterThan(guardIdx);
+    expect(finallyBody.indexOf("generationStatus.value = createGenerationStatus(Date.now());")).toBeGreaterThan(guardIdx);
+  });
+
+  it("the generation-status line exposes a screen-reader live region (role=status) that excludes ticking numerals", () => {
+    // Issue #6743 feature 1 a11y: async execution-state updates must be
+    // announced. The status block (data-ai-generation-status) must contain a
+    // role="status" live region fed by `statusLiveAnnouncement` — which, unlike
+    // the visible `statusText`, omits the per-second elapsed/idle numerals so a
+    // screen reader hears discrete state changes, not a timer ticking every 1s.
+    const statusBlockStart = source.indexOf("data-ai-generation-status");
+    expect(statusBlockStart).toBeGreaterThanOrEqual(0);
+    const block = source.slice(statusBlockStart);
+    expect(block).toContain('role="status"');
+    expect(block).toContain('aria-live="polite"');
+    expect(block).toContain('aria-atomic="true"');
+    expect(block).toContain("statusLiveAnnouncement");
+    expect(block).toContain('class="sr-only"');
+  });
+
+  it("the generation-status line hides once the generation is finished (agent_end) even before isGenerating clears", () => {
+    // Issue #6743 fix: agent_end/error arrive via the event callback before
+    // runAgentStream()'s promise resolves (CLI teardown / SSE close can take
+    // seconds), so the status line must ALSO be gated on phase !== 'finished' —
+    // otherwise it lingers below the completed reply showing a reset "0s".
+    const statusLineIdx = source.indexOf("data-ai-generation-status");
+    expect(statusLineIdx).toBeGreaterThanOrEqual(0);
+    const lineStart = source.lastIndexOf("\n", statusLineIdx) + 1;
+    const lineEnd = source.indexOf("\n", statusLineIdx);
+    const openingTag = source.slice(lineStart, lineEnd);
+    expect(openingTag).toContain("generationStatus.phase !== 'finished'");
+    expect(openingTag).toContain("data-ai-generation-status");
+  });
+
+  it("the >60s long-running hint is hidden once the generation is finished", () => {
+    // Fix keeps startedAt on the finished phase, so the hint must not reappear
+    // under a completed reply during the isGenerating-still-true gap.
+    const idx = source.indexOf("const statusLongRunningHintVisible");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const line = source.slice(idx, source.indexOf("\n", idx));
+    expect(line).toContain('"finished"');
   });
 
   // The three gaps below were called out on review of PR #6332: the generation guard
@@ -224,6 +268,12 @@ describe("AI assistant clear/switch cancels an in-flight request (issue #5941, P
     // compaction summary into the NEW conversation's transcript in its finally
     // block.
     expect(resetBody).toContain("pendingCompaction.value = null;");
+    // Issue #6743 feature 1: the live generation-status line is per-request
+    // transient state too — the 1s status timer and the status ref must be reset
+    // here, otherwise switching conversations leaks a stale status line (and a
+    // running interval) into the next generation.
+    expect(resetBody).toContain("stopStatusTimer();");
+    expect(resetBody).toContain("generationStatus.value = createGenerationStatus(Date.now());");
 
     const abandonBody = bodyOf("function abandonInFlightRequest(alreadyCancelledSessionId?: string)");
     expect(abandonBody).toContain("resetPendingRequestState();");
@@ -238,5 +288,30 @@ describe("AI assistant clear/switch cancels an in-flight request (issue #5941, P
     // clearMessages()/selectConversation().
     expect(body).toContain("if (isGenerating.value) abandonInFlightRequest();");
     expect(body).not.toContain("cancelStream();");
+  });
+
+  it("agent step cards render a running-tool tail and a computed duration tail", () => {
+    // Issue #6743 (feature-1 gap): per-tool execution time in the agent step cards —
+    // mockup shows a spinner + "执行中…" tail on running steps and `0.8s`/`1.2s` on
+    // completed steps. The step-row template must special-case running tool steps
+    // (spinner icon + executing tail) and completed tool steps (tabular duration).
+    const stepsStart = source.indexOf('v-for="step in msg.agentSteps"');
+    expect(stepsStart, "expected to find the agent-steps v-for in AiAssistant.vue").toBeGreaterThanOrEqual(0);
+    const stepsBlock = source.slice(stepsStart);
+    // Running tool step: spinner leading icon + right-aligned "executing…" tail.
+    expect(stepsBlock).toContain("step.tone === 'active' && step.toolName");
+    expect(stepsBlock).toContain('t("ai.agentSteps.executing")');
+    // Completed tool step: right-aligned tabular duration tail.
+    expect(stepsBlock).toContain("formatToolDurationMs(step.durationMs)");
+  });
+
+  it("the status-line idle branch swaps Clock for Hourglass (mockup alignment)", () => {
+    // Mockup: idle state shows a non-spinning hourglass (spinner animation stops);
+    // only the >60s hint below keeps the Clock. The swap must live in the status
+    // line's spinner/clock slot, not touch the hint.
+    const statusLineIdx = source.indexOf("data-ai-generation-status");
+    expect(statusLineIdx).toBeGreaterThanOrEqual(0);
+    const statusBlock = source.slice(statusLineIdx);
+    expect(statusBlock).toContain("<Hourglass v-else");
   });
 });

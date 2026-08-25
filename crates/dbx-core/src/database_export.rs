@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io::{BufWriter, Write};
 use std::sync::RwLock;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::connection::task_client_session_id;
 use crate::models::connection::DatabaseType;
@@ -16,7 +17,7 @@ use crate::transfer::{
     is_mysql_generated_column_extra, keyset_pagination_sql_with_identifier_quote, quote_identifier,
     quote_postgres_string_literal, wrap_dameng_identity_insert_sql_for_table,
 };
-use crate::types::ObjectSourceKind;
+use crate::types::{ObjectSourceKind, SpatialColumn};
 
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -287,6 +288,10 @@ pub struct ExportedTableSql {
     #[serde(default)]
     pub column_extras: Vec<Option<String>>,
     #[serde(default)]
+    pub spatial_columns: Vec<SpatialColumn>,
+    #[serde(default)]
+    pub spatial_values: Vec<Vec<Option<u32>>>,
+    #[serde(default)]
     pub rows: Vec<Vec<Value>>,
     #[serde(default)]
     pub truncated: bool,
@@ -311,6 +316,10 @@ pub struct BuildExportInsertStatementsOptions {
     pub column_types: Vec<Option<String>>,
     #[serde(default)]
     pub column_extras: Vec<Option<String>>,
+    #[serde(default)]
+    pub spatial_columns: Vec<SpatialColumn>,
+    #[serde(default)]
+    pub spatial_values: Vec<Vec<Option<u32>>>,
     #[serde(default)]
     pub rows: Vec<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,6 +400,9 @@ fn format_export_sql_literal_typed(
         return format_mysql_bit_literal(value);
     }
     if let Some(literal) = format_mysql_spatial_export_literal(value, database_type, column_type) {
+        return literal;
+    }
+    if let Some(literal) = format_xugu_spatial_export_literal(value, database_type, column_type) {
         return literal;
     }
     if is_mysql_compatible_export_literal_target(database_type) {
@@ -831,6 +843,50 @@ pub(crate) fn is_mysql_spatial_export_type(column_type: &str) -> bool {
     )
 }
 
+pub(crate) fn is_xugu_spatial_export_type(column_type: &str) -> bool {
+    let normalized = column_type.trim().to_ascii_lowercase();
+    let base = normalized.split(['(', ':', ' ', '\t', '\n']).next().unwrap_or("").trim();
+    matches!(base, "geometry" | "geography")
+}
+
+/// Xugu returns spatial values as readable WKT/EWKT text. Plain WKT is
+/// accepted by the server, but it cannot carry a non-zero SRID; database
+/// exports therefore select EWKT and replay it through the Xugu constructor.
+/// This branch is intentionally Xugu-only so PostgreSQL/PostGIS and other
+/// dialects retain their existing export behavior.
+pub(crate) fn format_xugu_spatial_export_literal(
+    value: &Value,
+    database_type: Option<DatabaseType>,
+    column_type: Option<&str>,
+) -> Option<String> {
+    format_xugu_spatial_export_literal_with_srid(value, database_type, column_type, None)
+}
+
+fn format_xugu_spatial_export_literal_with_srid(
+    value: &Value,
+    database_type: Option<DatabaseType>,
+    column_type: Option<&str>,
+    srid: Option<u32>,
+) -> Option<String> {
+    if database_type != Some(DatabaseType::Xugu) || !column_type.is_some_and(is_xugu_spatial_export_type) {
+        return None;
+    }
+    if value.is_null() {
+        return Some("NULL".to_string());
+    }
+    let text = value.as_str().map_or_else(|| value.to_string(), ToString::to_string);
+    let trimmed = text.trim_start();
+    if trimmed.len() > 5 && trimmed[..5].eq_ignore_ascii_case("SRID=") {
+        return Some(format!("ST_GeomFromEWKT({})", quote_export_sql_string(&text)));
+    }
+    if let Some(srid) = srid.filter(|srid| *srid != 0) {
+        return Some(format!("ST_GeomFromEWKT({})", quote_export_sql_string(&format!("SRID={srid};{text}"))));
+    }
+    // Xugu accepts a plain WKT string for both GEOMETRY and GEOGRAPHY. Keep
+    // that form for SRID 0/legacy values rather than inventing a constructor.
+    Some(quote_export_sql_string(&text))
+}
+
 /// Database exports encode MySQL spatial cells as `DBX_WKB:<srid>:<hex>` while
 /// reading them. Keeping this marker internal lets the normal JSON row shape
 /// and all non-export query paths continue to expose readable WKT values.
@@ -925,6 +981,31 @@ fn format_export_numeric_literal(value: &Value) -> Option<String> {
     }
 }
 
+fn export_column_type<'a>(
+    column_types: &'a [Option<String>],
+    index: usize,
+    database_type: Option<DatabaseType>,
+    spatial_columns: &HashMap<usize, Option<u32>>,
+) -> Option<&'a str> {
+    column_types.get(index).and_then(|value| value.as_deref()).filter(|value| !value.trim().is_empty()).or_else(|| {
+        (database_type == Some(DatabaseType::Xugu) && spatial_columns.contains_key(&index)).then_some("GEOMETRY")
+    })
+}
+
+fn format_export_sql_literal_typed_with_spatial(
+    value: &Value,
+    database_type: Option<DatabaseType>,
+    column_type: Option<&str>,
+    sqlserver_unicode_string: bool,
+    spatial_srid: Option<u32>,
+) -> String {
+    if let Some(literal) = format_xugu_spatial_export_literal_with_srid(value, database_type, column_type, spatial_srid)
+    {
+        return literal;
+    }
+    format_export_sql_literal_typed(value, database_type, column_type, sqlserver_unicode_string)
+}
+
 fn is_export_numeric_literal(text: &str) -> bool {
     if text.trim() != text || text.is_empty() {
         return false;
@@ -946,12 +1027,14 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
         options.qualified_table_name.as_deref(),
         options.identifier_quote.as_deref(),
     )?;
+    let spatial_columns =
+        options.spatial_columns.iter().map(|column| (column.column_index, column.srid)).collect::<HashMap<_, _>>();
     let insert_columns = options
         .columns
         .iter()
         .enumerate()
         .filter_map(|(index, column)| {
-            let column_type = options.column_types.get(index).and_then(|value| value.as_deref());
+            let column_type = export_column_type(&options.column_types, index, options.database_type, &spatial_columns);
             is_export_insert_column(
                 options.database_type,
                 column,
@@ -1022,7 +1105,7 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
             *row_count = 0;
         };
 
-    for row in options.rows {
+    for (row_index, row) in options.rows.into_iter().enumerate() {
         let mut rendered_row = String::with_capacity(insert_columns.len().saturating_mul(16).saturating_add(2));
         rendered_row.push('(');
         for (column_index, (index, _, sqlserver_unicode_string)) in insert_columns.iter().enumerate() {
@@ -1030,11 +1113,21 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
                 rendered_row.push_str(", ");
             }
             let value = row.get(*index).unwrap_or(&Value::Null);
-            rendered_row.push_str(&format_export_sql_literal_typed(
+            let column_type =
+                export_column_type(&options.column_types, *index, options.database_type, &spatial_columns);
+            let spatial_srid = options
+                .spatial_values
+                .get(row_index)
+                .and_then(|values| values.get(*index))
+                .copied()
+                .flatten()
+                .or_else(|| spatial_columns.get(index).copied().flatten());
+            rendered_row.push_str(&format_export_sql_literal_typed_with_spatial(
                 value,
                 options.database_type,
-                options.column_types.get(*index).and_then(|value| value.as_deref()),
+                column_type,
                 *sqlserver_unicode_string,
+                spatial_srid,
             ));
         }
         rendered_row.push(')');
@@ -1163,6 +1256,8 @@ pub fn build_database_sql_export(options: BuildDatabaseSqlExportOptions) -> Resu
             columns: table.columns,
             column_types: table.column_types,
             column_extras: table.column_extras,
+            spatial_columns: table.spatial_columns,
+            spatial_values: table.spatial_values,
             rows: table.rows,
             batch_size: Some(insert_batch_size),
         })?;
@@ -1486,6 +1581,46 @@ where
     }
 }
 
+fn snapshot_batch_cancelled(db_type: &DatabaseType, export_id: &str) -> bool {
+    *db_type != DatabaseType::Postgres && is_export_cancelled_now(export_id)
+}
+
+/// Unlike metadata operations, a database row stream owns a live server query
+/// and transaction cleanup. Signal its cancellation token, then keep polling
+/// the future until that cleanup finishes before reporting Export cancelled.
+async fn await_export_stream_operation<T, F>(
+    export_id: &str,
+    cancel_token: &CancellationToken,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::pin!(operation);
+    loop {
+        if is_export_cancelled_now(export_id) {
+            cancel_token.cancel();
+            if let Err(error) = operation.await {
+                if error.contains("Transaction cleanup failed") || error.contains("stream cleanup timed out") {
+                    log::warn!("[database-export] cancellation cleanup was incomplete export_id={export_id}: {error}");
+                }
+            }
+            return Err(EXPORT_CANCELLED_ERROR.to_string());
+        }
+        tokio::select! {
+            biased;
+            result = &mut operation => {
+                return if is_export_cancelled_now(export_id) {
+                    Err(EXPORT_CANCELLED_ERROR.to_string())
+                } else {
+                    result
+                };
+            },
+            _ = tokio::time::sleep(EXPORT_CANCEL_POLL_INTERVAL) => {}
+        }
+    }
+}
+
 pub async fn begin_database_backup_snapshot_core(
     state: &crate::connection::AppState,
     connection_id: &str,
@@ -1586,6 +1721,11 @@ fn database_export_select_list(columns: &[String], column_types: &[Option<String
                 && column_types.get(index).and_then(|value| value.as_deref()).is_some_and(is_mysql_spatial_export_type)
             {
                 mysql_spatial_export_marker_expression(column)
+            } else if *db_type == DatabaseType::Xugu
+                && column_types.get(index).and_then(|value| value.as_deref()).is_some_and(is_xugu_spatial_export_type)
+            {
+                let quoted = quote_identifier(column, db_type);
+                format!("ST_AsEWKT({quoted}) AS {quoted}")
             } else {
                 quote_identifier(column, db_type)
             }
@@ -1608,7 +1748,7 @@ pub(crate) fn replace_database_export_select_list(
     let prefix = format!("SELECT {original}");
     if !sql.starts_with(&prefix) {
         log::warn!(
-            "MySQL spatial database export could not replace its SELECT list; geometry columns will be exported as WKT"
+            "Spatial database export could not replace its SELECT list; geometry columns may lose SRID metadata"
         );
         return sql;
     }
@@ -1694,6 +1834,8 @@ fn write_database_export_rows<W: Write>(
         columns: insert_columns.to_vec(),
         column_types: insert_column_types.to_vec(),
         column_extras: insert_column_extras.to_vec(),
+        spatial_columns: Vec::new(),
+        spatial_values: Vec::new(),
         rows: insert_rows.to_vec(),
         batch_size: Some(DATABASE_EXPORT_INSERT_BATCH_SIZE),
     })?;
@@ -2508,39 +2650,48 @@ async fn export_database_sql_core_inner(
             if !col_names.is_empty() {
                 if let Some(snapshot_session_id) = request.snapshot_session_id.as_deref() {
                     let sql = database_export_select_sql(&col_names, &col_types, table_name, &request.schema, &db_type);
-                    crate::query::stream_rows_in_manual_transaction(
-                        state,
-                        snapshot_session_id,
-                        &sql,
-                        batch_size,
-                        |rows| {
-                            if is_export_cancelled_now(&request.export_id) {
-                                return Err("Export cancelled".to_string());
-                            }
-                            write_database_export_rows(
-                                &mut file,
-                                &rows,
-                                &col_names,
-                                &col_types,
-                                &col_extras,
-                                table_name,
-                                &request.schema,
-                                &db_type,
-                            )?;
-                            total_rows_exported += rows.len() as u64;
-                            on_progress(ExportProgress {
-                                export_id: request.export_id.clone(),
-                                current_object: table_name.clone(),
-                                object_index,
-                                total_objects,
-                                rows_exported: total_rows_exported,
-                                total_rows: None,
-                                status: ExportStatus::Running,
-                                error: None,
-                                preparing: false,
-                            });
-                            Ok(())
-                        },
+                    let cancel_token = CancellationToken::new();
+                    await_export_stream_operation(
+                        &request.export_id,
+                        &cancel_token,
+                        crate::query::stream_rows_in_manual_transaction_with_cancel(
+                            state,
+                            snapshot_session_id,
+                            &sql,
+                            batch_size,
+                            Some(cancel_token.clone()),
+                            |rows| {
+                                // PostgreSQL cancellation must unwind through its CancelRequest path so the
+                                // connection reaches ReadyForQuery before rollback. Other snapshot streams do
+                                // not consume the token yet, so retain their existing next-batch cancellation.
+                                if snapshot_batch_cancelled(&db_type, &request.export_id) {
+                                    return Err(EXPORT_CANCELLED_ERROR.to_string());
+                                }
+                                write_database_export_rows(
+                                    &mut file,
+                                    &rows,
+                                    &col_names,
+                                    &col_types,
+                                    &col_extras,
+                                    table_name,
+                                    &request.schema,
+                                    &db_type,
+                                )?;
+                                total_rows_exported += rows.len() as u64;
+                                on_progress(ExportProgress {
+                                    export_id: request.export_id.clone(),
+                                    current_object: table_name.clone(),
+                                    object_index,
+                                    total_objects,
+                                    rows_exported: total_rows_exported,
+                                    total_rows: None,
+                                    status: ExportStatus::Running,
+                                    error: None,
+                                    preparing: false,
+                                });
+                                Ok(())
+                            },
+                        ),
                     )
                     .await?;
                 } else {
@@ -2907,30 +3058,37 @@ fn build_database_export_object_source_sql(
 #[cfg(test)]
 mod tests {
     use super::{
-        await_export_operation, clear_export_cancelled, concurrent_metadata_prefetch_allowed,
-        database_export_metadata_prefetch_concurrency, emit_database_export_cancelled, set_export_cancelled,
-        ExportStatus, EXPORT_CANCELLED_ERROR,
+        await_export_operation, await_export_stream_operation, clear_export_cancelled,
+        concurrent_metadata_prefetch_allowed, database_export_metadata_prefetch_concurrency,
+        emit_database_export_cancelled, set_export_cancelled, snapshot_batch_cancelled, ExportStatus,
+        EXPORT_CANCELLED_ERROR,
     };
     use super::{
         build_database_export_object_source_sql, build_database_sql_export, build_export_insert_statements,
         database_export_select_sql, database_export_total_objects, drop_table_if_exists_sql,
         ensure_export_destination_dir, export_destination_identity_mismatch, filter_export_table_infos,
         format_export_sql_literal, format_export_table_ddl, format_mysql_spatial_export_literal,
-        generate_postgres_extension_ddl, generate_postgres_sequence_create_ddl, generate_postgres_sequence_owner_ddl,
-        generate_postgres_sequence_setval_sql, is_postgres_extension_member_routine, mysql_database_export_preamble,
-        mysql_view_dependencies_from_rows, mysql_view_dependencies_sql, normalize_export_table_ddl,
-        record_export_destination_identity, record_export_error, replace_database_export_select_list,
-        sort_export_views_by_dependencies, split_postgres_export_table_triggers, write_database_export_rows,
-        BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, DatabaseExportObjectCounts,
-        DatabaseExportRequest, DdlNormalizeOptions, ExportedTableSql, PostgresExportExtension, PostgresExportSequence,
-        PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
+        format_xugu_spatial_export_literal, generate_postgres_extension_ddl, generate_postgres_sequence_create_ddl,
+        generate_postgres_sequence_owner_ddl, generate_postgres_sequence_setval_sql,
+        is_postgres_extension_member_routine, mysql_database_export_preamble, mysql_view_dependencies_from_rows,
+        mysql_view_dependencies_sql, normalize_export_table_ddl, record_export_destination_identity,
+        record_export_error, replace_database_export_select_list, sort_export_views_by_dependencies,
+        split_postgres_export_table_triggers, write_database_export_rows, BuildDatabaseSqlExportOptions,
+        BuildExportInsertStatementsOptions, DatabaseExportObjectCounts, DatabaseExportRequest, DdlNormalizeOptions,
+        ExportedTableSql, PostgresExportExtension, PostgresExportSequence, PostgresExtensionMembers,
+        DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
     };
     use crate::connection::AppState;
     use crate::models::connection::DatabaseType;
     use crate::storage::Storage;
+    use crate::types::SpatialColumn;
     use crate::types::{ObjectInfo, ObjectSourceKind, TableInfo};
     use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn await_export_operation_drops_pending_metadata_after_cancel() {
@@ -2961,6 +3119,74 @@ mod tests {
         clear_export_cancelled(&export_id).await;
         let result = await_export_operation(&export_id, async { Ok::<_, String>(42_u32) }).await;
         assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_signals_cancel_and_waits_for_cleanup() {
+        let export_id = format!("cancel-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+        let stream_cancel_token = cancel_token.clone();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_after_cancel = cleaned.clone();
+        let task_export_id = export_id.clone();
+        let task = tokio::spawn(async move {
+            await_export_stream_operation(&task_export_id, &cancel_token, async move {
+                stream_cancel_token.cancelled().await;
+                cleaned_after_cancel.store(true, Ordering::SeqCst);
+                Err::<(), _>(crate::query::QUERY_CANCELED.to_string())
+            })
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        set_export_cancelled(&export_id).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("export stream cancellation should finish cleanup")
+            .expect("cancellation task should not panic");
+
+        assert_eq!(result, Err(EXPORT_CANCELLED_ERROR.to_string()));
+        assert!(cleaned.load(Ordering::SeqCst));
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_prioritizes_existing_cancel_over_completion() {
+        let export_id = format!("cancel-ready-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        set_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+
+        let result = await_export_stream_operation(&export_id, &cancel_token, async { Ok::<_, String>(42) }).await;
+
+        assert_eq!(result, Err(EXPORT_CANCELLED_ERROR.to_string()));
+        assert!(cancel_token.is_cancelled());
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_preserves_normal_completion() {
+        let export_id = format!("complete-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+
+        let result = await_export_stream_operation(&export_id, &cancel_token, async { Ok::<_, String>(42) }).await;
+
+        assert_eq!(result, Ok(42));
+        assert!(!cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn non_postgres_snapshot_batches_keep_existing_cancel_check() {
+        let export_id = format!("cancel-non-postgres-batch-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        set_export_cancelled(&export_id).await;
+
+        assert!(snapshot_batch_cancelled(&DatabaseType::Mysql, &export_id));
+        assert!(!snapshot_batch_cancelled(&DatabaseType::Postgres, &export_id));
+
+        clear_export_cancelled(&export_id).await;
     }
 
     #[test]
@@ -3318,6 +3544,8 @@ mod tests {
             columns: vec!["location".to_string(), "shape".to_string()],
             column_types: vec![Some("point".to_string()), Some("geometry".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![
                 json!("DBX_WKB:4326:0101000000AE47E17A14AE5C4052B81E85EBF34240"),
                 json!("DBX_WKB:0:0101000000000000000000F03F0000000000000040"),
@@ -3386,6 +3614,85 @@ mod tests {
     }
 
     #[test]
+    fn xugu_spatial_export_selects_ewkt_to_preserve_srid() {
+        let sql = database_export_select_sql(
+            &["id".to_string(), "shape".to_string(), "location".to_string(), "name".to_string()],
+            &[
+                Some("INTEGER".to_string()),
+                Some("GEOMETRY".to_string()),
+                Some("GEOGRAPHY".to_string()),
+                Some("VARCHAR(32)".to_string()),
+            ],
+            "places",
+            "app",
+            &DatabaseType::Xugu,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT \"id\", ST_AsEWKT(\"shape\") AS \"shape\", ST_AsEWKT(\"location\") AS \"location\", \"name\" FROM \"app\".\"places\""
+        );
+    }
+
+    #[test]
+    fn xugu_spatial_export_replays_ewkt_and_keeps_plain_wkt_compatible() {
+        assert_eq!(
+            format_xugu_spatial_export_literal(
+                &json!("SRID=3857;POINT(1 2)"),
+                Some(DatabaseType::Xugu),
+                Some("GEOMETRY"),
+            ),
+            Some("ST_GeomFromEWKT('SRID=3857;POINT(1 2)')".to_string())
+        );
+        assert_eq!(
+            format_xugu_spatial_export_literal(&json!("POINT(1 2)"), Some(DatabaseType::Xugu), Some("GEOGRAPHY"),),
+            Some("'POINT(1 2)'".to_string())
+        );
+        assert_eq!(
+            format_xugu_spatial_export_literal(&Value::Null, Some(DatabaseType::Xugu), Some("GEOMETRY")),
+            Some("NULL".to_string())
+        );
+        assert!(format_xugu_spatial_export_literal(
+            &json!("SRID=3857;POINT(1 2)"),
+            Some(DatabaseType::Xugu),
+            Some("VARCHAR")
+        )
+        .is_none());
+        assert!(format_xugu_spatial_export_literal(
+            &json!("SRID=3857;POINT(1 2)"),
+            Some(DatabaseType::Postgres),
+            Some("GEOMETRY")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn xugu_spatial_metadata_recovers_missing_type_and_cell_srid() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Xugu),
+            identifier_quote: None,
+            schema: Some("app".to_string()),
+            table_name: Some("places".to_string()),
+            qualified_table_name: None,
+            columns: vec!["shape".to_string()],
+            column_types: vec![None],
+            column_extras: vec![None],
+            spatial_columns: vec![SpatialColumn { column_index: 0, srid: Some(3857) }],
+            spatial_values: vec![vec![Some(3857)]],
+            rows: vec![vec![json!("POINT(1 2)")]],
+            batch_size: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                r#"INSERT INTO "app"."places" ("shape") VALUES (ST_GeomFromEWKT('SRID=3857;POINT(1 2)'));"#.to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn database_specific_boolean_export_literals() {
         let sqlserver_statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::SqlServer),
@@ -3396,6 +3703,8 @@ mod tests {
             columns: vec!["typed_true".to_string(), "untyped_false".to_string(), "typed_null".to_string()],
             column_types: vec![Some("bit".to_string()), None, Some("bit".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(true), json!(false), Value::Null]],
             batch_size: Some(10),
         })
@@ -3409,6 +3718,8 @@ mod tests {
             columns: vec!["enabled".to_string(), "disabled".to_string(), "unknown".to_string()],
             column_types: Vec::new(),
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(true), json!(false), Value::Null]],
             batch_size: Some(10),
         })
@@ -3451,6 +3762,8 @@ mod tests {
                 Some("nvarchar(20)".to_string()),
             ],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![
                 json!("张'三"),
                 json!("中文"),
@@ -3482,6 +3795,8 @@ mod tests {
             columns: vec!["body".to_string()],
             column_types: vec![Some("text".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("line1\nline2\tcol\rend\\slash\0\x1aO'Hara")]],
             batch_size: Some(10),
         })
@@ -3505,6 +3820,8 @@ mod tests {
             columns: vec!["payload".to_string()],
             column_types: vec![Some("longtext".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(long_value.clone())], vec![json!(long_value)]],
             batch_size: Some(100),
         })
@@ -3525,6 +3842,8 @@ mod tests {
             columns: vec!["id".to_string()],
             column_types: vec![Some("int".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: (0..1001).map(|id| vec![json!(id)]).collect(),
             batch_size: Some(2000),
         })
@@ -3546,6 +3865,8 @@ mod tests {
             columns: vec!["message".to_string()],
             column_types: vec![Some("varchar(255)".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("first\nsecond\tthird")]],
             batch_size: Some(10),
         })
@@ -3565,6 +3886,8 @@ mod tests {
             columns: vec!["body".to_string()],
             column_types: vec![Some("text".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("line1\nline2\tend")]],
             batch_size: Some(10),
         })
@@ -3589,6 +3912,8 @@ mod tests {
                 Some("text".to_string()),
             ],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("line1\rline2"), json!("O'Hara"), json!(r"C:\tmp"), json!("plain")]],
             batch_size: Some(10),
         })
@@ -3613,6 +3938,8 @@ mod tests {
             columns: vec!["payload".to_string()],
             column_types: vec![Some("jsonb".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(r#"{"text":"say \"hi\"","path":"C:\\tmp","quote":"O'Hara"}"#)]],
             batch_size: Some(10),
         })
@@ -3647,6 +3974,8 @@ mod tests {
                 Some("text[]".to_string()),
             ],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(1), json!([1.2, 3.4]), json!(["5", "6"]), json!(["x", "y"])]],
             batch_size: Some(10),
         })
@@ -3671,6 +4000,8 @@ mod tests {
             columns: vec!["id".to_string(), "name".to_string()],
             column_types: Vec::new(),
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("O'Hara")], vec![json!(3), json!("Linus")]],
             batch_size: Some(2),
         })
@@ -3696,6 +4027,8 @@ mod tests {
             columns: vec!["ID".to_string(), "NAME".to_string()],
             column_types: Vec::new(),
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("Linus")]],
             batch_size: Some(100),
         })
@@ -3721,6 +4054,8 @@ mod tests {
             columns: vec!["__DBX_ROWID".to_string(), "ID".to_string(), "NAME".to_string()],
             column_types: vec![Some("VARCHAR2".to_string()), Some("NUMBER".to_string()), Some("VARCHAR2".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("AAAPr9AAEAAAAGfAAA"), json!(1), json!("Ada")]],
             batch_size: Some(100),
         })
@@ -3740,6 +4075,8 @@ mod tests {
             columns: vec!["__DBX_ROWID".to_string(), "ID".to_string(), "NAME".to_string()],
             column_types: vec![Some("VARCHAR2".to_string()), Some("NUMBER".to_string()), Some("VARCHAR2".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("*AAABk1AAEAAAAAgAAA"), json!(1), json!("Ada")]],
             batch_size: Some(100),
         })
@@ -3759,6 +4096,8 @@ mod tests {
             columns: vec!["__DBX_ROWID".to_string(), "name".to_string()],
             column_types: Vec::new(),
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(7), json!("Ada")]],
             batch_size: Some(100),
         })
@@ -3778,6 +4117,8 @@ mod tests {
             columns: vec!["ID".to_string(), "CREATED_ON".to_string(), "RAW_TEXT".to_string()],
             column_types: vec![Some("NUMBER".to_string()), Some("DATE".to_string()), Some("VARCHAR2(64)".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![
                 vec![json!(1), json!("2022-08-25T09:58:43Z"), json!("2022-08-25T09:58:43Z")],
                 vec![json!(2), json!("2022-08-25T00:00:00Z"), json!("2022-08-25T00:00:00Z")],
@@ -3831,6 +4172,8 @@ mod tests {
                     Some("TIMESTAMP".to_string()),
                 ],
                 column_extras: Vec::new(),
+                spatial_columns: Vec::new(),
+                spatial_values: Vec::new(),
                 rows: vec![vec![
                     json!("2022-08-25 09:58:43.123456"),
                     json!("2022-08-26T10:59:44Z"),
@@ -3879,6 +4222,8 @@ mod tests {
             columns: vec!["created_at".to_string(), "recorded_at".to_string()],
             column_types: vec![Some("timestamp".to_string()), Some("timestamp with time zone".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("2022-08-25T09:58:43.123456Z"), json!("2022-08-26T10:59:44+08:00")]],
             batch_size: Some(100),
         })
@@ -3904,6 +4249,8 @@ mod tests {
             columns: vec!["enabled".to_string(), "mask".to_string(), "label".to_string()],
             column_types: vec![Some("bit(1)".to_string()), Some("BIT(4)".to_string()), Some("varchar(20)".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("1"), json!("1010"), json!("1010")], vec![json!(false), json!(3), json!("off")]],
             batch_size: Some(10),
         })
@@ -3926,6 +4273,8 @@ mod tests {
             columns: vec!["ENABLED".to_string(), "DELETED".to_string(), "OPTIONAL".to_string()],
             column_types: vec![Some("BIT".to_string()), Some("bit".to_string()), Some("BIT".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(true), json!(false), Value::Null]],
             batch_size: Some(10),
         })
@@ -3955,6 +4304,8 @@ mod tests {
             ],
             column_types: vec![Some("VARCHAR".to_string()); 6],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![
                 json!("plain"),
                 json!("eHall\0"),
@@ -3990,6 +4341,8 @@ mod tests {
             columns: vec!["id".to_string(), "f_blob".to_string(), "note".to_string()],
             column_types: vec![Some("int".to_string()), Some("blob".to_string()), Some("varchar(64)".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![
                 vec![json!("1"), json!("0x68656c6c6f"), json!("0x68656c6c6f")],
                 vec![json!("2"), json!("0X"), json!("1")],
@@ -4022,6 +4375,8 @@ mod tests {
                 Some("varchar(64)".to_string()),
             ],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![
                 json!(1),
                 json!("2026-06-12T10:11:12.123456789Z"),
@@ -4054,6 +4409,8 @@ mod tests {
                 Some("timestamp without time zone".to_string()),
             ],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("2026-06-12T10:11:12Z"), json!("2026-06-12T18:11:12+08:00")]],
             batch_size: Some(10),
         })
@@ -4078,6 +4435,8 @@ mod tests {
             columns: vec!["row_version".to_string(), "created_at".to_string()],
             column_types: vec![Some("timestamp".to_string()), Some("datetime2(3)".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!("2026-06-12T10:11:12Z"), json!("2026-06-12T10:11:12.1234567Z")]],
             batch_size: Some(10),
         })
@@ -4102,6 +4461,8 @@ mod tests {
             columns: vec!["id".to_string(), "title".to_string(), "search_vector".to_string()],
             column_types: vec![Some("integer".to_string()), Some("text".to_string()), Some("tsvector".to_string())],
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(1), json!("Hello"), json!("'hello':1A")]],
             batch_size: Some(10),
         })
@@ -4148,6 +4509,8 @@ mod tests {
                     Some("stored generated".to_string()),
                     Some("DEFAULT_GENERATED".to_string()),
                 ],
+                spatial_columns: Vec::new(),
+                spatial_values: Vec::new(),
                 rows: vec![vec![json!(7), json!(2), json!(3.5), json!(7.0), json!(7.0), json!("2026-07-30 08:00:00")]],
                 truncated: false,
             }],
@@ -4213,6 +4576,8 @@ mod tests {
             columns: vec!["ID".to_string(), "NAME".to_string()],
             column_types: vec![Some("INT".to_string()), Some("VARCHAR(20)".to_string())],
             column_extras: vec![Some("identity".to_string()), None],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(1), json!("Ada")]],
             batch_size: Some(10),
         })
@@ -4242,6 +4607,8 @@ mod tests {
                 columns: vec!["id".to_string()],
                 column_types: Vec::new(),
                 column_extras: Vec::new(),
+                spatial_columns: Vec::new(),
+                spatial_values: Vec::new(),
                 rows: vec![vec![json!(1)]],
                 truncated: true,
             }],
@@ -4598,6 +4965,8 @@ mod tests {
             columns: vec!["id".to_string(), "event_type".to_string()],
             column_types: vec![None, None],
             column_extras: vec![None, None],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(1), json!("login")]],
             batch_size: Some(100),
         })

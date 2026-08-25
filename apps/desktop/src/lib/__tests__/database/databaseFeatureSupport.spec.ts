@@ -91,9 +91,11 @@ describe("supportsTransaction", () => {
     expect(supportsTransaction("postgres")).toBe(true);
     expect(supportsTransaction("mysql")).toBe(true);
     expect(supportsTransaction("oracle")).toBe(true);
+    expect(supportsTransaction("jdbc")).toBe(true);
   });
 
   it("returns false for unsupported database types", () => {
+    expect(supportsTransaction("oceanbase-oracle")).toBe(false);
     expect(supportsTransaction("redis")).toBe(false);
     expect(supportsTransaction("mongodb")).toBe(false);
     expect(supportsTransaction("duckdb")).toBe(false);
@@ -114,11 +116,9 @@ describe("supportsTransaction", () => {
 });
 
 describe("defaultAutoCommitForDbType", () => {
-  it("defaults Oracle query tabs to manual transactions", () => {
-    expect(defaultAutoCommitForDbType("oracle")).toBe(false);
-  });
-
-  it("defaults other databases to auto-commit", () => {
+  it("defaults query tabs to auto-commit", () => {
+    expect(defaultAutoCommitForDbType("oceanbase-oracle")).toBe(true);
+    expect(defaultAutoCommitForDbType("oracle")).toBe(true);
     expect(defaultAutoCommitForDbType("mysql")).toBe(true);
     expect(defaultAutoCommitForDbType("postgres")).toBe(true);
     expect(defaultAutoCommitForDbType("dameng")).toBe(true);

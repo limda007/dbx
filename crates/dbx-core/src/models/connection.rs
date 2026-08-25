@@ -866,6 +866,15 @@ impl ConnectionConfig {
             })
     }
 
+    fn enables_cleartext_mysql_auth_by_default(&self) -> bool {
+        matches!(self.db_type, DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch)
+            || self
+                .driver_profile
+                .as_deref()
+                .map(|p| p.to_lowercase())
+                .is_some_and(|p| matches!(p.as_str(), "doris" | "selectdb" | "starrocks" | "manticoresearch"))
+    }
+
     pub fn is_starrocks(&self) -> bool {
         self.db_type == DatabaseType::StarRocks
             || self.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("starrocks"))
@@ -1457,23 +1466,16 @@ impl ConnectionConfig {
 
     fn normalized_url_params(&self) -> String {
         let value = self.url_params.as_deref().unwrap_or("").trim();
-        if self.needs_bare_mysql() {
-            if self.bare_mysql_uses_tls() {
-                return normalize_mysql_url_params(value, true, self.ca_cert_path.trim().is_empty());
-            }
-            return normalize_bare_mysql_url_params(value);
-        }
         match self.db_type {
             DatabaseType::Mysql => {
-                normalize_mysql_url_params(value, self.mysql_uses_tls(), self.ca_cert_path.trim().is_empty())
+                if self.needs_bare_mysql() {
+                    self.normalized_bare_mysql_url_params(value)
+                } else {
+                    normalize_mysql_url_params(value, self.mysql_uses_tls(), self.ca_cert_path.trim().is_empty())
+                }
             }
             DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch => {
-                let params = normalize_bare_mysql_url_params(value);
-                if params.is_empty() {
-                    "enable_cleartext_plugin=true".to_string()
-                } else {
-                    format!("{params}&enable_cleartext_plugin=true")
-                }
+                self.normalized_bare_mysql_url_params(value)
             }
             DatabaseType::Databend => normalize_bare_mysql_url_params(value),
             DatabaseType::Postgres | DatabaseType::Redshift => normalize_postgres_url_params(value, self.ssl),
@@ -1481,6 +1483,19 @@ impl ConnectionConfig {
                 normalize_mongo_url_params(value, self.ssl, !self.username.trim().is_empty(), self.ca_cert_path.trim())
             }
             _ => value.trim_start_matches('?').to_string(),
+        }
+    }
+
+    fn normalized_bare_mysql_url_params(&self, value: &str) -> String {
+        let params = if self.bare_mysql_uses_tls() {
+            normalize_mysql_url_params(value, true, self.ca_cert_path.trim().is_empty())
+        } else {
+            normalize_bare_mysql_url_params(value)
+        };
+        if self.enables_cleartext_mysql_auth_by_default() {
+            enable_mysql_cleartext_password_auth(params)
+        } else {
+            params
         }
     }
 
@@ -1746,6 +1761,20 @@ fn normalize_bare_mysql_url_params(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("&")
+}
+
+fn enable_mysql_cleartext_password_auth(params: String) -> String {
+    let mut parts = params
+        .split('&')
+        .filter(|part| {
+            !part.is_empty()
+                && !url_param_key_is(part, "allowCleartextPasswords")
+                && !url_param_key_is(part, "enable_cleartext_plugin")
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    parts.push("enable_cleartext_plugin=true".to_string());
+    parts.join("&")
 }
 
 fn is_mysql_cleartext_password_param(key: &str) -> bool {
@@ -3133,6 +3162,77 @@ mod tests {
     }
 
     #[test]
+    fn doris_database_type_enables_cleartext_password_auth_for_direct_and_tunneled_urls() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.db_type = DatabaseType::Doris;
+        config.port = 9030;
+
+        let direct_url = config.connection_url();
+        assert_eq!(direct_url, "mysql://root:secret@10.1.2.3:9030/analytics?enable_cleartext_plugin=true");
+        assert!(mysql_async::Opts::from_url(&direct_url).unwrap().enable_cleartext_plugin());
+        assert_eq!(
+            config.connection_url_with_host("127.0.0.1", 19030),
+            "mysql://root:secret@127.0.0.1:19030/analytics?enable_cleartext_plugin=true"
+        );
+    }
+
+    #[test]
+    fn doris_family_database_types_and_profiles_enable_cleartext_password_auth() {
+        for profile in ["doris", "selectdb", "starrocks", "manticoresearch"] {
+            let mut config = mysql_config("root", "secret", Some("analytics"));
+            config.driver_profile = Some(profile.to_string());
+            config.port = 9030;
+
+            assert_eq!(
+                config.connection_url(),
+                "mysql://root:secret@10.1.2.3:9030/analytics?enable_cleartext_plugin=true",
+                "profile {profile}"
+            );
+        }
+
+        for (db_type, port) in
+            [(DatabaseType::Doris, 9030), (DatabaseType::StarRocks, 9030), (DatabaseType::ManticoreSearch, 9306)]
+        {
+            let mut config = mysql_config("root", "secret", Some("analytics"));
+            config.db_type = db_type;
+            config.port = port;
+
+            assert_eq!(
+                config.connection_url(),
+                format!("mysql://root:secret@10.1.2.3:{port}/analytics?enable_cleartext_plugin=true")
+            );
+        }
+    }
+
+    #[test]
+    fn doris_family_cleartext_password_auth_is_canonical() {
+        let mut config = mysql_config("root", "secret", Some("analytics"));
+        config.driver_profile = Some("doris".to_string());
+        config.url_params = Some(
+            "charset=utf8mb4&allowCleartextPasswords=false&enable_cleartext_plugin=false&connect_timeout=10&enable_cleartext_plugin=true"
+                .to_string(),
+        );
+
+        assert_eq!(
+            config.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/analytics?connect_timeout=10&enable_cleartext_plugin=true"
+        );
+    }
+
+    #[test]
+    fn doris_family_cleartext_password_auth_does_not_change_other_mysql_profiles() {
+        let mysql = mysql_config("root", "secret", Some("analytics"));
+        assert_eq!(
+            mysql.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/analytics?ssl-mode=disabled&charset=utf8mb4"
+        );
+
+        let mut oceanbase = mysql_config("root", "secret", Some("analytics"));
+        oceanbase.driver_profile = Some("oceanbase".to_string());
+        assert_eq!(oceanbase.connection_url(), "mysql://root:secret@10.1.2.3:2883/analytics");
+    }
+
+    #[test]
     fn starrocks_profile_omits_mysql_ssl_mode_param_when_tls_disabled() {
         let mut config = mysql_config("root", "secret", Some("analytics"));
         config.driver_profile = Some("starrocks".to_string());
@@ -3143,7 +3243,7 @@ mod tests {
 
         assert!(config.needs_bare_mysql());
         assert!(!config.bare_mysql_uses_tls());
-        assert_eq!(config.connection_url(), "mysql://root:secret@10.1.2.3:2883/analytics");
+        assert_eq!(config.connection_url(), "mysql://root:secret@10.1.2.3:2883/analytics?enable_cleartext_plugin=true");
     }
 
     #[test]
@@ -3156,7 +3256,7 @@ mod tests {
         assert!(config.bare_mysql_uses_tls());
         assert_eq!(
             config.connection_url(),
-            "mysql://root:secret@10.1.2.3:2883/analytics?require_ssl=true&verify_ca=true&verify_identity=false&charset=utf8mb4"
+            "mysql://root:secret@10.1.2.3:2883/analytics?require_ssl=true&verify_ca=true&verify_identity=false&charset=utf8mb4&enable_cleartext_plugin=true"
         );
     }
 
@@ -3170,7 +3270,7 @@ mod tests {
         assert!(config.bare_mysql_uses_tls());
         assert_eq!(
             config.connection_url(),
-            "mysql://root:secret@10.1.2.3:2883/analytics?require_ssl=true&verify_identity=false&charset=utf8mb4"
+            "mysql://root:secret@10.1.2.3:2883/analytics?require_ssl=true&verify_identity=false&charset=utf8mb4&enable_cleartext_plugin=true"
         );
     }
 
@@ -3182,7 +3282,7 @@ mod tests {
 
         assert_eq!(
             config.connection_url(),
-            "mysql://root:secret@10.1.2.3:2883/analytics?connect_timeout=10&sessionVariables=query_timeout=60"
+            "mysql://root:secret@10.1.2.3:2883/analytics?connect_timeout=10&sessionVariables=query_timeout=60&enable_cleartext_plugin=true"
         );
     }
 

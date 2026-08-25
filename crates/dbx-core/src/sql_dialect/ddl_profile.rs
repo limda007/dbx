@@ -78,6 +78,23 @@ pub enum RenameColumnSyntax {
     SqlServerSpRename,
 }
 
+/// Column DDL that cannot use the generic `ADD COLUMN` / `ALTER COLUMN` forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnDdlSyntax {
+    Generic,
+    /// SQL Server uses `ADD` without `COLUMN`, a full definition for
+    /// `ALTER COLUMN`, and separate default-constraint objects.
+    SqlServer,
+}
+
+/// Standalone table and column comment representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentDdlSyntax {
+    Generic,
+    /// SQL Server stores comments in the `MS_Description` extended property.
+    SqlServerExtendedProperty,
+}
+
 /// DDL generation profile for one [`DatabaseType`].
 #[derive(Debug, Clone, Copy)]
 pub struct DdlDialectProfile {
@@ -108,8 +125,10 @@ pub struct DdlDialectProfile {
     pub table_comment_via_alter: bool,
     /// Standalone column comment SQL is unsupported (MySQL needs MODIFY COLUMN).
     pub column_comment_via_modify_only: bool,
+    pub comment_ddl: CommentDdlSyntax,
     pub trigger_template: TriggerTemplate,
     pub rename_column: RenameColumnSyntax,
+    pub column_ddl: ColumnDdlSyntax,
     /// MySQL `MODIFY COLUMN` vs ANSI `ALTER COLUMN … TYPE/SET`.
     pub alter_uses_modify_column: bool,
     /// Batch multiple alter clauses in one `ALTER TABLE` statement.
@@ -303,8 +322,10 @@ fn mysql_family(db: DatabaseType) -> DdlDialectProfile {
         index_supports_comment: true,
         table_comment_via_alter: true,
         column_comment_via_modify_only: true,
+        comment_ddl: CommentDdlSyntax::Generic,
         trigger_template: TriggerTemplate::MysqlStyle,
         rename_column: RenameColumnSyntax::MysqlChangeColumn,
+        column_ddl: ColumnDdlSyntax::Generic,
         prefers_native_source_ddl: true,
         grant_uses_mysql_user_syntax: true,
         warn_fk_needs_table_rebuild: false,
@@ -346,8 +367,10 @@ fn postgres_family(db: DatabaseType) -> DdlDialectProfile {
         index_supports_comment: false,
         table_comment_via_alter: false,
         column_comment_via_modify_only: false,
+        comment_ddl: CommentDdlSyntax::Generic,
         trigger_template: TriggerTemplate::PostgresStyle,
         rename_column: RenameColumnSyntax::RenameColumn,
+        column_ddl: ColumnDdlSyntax::Generic,
         prefers_native_source_ddl: false,
         grant_uses_mysql_user_syntax: false,
         warn_fk_needs_table_rebuild: false,
@@ -389,8 +412,10 @@ fn oracle_family(db: DatabaseType) -> DdlDialectProfile {
         index_supports_comment: false,
         table_comment_via_alter: false,
         column_comment_via_modify_only: false,
+        comment_ddl: CommentDdlSyntax::Generic,
         trigger_template: TriggerTemplate::GenericRowBody,
         rename_column: RenameColumnSyntax::RenameColumn,
+        column_ddl: ColumnDdlSyntax::Generic,
         prefers_native_source_ddl: false,
         grant_uses_mysql_user_syntax: false,
         warn_fk_needs_table_rebuild: false,
@@ -433,8 +458,10 @@ fn sqlserver_family(db: DatabaseType) -> DdlDialectProfile {
         index_supports_comment: false,
         table_comment_via_alter: false,
         column_comment_via_modify_only: false,
+        comment_ddl: CommentDdlSyntax::SqlServerExtendedProperty,
         trigger_template: TriggerTemplate::SqlServerStyle,
         rename_column: RenameColumnSyntax::SqlServerSpRename,
+        column_ddl: ColumnDdlSyntax::SqlServer,
         prefers_native_source_ddl: false,
         grant_uses_mysql_user_syntax: false,
         warn_fk_needs_table_rebuild: false,
@@ -476,8 +503,10 @@ fn sqlite_family(db: DatabaseType) -> DdlDialectProfile {
         index_supports_comment: false,
         table_comment_via_alter: false,
         column_comment_via_modify_only: false,
+        comment_ddl: CommentDdlSyntax::Generic,
         trigger_template: TriggerTemplate::GenericRowBody,
         rename_column: RenameColumnSyntax::RenameColumn,
+        column_ddl: ColumnDdlSyntax::Generic,
         prefers_native_source_ddl: false,
         grant_uses_mysql_user_syntax: false,
         warn_fk_needs_table_rebuild: true,
@@ -519,8 +548,10 @@ fn access_profile() -> DdlDialectProfile {
         index_supports_comment: false,
         table_comment_via_alter: false,
         column_comment_via_modify_only: false,
+        comment_ddl: CommentDdlSyntax::Generic,
         trigger_template: TriggerTemplate::GenericRowBody,
         rename_column: RenameColumnSyntax::RenameColumn,
+        column_ddl: ColumnDdlSyntax::Generic,
         prefers_native_source_ddl: false,
         grant_uses_mysql_user_syntax: false,
         warn_fk_needs_table_rebuild: false,
@@ -562,8 +593,10 @@ fn h2_profile() -> DdlDialectProfile {
         index_supports_comment: false,
         table_comment_via_alter: false,
         column_comment_via_modify_only: false,
+        comment_ddl: CommentDdlSyntax::Generic,
         trigger_template: TriggerTemplate::GenericRowBody,
         rename_column: RenameColumnSyntax::AlterColumnRenameTo,
+        column_ddl: ColumnDdlSyntax::Generic,
         prefers_native_source_ddl: false,
         grant_uses_mysql_user_syntax: false,
         warn_fk_needs_table_rebuild: false,
@@ -605,8 +638,10 @@ fn conservative_ansi(db: DatabaseType) -> DdlDialectProfile {
         index_supports_comment: false,
         table_comment_via_alter: false,
         column_comment_via_modify_only: false,
+        comment_ddl: CommentDdlSyntax::Generic,
         trigger_template: TriggerTemplate::GenericRowBody,
         rename_column: RenameColumnSyntax::RenameColumn,
+        column_ddl: ColumnDdlSyntax::Generic,
         prefers_native_source_ddl: false,
         grant_uses_mysql_user_syntax: false,
         warn_fk_needs_table_rebuild: false,

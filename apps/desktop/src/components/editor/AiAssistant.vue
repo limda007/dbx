@@ -13,6 +13,8 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Clock,
+  Hourglass,
   CircleSlash,
   Copy,
   Database,
@@ -104,6 +106,7 @@ import {
 import { isAiConfigModelCandidate } from "@/lib/ai/aiConfigCandidates";
 import { deleteConversationWithCancellation, stopAiGenerationWithFallback } from "@/lib/ai/aiConversationLifecycle";
 import { AiGenerationGuard } from "@/lib/ai/aiGenerationGuard";
+import { applyStatusEvent, createGenerationStatus, createStatusTicker, liveAnnouncementText, markCancelling, shouldShowLongRunningHint, statusText, toolLabel, STATUS_IDLE_THRESHOLD_MS, type AiGenerationStatus } from "@/lib/ai/aiGenerationStatus";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { addConfiguredAiModel, aiModelOptions } from "@/lib/ai/aiConfigList";
 import { orderAiConfigsForDisplay } from "@/lib/ai/aiConfigOrdering";
@@ -116,7 +119,7 @@ import { buildAiAgentPlan } from "@/lib/ai/aiAgentPlan";
 import { extractFirstSqlCodeBlock, extractSingleSqlCodeBlock } from "@/lib/ai/aiSqlExecutionPolicy";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import ProductionContextBadge from "@/components/common/ProductionContextBadge.vue";
-import { buildAiAgentStepItems, toolCallStepKey, upsertAgentStep, type AiAgentStepItem, type AiAgentStepTone } from "@/lib/ai/aiAgentStepPresentation";
+import { buildAiAgentStepItems, formatToolDurationMs, toolCallStepKey, upsertAgentStep, type AiAgentStepItem, type AiAgentStepTone } from "@/lib/ai/aiAgentStepPresentation";
 import { createAiShikiCodeHighlighter, type AiCodeHighlighter } from "@/lib/ai/aiCodeHighlighter";
 import { createAiMessageRenderer } from "@/lib/ai/aiMessageRender";
 import { formatAiInlineMarkdown, handleAiMarkdownLinkClick } from "@/lib/ai/aiMarkdown";
@@ -374,6 +377,72 @@ let currentAssistantMessageIndex = -1;
 // to a different conversation. See lib/ai/aiGenerationGuard.ts for why this exists
 // instead of relying on isGenerating/currentSessionId alone.
 const aiGenerationGuard = new AiGenerationGuard();
+
+// Live generation-status line (Issue #6743 feature 1). `generationStatus` is the
+// per-request state machine fed by every `ai-agent-event`; `statusNow` is bumped
+// by the whole-second ticker (`createStatusTicker`, lib/ai/aiGenerationStatus.ts)
+// only when the displayed whole second changes, so `statusText` recomputes
+// elapsed/idle at each real second boundary instead of a fixed 1s interval (a
+// delayed interval tick used to skip values — Math.ceil of a late wall-clock
+// sample — and freeze the display in between). The wall-clock `setTimeout`
+// replaces a per-frame rAF loop that rescheduled ~60×/s while only updating once
+// per second, and keeps ticking while the document is hidden (rAF pauses then).
+// Both refs are per-request transient state and MUST be reset on both the normal
+// `finally` path and `resetPendingRequestState()` (abandon path) — see the
+// dual-path note next to `resetPendingRequestState`.
+const generationStatus = ref<AiGenerationStatus>(createGenerationStatus(Date.now()));
+const statusNow = ref(Date.now());
+/** Last displayed whole second (`Math.ceil((statusNow - startedAt) / 1000)`). */
+let lastStatusSecond = -1;
+
+// Aligned-to-the-next-second ticker. The callback mirrors the old
+// requestAnimationFrame body: write `statusNow` only when the displayed whole
+// second changes, so the display rolls +1s at each real boundary.
+const statusTicker = createStatusTicker((now: number) => {
+  const second = Math.ceil((now - generationStatus.value.startedAt) / 1000);
+  if (second !== lastStatusSecond) {
+    lastStatusSecond = second;
+    statusNow.value = now;
+  }
+});
+
+function startStatusTimer() {
+  const now = Date.now();
+  statusNow.value = now;
+  // Seed the boundary so the ticker writes only when the displayed whole second
+  // changes — the display then rolls +1s within ~a frame of each real boundary
+  // instead of skipping values when a tick is delayed.
+  lastStatusSecond = Math.ceil((now - generationStatus.value.startedAt) / 1000);
+  statusTicker.start(now);
+}
+
+function stopStatusTimer() {
+  statusTicker.stop();
+}
+
+const generationStatusText = computed(() => statusText(generationStatus.value, statusNow.value, t));
+const statusElapsedSeconds = computed(() => Math.max(0, Math.ceil((statusNow.value - generationStatus.value.startedAt) / 1000)));
+const statusIdleSeconds = computed(() => (generationStatus.value.lastEventAt !== undefined ? Math.max(0, Math.ceil((statusNow.value - generationStatus.value.lastEventAt) / 1000)) : 0));
+/** Idle copy branch: an event was seen, but nothing has arrived for over 20s. */
+const generationStatusIdle = computed(() => {
+  const last = generationStatus.value.lastEventAt;
+  return last !== undefined && statusNow.value - last > STATUS_IDLE_THRESHOLD_MS;
+});
+const generationStatusRunningTool = computed(() => generationStatus.value.phase === "running_tool" && !!generationStatus.value.activeTool);
+const statusToolLabel = computed(() => {
+  const tool = generationStatus.value.activeTool;
+  return tool ? toolLabel(tool.name, t) : "";
+});
+const statusTurnBadge = computed(() => (generationStatus.value.turn !== undefined ? t("ai.status.turnBadge", { turn: generationStatus.value.turn + 1 }) : ""));
+/** Gentle >60s hint, hidden while the user is cancelling (they already decided to stop). */
+const statusLongRunningHintVisible = computed(() => generationStatus.value.phase !== "cancelling" && generationStatus.value.phase !== "finalizing" && generationStatus.value.phase !== "finished" && shouldShowLongRunningHint(generationStatus.value, statusNow.value));
+/**
+ * Stable screen-reader announcement for the status line. Fed into a
+ * `role="status"` live region; unlike `generationStatusText` it excludes the
+ * per-second elapsed/idle numerals so screen readers hear discrete state
+ * changes (phase / tool / turn / idle crossing), not a new number every tick.
+ */
+const statusLiveAnnouncement = computed(() => liveAnnouncementText(generationStatus.value, statusNow.value, t));
 
 function startEditMessage(visibleIndex: number) {
   if (isGenerating.value) return;
@@ -906,11 +975,6 @@ function messageTitle(message: ChatMessage): string {
   return [messageMentionLabels(message).join(" "), message.content].filter(Boolean).join(" ") || t("ai.newChat");
 }
 
-const isWaitingForFirstDelta = computed(() => {
-  const last = messages.value[messages.value.length - 1];
-  return isGenerating.value && last?.role === "assistant" && !last.content && !last.reasoning;
-});
-
 /**
  * The last assistant message whose final line looks like an action
  * proposal question. Used to render an inline "Yes / No" confirmation bar
@@ -1230,6 +1294,12 @@ function agentStepClass(tone: AiAgentStepTone): string {
   }
 }
 
+/** True when a step renders a right-aligned tail: a running tool step
+ *  (spinner + "executing") or a completed tool step with a computed duration. */
+function agentStepHasTail(step: AiAgentStepItem): boolean {
+  return (step.tone === "active" && !!step.toolName) || step.durationMs !== undefined;
+}
+
 /** Extract tool result content from the AgentEvent result value */
 function extractToolResultContent(result: unknown): string | undefined {
   if (!result) return undefined;
@@ -1273,7 +1343,7 @@ function parseExplainFromData(explainData: unknown, dbType: string): ParsedExpla
   }
 }
 
-function agentEventToStep(event: AgentEvent, index: number): AiAgentStepItem | undefined {
+function agentEventToStep(event: AgentEvent, index: number, now: number): AiAgentStepItem | undefined {
   if (event.type === "context_compacted") {
     return {
       key: `compact-${index}`,
@@ -1296,6 +1366,7 @@ function agentEventToStep(event: AgentEvent, index: number): AiAgentStepItem | u
       tone: "active",
       toolName: event.tool_name,
       toolArgs: event.args as Record<string, unknown>,
+      startedAtMs: now,
     };
   }
 
@@ -1312,6 +1383,7 @@ function agentEventToStep(event: AgentEvent, index: number): AiAgentStepItem | u
     toolResult: extractToolResultContent(event.result),
     explainData: extractExplainData(event.result),
     isError: event.is_error,
+    endedAtMs: now,
   };
 }
 
@@ -2352,11 +2424,15 @@ async function send() {
   // first, since clearMessages()/selectConversation() can invalidate it out from
   // under an in-flight send().
   isGenerating.value = true;
+  generationStatus.value = createGenerationStatus(Date.now());
+  startStatusTimer();
   const myGeneration = aiGenerationGuard.begin();
   if (!(await promptTemplateStore.ensureLoaded())) {
     clearPendingWriteGrant();
     if (aiGenerationGuard.isCurrent(myGeneration)) {
       isGenerating.value = false;
+      stopStatusTimer();
+      generationStatus.value = createGenerationStatus(Date.now());
       toast(t("ai.customInstructionsLoadFailed"), 5000);
     }
     return;
@@ -2490,6 +2566,10 @@ async function send() {
     // been registered with the backend yet (registration happens inside
     // runAgentStream() itself).
     if (!aiGenerationGuard.isCurrent(myGeneration)) return;
+    // The stream is about to reach the backend — transition the status line from
+    // `preparing` to `waiting_model` so it reads "等待模型响应" while no events have
+    // arrived yet (slow CLI first token included).
+    generationStatus.value = { ...generationStatus.value, phase: "waiting_model" };
     const history: AiMessage[] = messagesForAgentHistory(messages.value.slice(0, -2));
     await runAgentStream(
       {
@@ -2513,6 +2593,18 @@ async function send() {
         // shared state to write into.
         if (!aiGenerationGuard.isCurrent(myGeneration)) return;
         agentEvents.push(event);
+        // Feed every agent event into the generation-status state machine (Issue
+        // #6743 feature 1). `applyStatusEvent` refreshes lastEventAt, tracks the
+        // active tool / turn, and derives the phase purely from the event stream.
+        generationStatus.value = applyStatusEvent(generationStatus.value, event, Date.now());
+        // Terminal event (agent_end / error) hides the status line immediately —
+        // the backend promise may still be settling (CLI teardown / SSE close), so
+        // stop the ticker now instead of letting it idle through that gap. The
+        // non-terminal `response_complete` (phase=finalizing) hides the line the
+        // same way, but the listener stays alive for the real agent_end/error.
+        if (generationStatus.value.phase === "finished" || generationStatus.value.phase === "finalizing") {
+          stopStatusTimer();
+        }
         if (event.type === "text_delta" && event.delta) {
           appendAssistantDelta(assistantIdx, event.delta);
         }
@@ -2530,8 +2622,11 @@ async function send() {
           appendAssistantReasoning(assistantIdx, event.delta);
         }
         if (event.type === "agent_end") {
+          // End the card's "思考过程" spinner at the terminal event rather than
+          // waiting for send()'s finally (which can lag behind CLI teardown).
+          const msg = messages.value[assistantIdx];
+          if (msg) msg.isThinking = false;
           if (event.input_tokens || event.output_tokens) {
-            const msg = messages.value[assistantIdx];
             if (msg) msg.tokens = { input: event.input_tokens ?? 0, output: event.output_tokens ?? 0 };
           }
         }
@@ -2539,7 +2634,7 @@ async function send() {
           const msg = messages.value[assistantIdx];
           if (msg) {
             if (!msg.agentSteps) msg.agentSteps = [];
-            const step = agentEventToStep(event, agentEvents.length - 1);
+            const step = agentEventToStep(event, agentEvents.length - 1, Date.now());
             if (step) upsertAgentStep(msg.agentSteps, step);
           }
           pendingCompaction.value = { summary: event.summary, compactedMessages: event.compacted_messages };
@@ -2549,7 +2644,7 @@ async function send() {
           const msg = messages.value[assistantIdx];
           if (msg) {
             if (!msg.agentSteps) msg.agentSteps = [];
-            const step = agentEventToStep(event, agentEvents.length - 1);
+            const step = agentEventToStep(event, agentEvents.length - 1, Date.now());
             if (step) upsertAgentStep(msg.agentSteps, step);
           }
         }
@@ -2586,11 +2681,16 @@ async function send() {
       const msg = messages.value[assistantIdx];
       if (msg) msg.isThinking = false;
       isGenerating.value = false;
+      // Normal-path generation-status cleanup (dual-path reset — see
+      // resetPendingRequestState() below for the abandon-path equivalent).
+      stopStatusTimer();
+      generationStatus.value = createGenerationStatus(Date.now());
+      statusNow.value = Date.now();
       // Render agent tool call steps from agent events (fallback when no real-time steps)
       if (msg && agentEvents.length > 0 && !msg.agentSteps?.length) {
         const steps: AiAgentStepItem[] = [];
         agentEvents.forEach((e, index) => {
-          const step = agentEventToStep(e, index);
+          const step = agentEventToStep(e, index, Date.now());
           if (step) upsertAgentStep(steps, step);
         });
         if (steps.length) msg.agentSteps = steps;
@@ -2653,6 +2753,12 @@ function waitForGenerationToClear(timeoutMs: number): Promise<void> {
 }
 
 async function cancelStream() {
+  // User explicitly requested stop — reflect it in the status line (phase=cancelling)
+  // so it reads "正在取消…" while the backend cancellation is still settling.
+  if (isGenerating.value) {
+    generationStatus.value = markCancelling(generationStatus.value, Date.now());
+    statusNow.value = Date.now();
+  }
   await stopAiGenerationWithFallback({
     isGenerating: () => isGenerating.value,
     currentGeneration: () => aiGenerationGuard.peek(),
@@ -2688,6 +2794,13 @@ function resetPendingRequestState() {
   pendingAssistantReasoning = "";
   pendingAssistantIndex = -1;
   pendingCompaction.value = null;
+  // Abandon-path generation-status cleanup: a clear/switch/new-chat/unmount must
+  // stop the status ticker and clear the per-request status (and its `now` ref),
+  // otherwise switching conversations leaks a stale status line into the next
+  // generation.
+  stopStatusTimer();
+  generationStatus.value = createGenerationStatus(Date.now());
+  statusNow.value = Date.now();
 }
 
 // `alreadyCancelledSessionId`: the session id a caller (cancelStream()) has
@@ -2985,6 +3098,7 @@ onUnmounted(() => {
   if (assistantDeltaFrame !== null) cancelAnimationFrame(assistantDeltaFrame);
   clearTimeout(mentionTimer);
   clearEffortMenuCloseTimer();
+  stopStatusTimer();
   // Must invalidate the generation the same way clearMessages()/selectConversation()
   // do, not just fire the best-effort cancelStream() RPC: if a request is still
   // mid-await (context preparation, or the backend hasn't registered a session id
@@ -3317,10 +3431,18 @@ async function openExternalUrl(url: string) {
                 <div v-if="msg.agentSteps?.length" class="mb-2 space-y-1">
                   <div v-for="step in msg.agentSteps" :key="step.key" class="rounded border text-[10px]" :class="agentStepClass(step.tone)">
                     <button class="flex w-full items-center gap-1 px-2 py-1.5 text-left" @click="step.toolResult || step.toolArgs?.sql ? toggleStep(step.key) : undefined">
-                      <component :is="agentStepIcon(step.tone)" class="h-3 w-3 shrink-0" />
+                      <Loader2 v-if="step.tone === 'active' && step.toolName" class="h-3 w-3 shrink-0 animate-spin" />
+                      <component :is="agentStepIcon(step.tone)" v-else class="h-3 w-3 shrink-0" />
                       <span class="font-medium">{{ t(step.labelKey) }}</span>
                       <span v-if="step.toolName" class="text-muted-foreground">: {{ step.toolName }}</span>
-                      <ChevronRight v-if="step.toolResult || step.toolArgs?.sql" class="ml-auto h-3 w-3 shrink-0 transition-transform duration-150" :class="{ 'rotate-90': expandedSteps.has(step.key) }" />
+                      <template v-if="step.tone === 'active' && step.toolName">
+                        <span class="ml-auto flex shrink-0 items-center gap-1">
+                          <Loader2 class="h-3 w-3 animate-spin" />
+                          <span>{{ t("ai.agentSteps.executing") }}</span>
+                        </span>
+                      </template>
+                      <span v-else-if="step.durationMs !== undefined" class="ml-auto shrink-0 tabular-nums" :class="step.tone === 'danger' ? 'text-red-600 dark:text-red-400' : 'text-chart-2'">{{ formatToolDurationMs(step.durationMs) }}</span>
+                      <ChevronRight v-if="step.toolResult || step.toolArgs?.sql" class="h-3 w-3 shrink-0 transition-transform duration-150" :class="[{ 'rotate-90': expandedSteps.has(step.key) }, !agentStepHasTail(step) ? 'ml-auto' : '']" />
                     </button>
                     <div v-if="expandedSteps.has(step.key)" class="border-t border-current/10 px-2 pb-2 pt-1">
                       <div v-if="step.toolArgs?.sql" class="mb-1 rounded bg-background/50 px-2 py-1 font-mono text-[10px] text-foreground/80 whitespace-pre-wrap">{{ step.toolArgs.sql }}</div>
@@ -3407,9 +3529,39 @@ async function openExternalUrl(url: string) {
             </div>
           </template>
 
-          <div v-if="isWaitingForFirstDelta" class="flex items-center gap-2 text-xs text-muted-foreground">
-            <Loader2 class="h-3.5 w-3.5 animate-spin" />
-            <span>{{ t("ai.thinking") }}</span>
+          <!-- Live generation-status line (Issue #6743 feature 1). Replaces the old
+               "Thinking..." placeholder and covers the WHOLE generation period
+               (`v-if="isGenerating"`), not just the wait for the first token. The
+               `phase !== 'finished'` guard hides it the instant agent_end/error
+               arrives — before isGenerating clears — so a completed reply never
+               shows a lingering "等待模型响应 · 已运行 0s". `finalizing` (the
+               non-terminal `response_complete`) hides the line the same way, while
+               the listener stays alive for the real agent_end/error. -->
+          <div v-if="isGenerating && generationStatus.phase !== 'finished' && generationStatus.phase !== 'finalizing'" class="flex min-w-0 items-center gap-[7px] text-xs text-muted-foreground" data-ai-generation-status>
+            <!-- Screen-reader live region: announces discrete execution-state changes
+                 (phase / tool / turn / idle crossing) only, never the per-second
+                 elapsed numerals — see `liveAnnouncementText`. -->
+            <span class="sr-only" role="status" aria-live="polite" aria-atomic="true">{{ statusLiveAnnouncement }}</span>
+            <Loader2 v-if="!generationStatusIdle" class="h-3 w-3 shrink-0 animate-spin" aria-hidden="true" />
+            <Hourglass v-else class="h-3 w-3 shrink-0" aria-hidden="true" />
+            <!-- Idle-with-tool copy MUST win over the running-tool layout: PRD copy
+                 priority 1 (idle >20s, "等待此步骤完成 · 最后活动 Ns 前 · 正在执行 {tool}")
+                 outranks priority 2 ("第 N 轮 · 正在执行 {tool} · 已运行 Ns"), matching
+                 the pure `statusText()` branch order. Exclude the cancelling phase so
+                 "正在取消…" (checked first by `statusText`) is never masked by the idle
+                 copy while the user is stopping a long-running tool. -->
+            <template v-if="generationStatusIdle && generationStatus.activeTool && generationStatus.phase !== 'cancelling'">
+              <span class="whitespace-nowrap tabular-nums">{{ t("ai.status.idle", { idle: statusIdleSeconds }) }}</span>
+              <span class="whitespace-nowrap">{{ t("ai.status.runningToolAction") }}</span>
+              <span class="whitespace-nowrap rounded-[5px] border border-chart-2/30 bg-chart-2/12 px-1.5 py-px font-mono text-[10px] text-chart-2">{{ statusToolLabel }}</span>
+            </template>
+            <template v-else-if="generationStatusRunningTool">
+              <span v-if="statusTurnBadge" class="whitespace-nowrap rounded-[5px] border border-border px-[5px] font-mono text-[10px] text-muted-foreground">{{ statusTurnBadge }}</span>
+              <span class="whitespace-nowrap">{{ t("ai.status.runningToolAction") }}</span>
+              <span class="whitespace-nowrap rounded-[5px] border border-chart-2/30 bg-chart-2/12 px-1.5 py-px font-mono text-[10px] text-chart-2">{{ statusToolLabel }}</span>
+              <span class="whitespace-nowrap tabular-nums">{{ t("ai.status.runningToolElapsed", { elapsed: statusElapsedSeconds }) }}</span>
+            </template>
+            <span v-else class="min-w-0 tabular-nums">{{ generationStatusText }}</span>
           </div>
         </div>
       </ScrollArea>
@@ -3624,6 +3776,12 @@ async function openExternalUrl(url: string) {
             @paste="onPromptPaste"
           />
           <input ref="csvFileInputRef" type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,.csv,.md,.markdown,.txt,.text,.json,.yaml,.yml,.xml,.log,.tsv" class="hidden" @change="onCsvFileSelected" />
+          <!-- Gentle >60s hint (Issue #6743 feature 1): never asserts the request is
+               stuck/hung, only that it is running long and may be waited on or stopped. -->
+          <div v-if="statusLongRunningHintVisible" class="mb-1.5 flex items-center gap-1.5 rounded-[7px] border border-warning/30 bg-warning/10 px-[9px] py-[5px] text-[11px] text-warning">
+            <Clock class="h-3.5 w-3.5 shrink-0" />
+            <span>{{ t("ai.status.longRunningHint") }}</span>
+          </div>
           <div class="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden">
             <Tooltip>
               <TooltipTrigger as-child>

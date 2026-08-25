@@ -525,6 +525,7 @@ export interface EditorSettings {
   timeoutInheritanceMigrationVersion: number;
   showExecutionTargetPicker: boolean;
   showStatementRunButtons: boolean;
+  showLineNumbers: boolean;
   showCurrentStatementFrame: boolean;
   showInsertValueHints: boolean;
   autoAliasTables: boolean;
@@ -572,6 +573,7 @@ export interface EditorSettings {
   dataGridExtractorOptions: DataGridExtractorOptions;
   resultRunDisplayMode: ResultRunDisplayMode;
   dataGridAutoTransposeSingleRow: boolean;
+  dataGridCellDetailButtonVisible: boolean;
   dataGridMultiRowTranspose: boolean;
   dataGridHideNullColumns: boolean;
   dataGridBooleanDisplayMode: "dropdown" | "checkbox";
@@ -602,6 +604,7 @@ export interface EditorSettings {
   openDataTabsNextToActive: boolean;
   prefillNewQueryWithSelect: boolean;
   generateSqlIncludeDatabaseName: boolean;
+  formatSqlOnSqlFileSave: boolean;
   updateNotificationsEnabled: boolean;
   sidebarHiddenTablePrefixes: string[];
   sidebarObjectInfoMode: SidebarObjectInfoMode;
@@ -733,6 +736,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   timeoutInheritanceMigrationVersion: 2,
   showExecutionTargetPicker: false,
   showStatementRunButtons: true,
+  showLineNumbers: true,
   showCurrentStatementFrame: true,
   showInsertValueHints: true,
   autoAliasTables: true,
@@ -746,7 +750,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sqlSemanticDiagnosticsEnabled: SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED,
   confirmDangerousSqlExecution: true,
   confirmUnsavedSqlClose: true,
-  appCloseUnsavedTabsMode: "prompt",
+  appCloseUnsavedTabsMode: "keep-drafts",
   savedSqlOpenTargetMode: "saved",
   compactTabTitle: false,
   tabLayout: "scroll",
@@ -779,6 +783,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   dataGridExtractorOptions: normalizeDataGridExtractorOptions(DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS),
   resultRunDisplayMode: "tabs",
   dataGridAutoTransposeSingleRow: false,
+  dataGridCellDetailButtonVisible: true,
   dataGridMultiRowTranspose: false,
   dataGridHideNullColumns: false,
   dataGridBooleanDisplayMode: "dropdown",
@@ -809,6 +814,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   openDataTabsNextToActive: false,
   prefillNewQueryWithSelect: true,
   generateSqlIncludeDatabaseName: false,
+  formatSqlOnSqlFileSave: false,
   updateNotificationsEnabled: true,
   sidebarHiddenTablePrefixes: [],
   sidebarObjectInfoMode: "comment-inline",
@@ -1105,6 +1111,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
           : 0,
     showExecutionTargetPicker: settings.showExecutionTargetPicker ?? DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker,
     showStatementRunButtons: typeof settings.showStatementRunButtons === "boolean" ? settings.showStatementRunButtons : DEFAULT_EDITOR_SETTINGS.showStatementRunButtons,
+    showLineNumbers: typeof settings.showLineNumbers === "boolean" ? settings.showLineNumbers : DEFAULT_EDITOR_SETTINGS.showLineNumbers,
     showCurrentStatementFrame: typeof settings.showCurrentStatementFrame === "boolean" ? settings.showCurrentStatementFrame : DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame,
     showInsertValueHints: typeof settings.showInsertValueHints === "boolean" ? settings.showInsertValueHints : DEFAULT_EDITOR_SETTINGS.showInsertValueHints,
     autoAliasTables: settings.autoAliasTables ?? DEFAULT_EDITOR_SETTINGS.autoAliasTables,
@@ -1151,6 +1158,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     dataGridExtractorOptions: normalizeDataGridExtractorOptions(settings.dataGridExtractorOptions),
     resultRunDisplayMode: normalizeResultRunDisplayMode(settings.resultRunDisplayMode),
     dataGridAutoTransposeSingleRow: settings.dataGridAutoTransposeSingleRow === true,
+    dataGridCellDetailButtonVisible: typeof settings.dataGridCellDetailButtonVisible === "boolean" ? settings.dataGridCellDetailButtonVisible : DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible,
     dataGridMultiRowTranspose: settings.dataGridMultiRowTranspose === true,
     dataGridHideNullColumns: settings.dataGridHideNullColumns === true,
     dataGridBooleanDisplayMode: settings.dataGridBooleanDisplayMode === "checkbox" ? "checkbox" : "dropdown",
@@ -1202,6 +1210,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     openDataTabsNextToActive: typeof settings.openDataTabsNextToActive === "boolean" ? settings.openDataTabsNextToActive : DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive,
     prefillNewQueryWithSelect: typeof settings.prefillNewQueryWithSelect === "boolean" ? settings.prefillNewQueryWithSelect : DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect,
     generateSqlIncludeDatabaseName: settings.generateSqlIncludeDatabaseName === true,
+    formatSqlOnSqlFileSave: settings.formatSqlOnSqlFileSave === true,
     updateNotificationsEnabled: settings.updateNotificationsEnabled ?? DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(settings.sidebarHiddenTablePrefixes),
     sidebarObjectInfoMode: normalizeSidebarObjectInfoMode(
@@ -1705,6 +1714,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.timeoutInheritanceMigrationVersion !== undefined) editorSettings.value.timeoutInheritanceMigrationVersion = Math.max(0, Math.floor(partial.timeoutInheritanceMigrationVersion));
     if (partial.showExecutionTargetPicker !== undefined) editorSettings.value.showExecutionTargetPicker = partial.showExecutionTargetPicker;
     if (partial.showStatementRunButtons !== undefined) editorSettings.value.showStatementRunButtons = partial.showStatementRunButtons === true;
+    if (partial.showLineNumbers !== undefined) editorSettings.value.showLineNumbers = partial.showLineNumbers === true;
     if (partial.showCurrentStatementFrame !== undefined) editorSettings.value.showCurrentStatementFrame = partial.showCurrentStatementFrame === true;
     if (partial.showInsertValueHints !== undefined) editorSettings.value.showInsertValueHints = partial.showInsertValueHints === true;
     if (partial.autoAliasTables !== undefined) editorSettings.value.autoAliasTables = partial.autoAliasTables;
@@ -1762,6 +1772,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.dataGridExtractorOptions !== undefined) editorSettings.value.dataGridExtractorOptions = normalizeDataGridExtractorOptions(partial.dataGridExtractorOptions);
     if (partial.resultRunDisplayMode !== undefined) editorSettings.value.resultRunDisplayMode = normalizeResultRunDisplayMode(partial.resultRunDisplayMode);
     if (partial.dataGridAutoTransposeSingleRow !== undefined) editorSettings.value.dataGridAutoTransposeSingleRow = partial.dataGridAutoTransposeSingleRow === true;
+    if (partial.dataGridCellDetailButtonVisible !== undefined) editorSettings.value.dataGridCellDetailButtonVisible = typeof partial.dataGridCellDetailButtonVisible === "boolean" ? partial.dataGridCellDetailButtonVisible : DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible;
     if (partial.dataGridMultiRowTranspose !== undefined) editorSettings.value.dataGridMultiRowTranspose = partial.dataGridMultiRowTranspose === true;
     if (partial.dataGridHideNullColumns !== undefined) editorSettings.value.dataGridHideNullColumns = partial.dataGridHideNullColumns === true;
     if (partial.dataGridBooleanDisplayMode !== undefined) editorSettings.value.dataGridBooleanDisplayMode = partial.dataGridBooleanDisplayMode === "dropdown" ? "dropdown" : "checkbox";
@@ -1792,6 +1803,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.openDataTabsNextToActive !== undefined) editorSettings.value.openDataTabsNextToActive = partial.openDataTabsNextToActive === true;
     if (partial.prefillNewQueryWithSelect !== undefined) editorSettings.value.prefillNewQueryWithSelect = partial.prefillNewQueryWithSelect;
     if (partial.generateSqlIncludeDatabaseName !== undefined) editorSettings.value.generateSqlIncludeDatabaseName = partial.generateSqlIncludeDatabaseName === true;
+    if (partial.formatSqlOnSqlFileSave !== undefined) editorSettings.value.formatSqlOnSqlFileSave = partial.formatSqlOnSqlFileSave === true;
     if (partial.updateNotificationsEnabled !== undefined) editorSettings.value.updateNotificationsEnabled = partial.updateNotificationsEnabled;
     if (partial.sidebarHiddenTablePrefixes !== undefined) editorSettings.value.sidebarHiddenTablePrefixes = normalizeSidebarHiddenTablePrefixes(partial.sidebarHiddenTablePrefixes);
     if (partial.sidebarObjectInfoMode !== undefined) editorSettings.value.sidebarObjectInfoMode = normalizeSidebarObjectInfoMode(partial.sidebarObjectInfoMode);

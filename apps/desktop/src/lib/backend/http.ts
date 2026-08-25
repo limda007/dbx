@@ -831,6 +831,10 @@ export async function getTableComment(_connectionId: string, _database: string, 
   throw new Error("Table comment lookup is not available in the web backend");
 }
 
+export async function getMysqlTableAutoIncrement(_connectionId: string, _database: string, _table: string): Promise<string | null> {
+  throw new Error("MySQL AUTO_INCREMENT metadata is not available in the web backend");
+}
+
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: (SidebarObjectKind | "EVENT")[], filter?: string, limit?: number, offset?: number, catalog?: string, tableNameFilter?: TableNameFilter): Promise<ObjectInfo[]> {
   return get(
     `/api/schema/objects?${qs({
@@ -1248,7 +1252,7 @@ export async function beginManualTransaction(_connectionId: string, _database: s
   throw new Error("Manual transaction management is only available in the desktop app.");
 }
 
-export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _maxRows?: number, _tableDataPreview?: boolean): Promise<QueryResult[]> {
+export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _maxRows?: number, _tableDataPreview?: boolean, _pageSize?: number, _resultSessionId?: string): Promise<QueryResult[]> {
   throw new Error("Manual transaction management is only available in the desktop app.");
 }
 

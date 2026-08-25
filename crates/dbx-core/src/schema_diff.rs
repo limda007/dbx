@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::models::connection::DatabaseType;
-use crate::sql_dialect::ddl_profile::{profile_for, DdlDialectProfile};
+use crate::sql_dialect::ddl_profile::{profile_for, ColumnDdlSyntax, CommentDdlSyntax, DdlDialectProfile};
 use crate::sql_dialect::descriptor::DialectKind;
 use crate::sql_dialect::inference::{ColumnType, DefaultTypeInferenceEngine, TypeInferenceEngine};
 use crate::sql_dialect::type_rewrite::{
@@ -1164,15 +1164,13 @@ impl RollbackGraph {
     }
 
     fn invert_change_string(ch: &str) -> String {
-        if let Some(_pos) = ch.find(" → ") {
-            let parts: Vec<&str> = ch.split(" → ").collect();
-            if parts.len() == 2 {
-                format!("{} → {}", parts[1], parts[0])
-            } else {
-                ch.to_string()
-            }
+        let Some((before, after)) = ch.split_once(" → ") else {
+            return ch.to_string();
+        };
+        if let Some((kind, value)) = before.split_once(": ") {
+            format!("{kind}: {after} → {value}")
         } else {
-            ch.to_string()
+            format!("{after} → {before}")
         }
     }
 
@@ -3424,18 +3422,120 @@ fn column_comment_sql(
     if profile.column_comment_via_modify_only {
         return format!("-- Column comment for {column_name}: use ALTER TABLE ... MODIFY COLUMN to set comment");
     }
+    if profile.comment_ddl == CommentDdlSyntax::SqlServerExtendedProperty {
+        return sqlserver_column_comment_sql(table_name, column_name, comment, db_type, schema);
+    }
     let table = qualified_name(table_name, db_type, schema);
     format!("COMMENT ON COLUMN {table}.{} IS {};", quote_id(column_name, db_type), comment_literal(comment))
 }
 
 fn table_comment_sql(table_name: &str, comment: &str, db_type: DatabaseType, schema: Option<&str>) -> String {
     let profile = profile_for(db_type);
+    if profile.comment_ddl == CommentDdlSyntax::SqlServerExtendedProperty {
+        return sqlserver_table_comment_sql(table_name, comment, db_type, schema);
+    }
     let table = qualified_name(table_name, db_type, schema);
     if profile.table_comment_via_alter {
         format!("ALTER TABLE {table} COMMENT = {};", comment_literal(comment))
     } else {
         format!("COMMENT ON TABLE {table} IS {};", comment_literal(comment))
     }
+}
+
+fn sqlserver_schema_name(schema: Option<&str>) -> &str {
+    schema.map(str::trim).filter(|name| !name.is_empty()).unwrap_or("dbo")
+}
+
+fn sqlserver_column_comment_sql(
+    table_name: &str,
+    column_name: &str,
+    comment: &str,
+    db_type: DatabaseType,
+    schema: Option<&str>,
+) -> String {
+    let table = qualified_name(table_name, db_type, schema);
+    let object_id = table.replace('\'', "''");
+    let schema = sqlserver_schema_name(schema).replace('\'', "''");
+    let table_name = table_name.replace('\'', "''");
+    let column_name = column_name.replace('\'', "''");
+    let exists = format!(
+        "EXISTS (SELECT 1 FROM sys.extended_properties WHERE major_id = OBJECT_ID(N'{object_id}') AND minor_id = COLUMNPROPERTY(OBJECT_ID(N'{object_id}'), N'{column_name}', 'ColumnId') AND name = N'MS_Description')"
+    );
+    let levels = format!(
+        "@level0type=N'SCHEMA', @level0name=N'{schema}', @level1type=N'TABLE', @level1name=N'{table_name}', @level2type=N'COLUMN', @level2name=N'{column_name}'"
+    );
+
+    if comment.is_empty() {
+        format!("IF {exists} EXEC sys.sp_dropextendedproperty @name=N'MS_Description', {levels};")
+    } else {
+        let comment = comment.replace('\'', "''");
+        format!(
+            "IF {exists} EXEC sys.sp_updateextendedproperty @name=N'MS_Description', @value=N'{comment}', {levels} ELSE EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{comment}', {levels};"
+        )
+    }
+}
+
+fn sqlserver_table_comment_sql(table_name: &str, comment: &str, db_type: DatabaseType, schema: Option<&str>) -> String {
+    let table = qualified_name(table_name, db_type, schema);
+    let object_id = table.replace('\'', "''");
+    let schema = sqlserver_schema_name(schema).replace('\'', "''");
+    let table_name = table_name.replace('\'', "''");
+    let exists = format!(
+        "EXISTS (SELECT 1 FROM sys.extended_properties WHERE major_id = OBJECT_ID(N'{object_id}') AND minor_id = 0 AND name = N'MS_Description')"
+    );
+    let levels =
+        format!("@level0type=N'SCHEMA', @level0name=N'{schema}', @level1type=N'TABLE', @level1name=N'{table_name}'");
+
+    if comment.is_empty() {
+        format!("IF {exists} EXEC sys.sp_dropextendedproperty @name=N'MS_Description', {levels};")
+    } else {
+        let comment = comment.replace('\'', "''");
+        format!(
+            "IF {exists} EXEC sys.sp_updateextendedproperty @name=N'MS_Description', @value=N'{comment}', {levels} ELSE EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{comment}', {levels};"
+        )
+    }
+}
+
+fn sqlserver_exec_batch(sql: &str) -> String {
+    format!("EXEC sys.sp_executesql N'{}';", sql.replace('\'', "''"))
+}
+
+fn sqlserver_has_default(column: Option<&ColumnInfo>) -> bool {
+    column.and_then(|column| column.column_default.as_deref()).is_some_and(|default| {
+        let default = default.trim();
+        !default.is_empty() && !default.eq_ignore_ascii_case("null")
+    })
+}
+
+fn sqlserver_drop_default_constraint_sql(table: &str, column_name: &str) -> String {
+    let table_literal = table.replace('\'', "''");
+    let column_literal = column_name.replace('\'', "''");
+    sqlserver_exec_batch(&format!(
+        "DECLARE @dbx_default_sql NVARCHAR(MAX); \
+         SELECT TOP (1) @dbx_default_sql = N'ALTER TABLE {table_literal} DROP CONSTRAINT ' + QUOTENAME(dc.name) \
+         FROM sys.default_constraints AS dc \
+         WHERE dc.parent_object_id = OBJECT_ID(N'{table_literal}') AND dc.parent_column_id = COLUMNPROPERTY(OBJECT_ID(N'{table_literal}'), N'{column_literal}', 'ColumnId'); \
+         IF @dbx_default_sql IS NOT NULL EXEC sys.sp_executesql @dbx_default_sql;"
+    ))
+}
+
+fn sqlserver_alter_column_preserving_default_sql(table: &str, column_name: &str, column: &ColumnInfo) -> String {
+    let table_literal = table.replace('\'', "''");
+    let column_literal = column_name.replace('\'', "''");
+    let quoted_column = quote_id(column_name, DatabaseType::SqlServer);
+    let quoted_column_literal = quoted_column.replace('\'', "''");
+    let nullability = if column.is_nullable { "NULL" } else { "NOT NULL" };
+
+    sqlserver_exec_batch(&format!(
+        "DECLARE @dbx_default_sql NVARCHAR(MAX), @dbx_default_name sysname, @dbx_default_definition NVARCHAR(MAX); \
+         SELECT TOP (1) @dbx_default_name = dc.name, @dbx_default_definition = dc.definition \
+         FROM sys.default_constraints AS dc \
+         WHERE dc.parent_object_id = OBJECT_ID(N'{table_literal}') AND dc.parent_column_id = COLUMNPROPERTY(OBJECT_ID(N'{table_literal}'), N'{column_literal}', 'ColumnId'); \
+         IF @dbx_default_name IS NOT NULL BEGIN SET @dbx_default_sql = N'ALTER TABLE {table_literal} DROP CONSTRAINT ' + QUOTENAME(@dbx_default_name); EXEC sys.sp_executesql @dbx_default_sql; END; \
+         ALTER TABLE {table} ALTER COLUMN {quoted_column} {data_type} {nullability}; \
+         IF @dbx_default_name IS NOT NULL BEGIN SET @dbx_default_sql = N'ALTER TABLE {table_literal} ADD CONSTRAINT ' + QUOTENAME(@dbx_default_name) + N' DEFAULT ' + @dbx_default_definition + N' FOR {quoted_column_literal}'; EXEC sys.sp_executesql @dbx_default_sql; END;",
+        data_type = column.data_type,
+    ))
 }
 
 fn create_trigger_sql(
@@ -4084,8 +4184,10 @@ fn generate_schema_sync_sql_inner(
                             } else {
                                 String::new()
                             };
+                            let add_column =
+                                if profile.column_ddl == ColumnDdlSyntax::SqlServer { "ADD" } else { "ADD COLUMN" };
                             parts.push(format!(
-                                "  ADD COLUMN {}{}",
+                                "  {add_column} {}{}",
                                 column_def(&convert_col(source), db_type, source_dialect),
                                 position
                             ));
@@ -4097,7 +4199,51 @@ fn generate_schema_sync_sql_inner(
                     "modified" => {
                         if let Some(source) = &column.source {
                             let mapped = convert_col(source);
-                            if profile.alter_uses_modify_column {
+                            if profile.column_ddl == ColumnDdlSyntax::SqlServer {
+                                let name = quote_id(&column.name, db_type);
+                                let definition_changed = column
+                                    .changes
+                                    .iter()
+                                    .any(|change| change.starts_with("type:") || change.starts_with("nullable:"));
+                                let default_changed =
+                                    column.changes.iter().any(|change| change.starts_with("default:"));
+                                let had_default = sqlserver_has_default(column.target.as_ref());
+
+                                if definition_changed && had_default && !default_changed {
+                                    standalone_statements.push(sqlserver_alter_column_preserving_default_sql(
+                                        &table,
+                                        &column.name,
+                                        &mapped,
+                                    ));
+                                } else {
+                                    if definition_changed && had_default {
+                                        standalone_statements
+                                            .push(sqlserver_drop_default_constraint_sql(&table, &column.name));
+                                    }
+                                    if definition_changed {
+                                        let nullability = if source.is_nullable { "NULL" } else { "NOT NULL" };
+                                        parts.push(format!("  ALTER COLUMN {name} {} {nullability}", mapped.data_type));
+                                    }
+                                }
+
+                                if default_changed {
+                                    if had_default && !definition_changed {
+                                        standalone_statements
+                                            .push(sqlserver_drop_default_constraint_sql(&table, &column.name));
+                                    }
+                                    if let Some(default) = &source.column_default {
+                                        parts.push(format!(
+                                            "  ADD DEFAULT {} FOR {name}",
+                                            default_literal(
+                                                default,
+                                                &mapped.data_type,
+                                                effective_source_dialect(source_dialect, db_type),
+                                                source.extra.as_deref()
+                                            )
+                                        ));
+                                    }
+                                }
+                            } else if profile.alter_uses_modify_column {
                                 if column.changes.iter().any(|change| !change.starts_with("order:")) {
                                     parts.push(format!(
                                         "  MODIFY COLUMN {}",
@@ -4826,6 +4972,208 @@ mod tests {
         assert!(!sql.contains("ALTER TABLE \"orders\"  EXEC sp_rename"), "sp_rename must be standalone: {sql}");
         assert!(sql.lines().any(|line| line.starts_with("EXEC sp_rename")), "standalone sp_rename: {sql}");
         assert!(!sql.contains('`'), "SQL Server no backticks: {sql}");
+    }
+
+    #[test]
+    fn sqlserver_schema_diff_adds_columns_and_unicode_comments_with_tsql() {
+        let source = vec![ColumnInfo {
+            is_nullable: true,
+            comment: Some("厂家追溯码's".to_string()),
+            ..column("manufacture_trace_code", "varchar(200)", None)
+        }];
+        let diffs = diff_columns_with_options(&source, &[], false, false, false, 0.5);
+        let sql = generate_schema_sync_sql(
+            &[wrap_table_diff("inter_putaway_sub", diffs)],
+            &[],
+            &[],
+            &[],
+            &[],
+            DatabaseType::SqlServer,
+            Some("dbo"),
+            false,
+            Some(DialectKind::SqlServer),
+            &[],
+        );
+
+        assert!(
+            sql.contains("ALTER TABLE \"dbo\".\"inter_putaway_sub\"  ADD \"manufacture_trace_code\" varchar(200);"),
+            "SQL Server ADD syntax: {sql}"
+        );
+        assert!(sql.contains("sys.sp_addextendedproperty"), "SQL Server comment add: {sql}");
+        assert!(sql.contains("@value=N'厂家追溯码''s'"), "Unicode comment escaping: {sql}");
+        assert!(!sql.contains("ADD COLUMN"), "SQL Server must not emit ADD COLUMN: {sql}");
+        assert!(!sql.contains("COMMENT ON"), "SQL Server must not emit COMMENT ON: {sql}");
+    }
+
+    #[test]
+    fn sqlserver_schema_diff_renders_default_constraint_transitions_as_single_batches() {
+        let transitions =
+            [(None, Some("((0))"), true), (Some("((0))"), Some("((1))"), true), (Some("((0))"), None, false)];
+
+        for (old_default, new_default, expects_add) in transitions {
+            let source = vec![ColumnInfo {
+                column_default: new_default.map(str::to_string),
+                ..column("frozen_status", "int", None)
+            }];
+            let target = vec![ColumnInfo {
+                column_default: old_default.map(str::to_string),
+                ..column("frozen_status", "int", None)
+            }];
+            let diffs = diff_columns_with_options(&source, &target, false, false, false, 0.5);
+            let sql = generate_schema_sync_sql(
+                &[wrap_table_diff("wbs_flat_package_data_sub", diffs)],
+                &[],
+                &[],
+                &[],
+                &[],
+                DatabaseType::SqlServer,
+                Some("dbo"),
+                false,
+                Some(DialectKind::SqlServer),
+                &[],
+            );
+
+            assert!(!sql.contains(" SET DEFAULT "), "SQL Server must not emit SET DEFAULT: {sql}");
+            assert!(!sql.contains(" DROP DEFAULT"), "SQL Server must not emit DROP DEFAULT: {sql}");
+            if old_default.is_some() {
+                assert!(sql.contains("sys.default_constraints"), "default lookup: {sql}");
+                assert!(sql.contains("DROP CONSTRAINT"), "default drop: {sql}");
+                assert!(sql.contains("EXEC sys.sp_executesql N'"), "drop batch wrapper: {sql}");
+            }
+            if expects_add {
+                assert!(
+                    sql.contains(&format!("ADD DEFAULT {} FOR \"frozen_status\"", new_default.unwrap())),
+                    "default add: {sql}"
+                );
+            } else {
+                assert!(!sql.contains("ADD DEFAULT"), "default removal must not re-add: {sql}");
+            }
+
+            let statements = crate::sql::split_sql_statements_for_database(&sql, DatabaseType::SqlServer);
+            assert!(
+                statements.iter().all(|statement| !statement.trim_start().starts_with("DECLARE ")),
+                "SQL Server splitter must keep helper batches together: {statements:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlserver_schema_diff_alters_full_column_definition_and_preserves_default() {
+        let source = vec![ColumnInfo {
+            is_nullable: false,
+            column_default: Some("((0))".to_string()),
+            ..column("amount", "bigint", None)
+        }];
+        let target = vec![ColumnInfo {
+            is_nullable: true,
+            column_default: Some("((0))".to_string()),
+            ..column("amount", "int", None)
+        }];
+        let diffs = diff_columns_with_options(&source, &target, false, false, false, 0.5);
+        let sql = generate_schema_sync_sql(
+            &[wrap_table_diff("payments", diffs)],
+            &[],
+            &[],
+            &[],
+            &[],
+            DatabaseType::SqlServer,
+            Some("billing"),
+            false,
+            Some(DialectKind::SqlServer),
+            &[],
+        );
+
+        assert!(
+            sql.contains("ALTER TABLE \"billing\".\"payments\" ALTER COLUMN \"amount\" bigint NOT NULL"),
+            "full SQL Server column definition: {sql}"
+        );
+        assert!(sql.contains("dc.definition"), "existing default definition must be captured: {sql}");
+        assert!(sql.contains("ADD CONSTRAINT"), "existing default constraint must be restored: {sql}");
+        assert!(!sql.contains(" ALTER COLUMN \"amount\" TYPE "), "no PostgreSQL TYPE syntax: {sql}");
+        assert!(!sql.contains(" SET NOT NULL"), "no PostgreSQL nullability syntax: {sql}");
+
+        let statements = crate::sql::split_sql_statements_for_database(&sql, DatabaseType::SqlServer);
+        assert_eq!(statements.len(), 1, "preserve-default batch must stay atomic: {statements:?}");
+        assert!(statements[0].trim_start().starts_with("-- Alter table: payments\nEXEC sys.sp_executesql N'"));
+    }
+
+    #[test]
+    fn sqlserver_schema_diff_upserts_and_drops_escaped_column_comments() {
+        let cases = [
+            (None, Some("owner's 新值"), true, true, false),
+            (Some("旧值"), Some("owner's 新值"), true, true, false),
+            (Some("旧值"), None, false, false, true),
+        ];
+
+        for (old_comment, new_comment, expects_add, expects_update, expects_drop) in cases {
+            let source = vec![column("display'name", "nvarchar(80)", new_comment)];
+            let target = vec![column("display'name", "nvarchar(80)", old_comment)];
+            let diffs = diff_columns_with_options(&source, &target, false, false, false, 0.5);
+            let sql = generate_schema_sync_sql(
+                &[wrap_table_diff("user's", diffs)],
+                &[],
+                &[],
+                &[],
+                &[],
+                DatabaseType::SqlServer,
+                Some("app's"),
+                false,
+                Some(DialectKind::SqlServer),
+                &[],
+            );
+
+            assert_eq!(sql.contains("sys.sp_addextendedproperty"), expects_add, "comment add: {sql}");
+            assert_eq!(sql.contains("sys.sp_updateextendedproperty"), expects_update, "comment update: {sql}");
+            assert_eq!(sql.contains("sys.sp_dropextendedproperty"), expects_drop, "comment drop: {sql}");
+            assert!(sql.contains("N'app''s'"), "schema escaping: {sql}");
+            assert!(sql.contains("N'user''s'"), "table escaping: {sql}");
+            assert!(sql.contains("N'display''name'"), "column escaping: {sql}");
+            if new_comment.is_some() {
+                assert!(sql.contains("N'owner''s 新值'"), "comment escaping: {sql}");
+            }
+            assert!(!sql.contains("COMMENT ON"), "SQL Server must not emit COMMENT ON: {sql}");
+
+            let statements = crate::sql::split_sql_statements_for_database(&sql, DatabaseType::SqlServer);
+            assert_eq!(statements.len(), 1, "comment transition must be one T-SQL statement: {statements:?}");
+        }
+    }
+
+    #[test]
+    fn sqlserver_schema_diff_rollback_uses_the_same_tsql_strategy() {
+        let source = vec![ColumnInfo {
+            column_default: Some("((1))".to_string()),
+            comment: Some("new".to_string()),
+            ..column("status", "int", None)
+        }];
+        let target = vec![ColumnInfo {
+            column_default: Some("((0))".to_string()),
+            comment: Some("old".to_string()),
+            ..column("status", "int", None)
+        }];
+        let diffs = diff_columns_with_options(&source, &target, false, false, false, 0.5);
+        let plan = generate_schema_sync_sql_plan(
+            &[wrap_table_diff("orders", diffs)],
+            &[],
+            &[],
+            &[],
+            &[],
+            DatabaseType::SqlServer,
+            Some("dbo"),
+            false,
+            Some(DialectKind::SqlServer),
+            &[],
+            true,
+        );
+        let rollback = plan.rollback_sync_sql.expect("rollback SQL");
+
+        for (direction, sql) in [("forward", &plan.sync_sql), ("rollback", &rollback)] {
+            assert!(sql.contains("sys.default_constraints"), "{direction} default constraint strategy: {sql}");
+            assert!(sql.contains("sys.sp_updateextendedproperty"), "{direction} comment strategy: {sql}");
+            assert!(!sql.contains(" SET DEFAULT "), "{direction} no PostgreSQL default syntax: {sql}");
+            assert!(!sql.contains("COMMENT ON"), "{direction} no PostgreSQL comment syntax: {sql}");
+        }
+        assert!(plan.sync_sql.contains("ADD DEFAULT ((1)) FOR \"status\""), "forward: {}", plan.sync_sql);
+        assert!(rollback.contains("ADD DEFAULT ((0)) FOR \"status\""), "rollback: {rollback}");
     }
 
     #[test]
