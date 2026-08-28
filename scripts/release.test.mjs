@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { isDesktopVersionOnlyCargoLockChange } from "./release-lock.mjs";
 
 const repoRoot = new URL("..", import.meta.url).pathname;
 const releaseScript = join(repoRoot, "scripts/release.mjs");
@@ -134,4 +135,38 @@ test("Windows 7 release build does not use sccache", () => {
   assert.notEqual(end, -1);
   const win7Job = workflow.slice(start, end);
   assert.doesNotMatch(win7Job, /RUSTC_WRAPPER|SCCACHE_|sccache/i);
+});
+
+test("desktop-only Cargo.lock version refresh does not count as a Node package change", () => {
+  const before = `
+[[package]]
+name = "dbx"
+version = "0.5.95"
+dependencies = ["dbx-core"]
+
+[[package]]
+name = "dbx-web"
+version = "0.5.95"
+dependencies = ["dbx-core"]
+
+[[package]]
+name = "dbx-mcp"
+version = "0.4.73"
+dependencies = ["dbx-core"]
+`;
+  const after = before.replaceAll('version = "0.5.95"', 'version = "0.5.96"');
+
+  assert.equal(isDesktopVersionOnlyCargoLockChange(before, after), true);
+});
+
+test("Cargo.lock dependency changes still count as a Node package change", () => {
+  const before = `
+[[package]]
+name = "dbx"
+version = "0.5.95"
+dependencies = ["dbx-core"]
+`;
+  const after = before.replace('dependencies = ["dbx-core"]', 'dependencies = ["dbx-core", "dbx-mcp"]');
+
+  assert.equal(isDesktopVersionOnlyCargoLockChange(before, after), false);
 });
